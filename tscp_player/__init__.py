@@ -1,0 +1,76 @@
+"""ASCII-first terminal player for the TSCP script format."""
+
+from .format import (
+    FORMAT_VERSION,
+    Directive,
+    Dialogue,
+    Script,
+    parse_tscp,
+    parse_tscps,
+    serialize_tscp,
+    serialize_tscps,
+    visible_text_length,
+)
+from .archive import (
+    FORMAT_TEXT as PACKAGE_FORMAT_TEXT,
+    SUFFIX as PACKAGE_SUFFIX,
+    PackageError,
+)
+from .music import (
+    MusicCue,
+    MusicTimeline,
+    build_timeline,
+    line_durations,
+)
+from .plot import (
+    PROGRAM_VERSION,
+    PROGRAM_VERSION_TEXT,
+    ArchiveSource,
+    Character,
+    DirectorySource,
+    PlotPackage,
+    PlotSource,
+    available_plots,
+    discover_plot,
+    discover_plots,
+    find_music_directory,
+    load_archive_package,
+    load_music_files,
+    load_plot_package,
+)
+from .timing import compile_file, compile_script
+
+__all__ = [
+    "FORMAT_VERSION",
+    "Directive",
+    "Dialogue",
+    "Script",
+    "Character",
+    "MusicCue",
+    "MusicTimeline",
+    "PROGRAM_VERSION",
+    "PROGRAM_VERSION_TEXT",
+    "PlotPackage",
+    "PlotSource",
+    "DirectorySource",
+    "ArchiveSource",
+    "PackageError",
+    "PACKAGE_SUFFIX",
+    "PACKAGE_FORMAT_TEXT",
+    "load_plot_package",
+    "load_archive_package",
+    "discover_plot",
+    "discover_plots",
+    "available_plots",
+    "find_music_directory",
+    "load_music_files",
+    "parse_tscp",
+    "parse_tscps",
+    "serialize_tscp",
+    "serialize_tscps",
+    "visible_text_length",
+    "build_timeline",
+    "line_durations",
+    "compile_file",
+    "compile_script",
+]

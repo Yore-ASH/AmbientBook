@@ -1,0 +1,83 @@
+{
+  "NAME": "ExampleScripts",
+  "VERSION": "0.0.1",
+  "SUMMARY": "A script used for example.",
+  "CHARACTERS": {
+    "f": {
+      "NAME": "FISH",
+      "STYLE": "\u001b[1;33m"
+    },
+    "a": {
+      "NAME": "ASH",
+      "STYLE": "\u001b[1;31m"
+    },
+    "t": {
+      "NAME": "Teiresias",
+      "STYLE": "\u001b[1;36m"
+    },
+    "std1": {
+      "NAME": "Student 1",
+      "STYLE": "\u001b[1m"
+    },
+    "std2": {
+      "NAME": "Student 2",
+      "STYLE": "\u001b[1m"
+    },
+    "y": {
+      "NAME": "Yore",
+      "STYLE": "\u001b[1;32m"
+    },
+    "v": {
+      "NAME": "Vita",
+      "STYLE": "\u001b[1;31m"
+    },
+    "n": {
+      "NAME": "Nale",
+      "STYLE": "\u001b[1;34m"
+    },
+    "Pe": {
+      "NAME": "Persis",
+      "STYLE": "\u001b[1;95m"
+    },
+    "b": {
+      "NAME": "Bister",
+      "STYLE": "\u001b[1;90m"
+    },
+    "i": {
+      "NAME": "Iris",
+      "STYLE": "\u001b[1;36m"
+    },
+    "p": {
+      "NAME": "Principle",
+      "STYLE": "\u001b[1;35m"
+    },
+    "F": {
+      "NAME": "Frederick",
+      "STYLE": "\u001b[1;36m"
+    },
+    "l": {
+      "NAME": "Loy",
+      "STYLE": "\u001b[1;34m"
+    },
+    "d": {
+      "NAME": "Death",
+      "STYLE": "\u001b[1;91m"
+    },
+    "I": {
+      "NAME": "InterSpace",
+      "STYLE": "\u001b[1;92m"
+    },
+    "L": {
+      "NAME": "Lion",
+      "STYLE": "\u001b[1;33m"
+    }
+  },
+  "DEPENDECE": {
+    "MAIN": {
+      "VERSION": "0.0.1"
+    },
+    "MUSIC_PACK": {
+      "VERSION": "0.0.1"
+    }
+  }
+}

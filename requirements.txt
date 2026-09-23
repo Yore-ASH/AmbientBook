@@ -1,0 +1,3 @@
+pygame>=2.5
+PySide6>=6.5
+pytest>=8.0

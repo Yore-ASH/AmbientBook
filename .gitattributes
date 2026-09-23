@@ -1,0 +1,15 @@
+* text=auto
+
+# 剧本文本是 UTF-8 文本，统一用 LF，避免跨平台行尾差异
+*.py    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.tscp  text eol=lf
+*.tscps text eol=lf
+
+# 音频与剧情包容器是二进制，禁止任何行尾转换
+*.flac   binary
+*.mp3    binary
+*.ogg    binary
+*.wav    binary
+*.tscpkg binary

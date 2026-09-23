@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tscp-terminal-player"
+version = "0.1.0"
+description = "An ASCII-first terminal player for TSCP plot packages"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+
+[project.scripts]
+tscp-player = "tscp_player.cli:main"
+tscp-editor = "TSCPEditor.Main:main"
+ts2tp = "Ts2Tp.Main:main"
+tscp-pack = "PlotManager.Main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
