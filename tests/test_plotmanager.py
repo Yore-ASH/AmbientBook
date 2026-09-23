@@ -235,6 +235,53 @@ def test_export_script_writes_a_file(tmp_path):
     assert inside.read_text(encoding="utf-8") == SCRIPT
 
 
+def test_save_copy_exports_everything_inserted(tmp_path):
+    path = _package(tmp_path)
+    song = _song(tmp_path)
+    model.add_music(path, [(song, "iw")])
+    compiled = tmp_path / "plot.tscp"
+    compiled.write_text(SCRIPT, encoding="utf-8")
+    model.add_script(path, compiled)
+
+    exported = model.save_copy(path, tmp_path / "handout")
+    assert exported.suffix == ".tscpkg"
+    assert exported != path
+
+    info = model.inspect(exported)
+    assert info.name == "Demo"
+    assert [entry.abbreviation for entry in info.music] == ["iw"]
+    assert info.music[0].present is True
+    assert [entry.filename for entry in info.scripts] == ["plot.tscp"]
+    extracted = archive.extract(exported, "Musics/i want.flac", tmp_path / "cache")
+    assert extracted.read_bytes() == song.read_bytes()
+
+
+def test_save_copy_is_independent_from_the_original(tmp_path):
+    path = _package(tmp_path)
+    exported = model.save_copy(path, tmp_path / "handout.tscpkg")
+
+    model.update_metadata(exported, name="Handout")
+    model.add_music(exported, [(_song(tmp_path, "extra.flac"), "ex")])
+
+    assert model.inspect(path).name == "Demo"
+    assert model.inspect(path).music == []
+    assert model.inspect(exported).name == "Handout"
+
+
+def test_save_copy_rejects_bad_targets(tmp_path):
+    path = _package(tmp_path)
+    with pytest.raises(model.PackError):
+        model.save_copy(path, path)
+
+    broken = tmp_path / "broken.tscpkg"
+    broken.write_text("not a zip", encoding="utf-8")
+    with pytest.raises(model.PackError):
+        model.save_copy(broken, tmp_path / "out.tscpkg")
+
+    with pytest.raises(model.PackError):
+        model.save_copy(tmp_path / "missing.tscpkg", tmp_path / "out.tscpkg")
+
+
 def test_suggest_abbreviation(tmp_path):
     assert model.suggest_abbreviation(tmp_path / "i want.flac") == "i"
     assert model.suggest_abbreviation(tmp_path / "theme.ogg") == "theme"

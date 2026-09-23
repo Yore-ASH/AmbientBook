@@ -7,6 +7,7 @@ shell and the same helpers are usable from scripts and tests.
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -248,9 +249,40 @@ def pack_directory(
     return package
 
 
+def save_copy(source: PathLike, target: PathLike) -> Path:
+    """Write a copy of an existing container to *target*.
+
+    Editing a container already writes straight into it, so this is the explicit
+    "导出为 .tscpkg" step: keep the working file where it is and hand a copy to
+    someone else.  The copy is fully independent - adding music afterwards does
+    not touch the original.
+    """
+
+    origin = Path(source)
+    if not archive.is_package(origin):
+        raise PackError("不是 .tscpkg 文件：%s" % origin)
+    try:
+        archive.members(origin)
+    except archive.PackageError as exc:
+        raise PackError("不是有效的 .tscpkg：%s" % exc) from exc
+
+    destination = Path(target)
+    if destination.suffix.lower() != archive.SUFFIX:
+        destination = destination.with_suffix(archive.SUFFIX)
+    if destination.resolve() == origin.resolve():
+        raise PackError("目标就是当前打开的剧情包，不需要另存")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copyfile(origin, destination)
+    except OSError as exc:
+        raise PackError("无法写入 %s：%s" % (destination, exc)) from exc
+    return destination
+
+
 # --------------------------------------------------------------------------
 # music
 # --------------------------------------------------------------------------
+
 
 def _check_abbreviation(value: str) -> str:
     key = str(value).strip()

@@ -30,6 +30,7 @@ try:
         remove_music,
         remove_script,
         replace_script,
+        save_copy,
         script_text,
         suggest_abbreviation,
         update_metadata,
@@ -47,6 +48,7 @@ except ImportError:  # Support ``python PlotManager/Main.py``.
         remove_music,
         remove_script,
         replace_script,
+        save_copy,
         script_text,
         suggest_abbreviation,
         update_metadata,
@@ -146,14 +148,25 @@ if QT_AVAILABLE:
             new_button.clicked.connect(self.new_package)
             open_button = QPushButton("打开 .tscpkg")
             open_button.clicked.connect(self.open_package)
-            pack_button = QPushButton("目录打包成 .tscpkg")
-            pack_button.setToolTip("把包含 Musics 和 Scripts 的旧目录剧情迁移成单文件")
+            save_as_button = QPushButton("导出副本 .tscpkg")
+            save_as_button.setToolTip(
+                "把当前剧情包（含已插入的音乐和剧本）导出成另一个 .tscpkg 文件，\n"
+                "导出后仍继续编辑原来那个包。"
+            )
+            save_as_button.clicked.connect(self.save_as_package)
+            pack_button = QPushButton("文件夹导出为 .tscpkg")
+            pack_button.setToolTip(
+                "把包含 Musics 和 Scripts 的整个文件夹打包导出成一个 .tscpkg，\n"
+                "音乐和 Scripts 里的 .tscp/.tscps 都会一起装进去。"
+            )
             pack_button.clicked.connect(self.pack_directory)
             refresh_button = QPushButton("刷新")
             refresh_button.clicked.connect(self.refresh)
 
             toolbar = QHBoxLayout()
-            for button in (new_button, open_button, pack_button, refresh_button):
+            for button in (
+                new_button, open_button, save_as_button, pack_button, refresh_button,
+            ):
                 toolbar.addWidget(button)
             toolbar.addStretch(1)
 
@@ -298,6 +311,27 @@ if QT_AVAILABLE:
                 "已打开 %s：%d 个音乐简称、%d 个剧本、%d 个角色"
                 % (path.name, len(self.info.music), len(self.info.scripts),
                    len(self.info.characters))
+            )
+
+        def save_as_package(self) -> None:
+            """Export the open container, with everything inserted, to a new file."""
+
+            path = self._require()
+            if path is None:
+                return
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "导出剧情包副本", path.name, "TSCP 剧情包 (*.tscpkg)"
+            )
+            if not filename:
+                return
+            try:
+                target = save_copy(path, filename)
+            except (PackError, archive.PackageError, OSError, ValueError) as exc:
+                QMessageBox.critical(self, "剧情素材管理器", "导出失败：%s" % exc)
+                return
+            self.status.setText(
+                "已导出 %s：%d 个音乐、%d 个剧本（仍在本包里继续编辑）"
+                % (target, len(self.info.music), len(self.info.scripts))
             )
 
         def pack_directory(self) -> None:
