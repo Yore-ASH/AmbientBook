@@ -34,8 +34,7 @@ source/
     ExamplePlot.tscpkg    打包产物：交付只需要这一个文件
 ```
 
-`Scripts/__init__.json` 使用题目给出的 `CHARACTERS` 和 `DEPENDECE` 字段。
-题目中虽然写作 `Scripts/__init__.py`，这里按其实际内容使用 JSON 文件。
+`Scripts/__init__.json` 使用 `CHARACTERS` 和 `DEPENDECE` 字段。
 
 ## 安装和运行
 
