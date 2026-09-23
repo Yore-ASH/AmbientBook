@@ -150,11 +150,7 @@ if QT_AVAILABLE:
             package, scripts = self.playlists[row]
             self.title.setText(self.labels[row] if row < len(self.labels) else package.name)
             self.description.setText(
-                "%s\n%s"
-                % (
-                    package.metadata.get("DESCRIPTION", "请选择要播放的剧情"),
-                    package.location,
-                )
+                str(package.metadata.get("DESCRIPTION") or "请选择要播放的剧情")
             )
             self.script_list.clear()
             for name in scripts:

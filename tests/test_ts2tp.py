@@ -46,20 +46,29 @@ def test_source_pages_split_at_clear():
     assert [[line.text for line in page.lines] for page in pages] == [["一"], ["二"]]
 
 
-def test_punctuation_is_visible_but_does_not_consume_a_key():
+def test_punctuation_now_consumes_a_key():
     assert visible_characters("A,B!") == ["A", ",", "B", "!"]
-    assert timed_character_positions("A,B!") == [0, 2]
-    model = KeyboardTimingModel(
-        Script([Dialogue(None, "A,B!")]),
-        clock=iter([0.0, 1.0]).__next__,
-    )
+    assert timed_character_positions("A,B!") == [0, 1, 2, 3]
+    model = KeyboardTimingModel(Script([Dialogue(None, "A,B!")]))
     model.start(0.0)
-    assert model.handle_key("Space")
-    assert model.handle_key("Enter")
+    assert model.handle_key("Enter", 0.5)
+    assert model.handle_key("Enter", 0.6)
+    assert model.handle_key("Enter", 1.0)
+    assert model.handle_key("Enter", 1.1)
     result = model.result()
-    assert result.lines[0].delays == [0.0, 0.0, 1.0, 0.0]
-    # The explicit zero entries make the result valid for the TSCP serializer.
-    assert "0.000000,0.000000,1.000000,0.000000" in serialize_tscp(result)
+    assert result.lines[0].delays == pytest.approx([0.5, 0.1, 0.4, 0.1])
+    assert "0.500000,0.100000,0.400000,0.100000" in serialize_tscp(result)
+
+
+def test_whitespace_is_still_automatic():
+    assert visible_characters("A B") == ["A", " ", "B"]
+    assert timed_character_positions("A B") == [0, 2]
+    model = KeyboardTimingModel(Script([Dialogue(None, "A B")]))
+    model.start(0.0)
+    assert model.handle_key("Enter", 0.5)
+    assert model.handle_key("Enter", 1.0)
+    # 空格仍然立刻显示（0 秒），它没有自己的长度需要表演。
+    assert model.result().lines[0].delays == pytest.approx([0.5, 0.0, 0.5])
 
 
 def test_control_events_are_not_timed_and_are_reported():

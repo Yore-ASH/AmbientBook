@@ -29,7 +29,7 @@ from tscp_player.plot import (
     find_music_directory,
     load_music_files,
 )
-from TSGenerator.model import split_pages
+from TSGenerator.model import load_character_config, split_pages
 
 try:
     from .model import (
@@ -55,6 +55,7 @@ try:  # pragma: no cover - depends on optional GUI package
         QApplication,
         QAbstractItemView,
         QComboBox,
+        QDoubleSpinBox,
         QFileDialog,
         QHBoxLayout,
         QLabel,
@@ -92,6 +93,15 @@ def parse_script_file(text: str, suffix: str = "") -> Script:
     if suffix.lower() == ".tscp" or text.lstrip().startswith("TSCP "):
         return parse_tscp(text)
     return parse_tscps(text)
+
+
+def _seconds(value: object) -> float:
+    """Parse a ``<s>`` duration, treating anything broken as zero."""
+
+    try:
+        return max(0.0, float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _key_name(event: "QKeyEvent") -> str:
@@ -160,6 +170,21 @@ if QT_AVAILABLE:
         return "".join(output)
 
 
+    def _char_fragments(text: str):
+        """Yield one HTML fragment per visible character, ANSI styles applied."""
+
+        style = ""
+        for part in re.split("(" + ANSI_SEQUENCE_RE.pattern + ")", text):
+            if not part:
+                continue
+            if ANSI_SEQUENCE_RE.fullmatch(part):
+                style = _ansi_css(part)
+                continue
+            for character in part:
+                safe = html.escape(character).replace(" ", "&nbsp;")
+                yield "<span style='%s'>%s</span>" % (style, safe) if style else safe
+
+
     class ConverterWindow(QMainWindow):
         """Table-driven timing interface; source controls never consume a key."""
 
@@ -173,9 +198,16 @@ if QT_AVAILABLE:
             self._handled_directives = set()
             self.music_root: Optional[Path] = None
             self.music_files: dict = {}
+            self.characters: dict = {}
             self._music: Optional[MusicPlayer] = None
             self._music_unavailable = False
             self._wait_until = 0.0
+            self._preview_running = False
+            self._preview_index = 0
+            self._preview_parts: list = []
+            self._preview_fragments: list = []
+            self._preview_delays: list = []
+            self._preview_char = 0
             self.setWindowTitle("Ts2Tp - TSCP 逐字计时")
             self.resize(1180, 720)
             self._build_ui()
@@ -200,8 +232,12 @@ if QT_AVAILABLE:
             selected_button.clicked.connect(self.start_selected)
             save_button = QPushButton("保存 .tscp")
             save_button.clicked.connect(self.save_file)
-            full_button = QPushButton("完全预览")
-            full_button.clicked.connect(self.full_preview)
+            self.full_button = QPushButton("完全预览")
+            self.full_button.setToolTip(
+                "按设定好的程序流程完整播放一次整个剧本：\n"
+                "逐字节奏、<p> 音乐和 <s> 暂停都会真的执行。播放中按 Esc 停止。"
+            )
+            self.full_button.clicked.connect(self.full_preview)
             page_button = QPushButton("内容单页展示")
             page_button.clicked.connect(self.next_page)
             music_button = QPushButton("音乐文件夹")
@@ -220,16 +256,26 @@ if QT_AVAILABLE:
             self.key_edit.setMaximumWidth(130)
             self.key_edit.setToolTip("Enter、Space 或任意自定义键名；自定义键可填一个字符")
             key_label = QLabel("计时键:")
+            self.preview_delay = QDoubleSpinBox()
+            self.preview_delay.setRange(0.0, 2.0)
+            self.preview_delay.setDecimals(2)
+            self.preview_delay.setSingleStep(0.01)
+            self.preview_delay.setValue(0.06)
+            self.preview_delay.setMaximumWidth(90)
+            self.preview_delay.setToolTip("剧本还没有逐字时间时，完全预览使用的间隔（秒）")
+            preview_label = QLabel("预览逐字:")
 
             toolbar = QHBoxLayout()
             for button in (
                 open_button, start_button, selected_button, save_button,
-                full_button, page_button, music_button,
+                self.full_button, page_button, music_button,
             ):
                 toolbar.addWidget(button)
             toolbar.addWidget(self.mode)
             toolbar.addWidget(key_label)
             toolbar.addWidget(self.key_edit)
+            toolbar.addWidget(preview_label)
+            toolbar.addWidget(self.preview_delay)
             toolbar.addStretch(1)
 
             self.table = QTableWidget(0, 6)
@@ -284,7 +330,12 @@ if QT_AVAILABLE:
             self.model = None
             self._handled_directives.clear()
             self._wait_until = 0.0
+            self._stop_preview()
             self._stop_music()
+            try:
+                self.characters = load_character_config(path)
+            except ValueError:
+                self.characters = {}
             self._load_music_pack(find_music_directory(path))
             self._render_table()
             self.setWindowTitle("Ts2Tp - %s" % path.name)
@@ -395,6 +446,7 @@ if QT_AVAILABLE:
                 return
             self._handled_directives.clear()
             self._wait_until = 0.0
+            self._stop_preview()
             self._stop_music()
             self.model = KeyboardTimingModel(
                 self.script,
@@ -411,7 +463,7 @@ if QT_AVAILABLE:
         def start_timing(self) -> None:
             self._start_run(
                 None,
-                "全程计时：按 %s 记录当前字；第一次按键即计时起点，标点自动显示（0 秒）"
+                "全程计时：按 %s 记录当前字；第一次按键即计时起点（空格自动显示）"
                 % self.key_edit.text(),
             )
 
@@ -476,22 +528,25 @@ if QT_AVAILABLE:
             return "已清空屏幕"
 
         def eventFilter(self, watched: object, event: object) -> bool:
-            if (
-                self.model is not None
-                and event.type() == QEvent.Type.KeyPress
-                and watched is not self.key_edit
-            ):
+            if event.type() == QEvent.Type.KeyPress and watched is not self.key_edit:
                 key_event = event  # type: ignore[assignment]
-                remaining = self._wait_until - time.monotonic()
-                if remaining > 0:
-                    # <s> 暂停真的生效：暂停期间的按键不计时。
-                    self.status.setText("暂停中… 还需 %.1f 秒" % remaining)
+                if self._preview_running:
+                    # 完全预览期间按键只用来停止，不参与计时。
+                    if key_event.key() == Qt.Key.Key_Escape:
+                        self._stop_preview()
+                        self.status.setText("完全预览已停止")
                     return True
-                if self.model.handle_key(_key_name(key_event)):
-                    self._refresh_progress()
-                    if self.model.complete:
-                        self._finish_run()
-                    return True
+                if self.model is not None:
+                    remaining = self._wait_until - time.monotonic()
+                    if remaining > 0:
+                        # <s> 暂停真的生效：暂停期间的按键不计时。
+                        self.status.setText("暂停中… 还需 %.1f 秒" % remaining)
+                        return True
+                    if self.model.handle_key(_key_name(key_event)):
+                        self._refresh_progress()
+                        if self.model.complete:
+                            self._finish_run()
+                        return True
             return super().eventFilter(watched, event)
 
         def _render_table(self) -> None:
@@ -613,8 +668,13 @@ if QT_AVAILABLE:
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     return
+            # Default next to the script that was opened, not to the process
+            # working directory, so saving never drops a stray file at the root.
+            default = Path(compiled_name(self.source_path or "plot.tscps"))
+            if self.source_path is not None:
+                default = self.source_path.with_name(default.name)
             filename, _ = QFileDialog.getSaveFileName(
-                self, "保存编译文件", compiled_name(self.source_path or "plot.tscps"),
+                self, "保存编译文件", str(default),
                 "TSCP 文件 (*.tscp);;所有文件 (*)",
             )
             if not filename:
@@ -630,8 +690,117 @@ if QT_AVAILABLE:
             self.status.setText("已保存：%s" % path.name)
 
         def full_preview(self) -> None:
-            self.character_panel.setPlainText("\n".join(_display_line(line) for line in self.script.lines))
-            self.status.setText("完全预览：显示全部源事件；开始计时可恢复高亮")
+            """Play the whole script once, following the designed program flow.
+
+            Every event is performed for real: characters appear at their
+            recorded per-character delays, ``<p>`` switches the music and ``<s>``
+            really waits.  A script that has not been timed yet uses the
+            「预览逐字」 interval so the preview is still watchable.
+            """
+
+            if self._preview_running:
+                self._stop_preview()
+                self.status.setText("完全预览已停止")
+                return
+            if not self.script.lines:
+                QMessageBox.information(self, "Ts2Tp", "还没有可播放的剧本")
+                return
+            self._wait_until = 0.0
+            self._stop_music()
+            self._preview_running = True
+            self._preview_index = 0
+            self._preview_parts = []
+            self._preview_fragments = []
+            self._preview_delays = []
+            self._preview_char = 0
+            self.character_panel.clear()
+            self.full_button.setText("停止预览")
+            self.status.setText("完全预览：按剧本流程完整播放一次（Esc 停止）")
+            self._preview_next_event()
+
+        def _stop_preview(self) -> None:
+            self._preview_running = False
+            self._stop_music()
+            button = getattr(self, "full_button", None)
+            if button is not None:
+                button.setText("完全预览")
+
+        def _preview_next_event(self) -> None:
+            if not self._preview_running:
+                return
+            if self._preview_index >= len(self.script.lines):
+                self._preview_running = False
+                self.full_button.setText("完全预览")
+                self._stop_music()
+                self.status.setText("完全预览结束：整段剧情已按时间轴播完")
+                return
+            event = self.script.lines[self._preview_index]
+            self._preview_index += 1
+            if isinstance(event, Dialogue):
+                self._preview_begin_dialogue(event)
+            else:
+                self._preview_directive(event)
+
+        def _preview_begin_dialogue(self, event: Dialogue) -> None:
+            width = max(
+                (len(entry.name) for entry in self.characters.values()), default=0
+            )
+            if event.character is None:
+                self._preview_parts.append("&nbsp;" * (width + 4))
+            else:
+                character = self.characters.get(event.character)
+                name = character.name if character else event.character
+                css = _ansi_css(character.style) if character else ""
+                styled = (
+                    "<span style='%s'>%s</span>" % (css, html.escape(name))
+                    if css
+                    else html.escape(name)
+                )
+                self._preview_parts.append(
+                    "%s%s : " % ("&nbsp;" * max(0, width - len(name)), styled)
+                )
+            self._preview_fragments = list(_char_fragments(event.text))
+            self._preview_delays = list(event.delays)
+            self._preview_char = 0
+            self._preview_write()
+
+        def _preview_write(self) -> None:
+            if not self._preview_running:
+                return
+            if self._preview_char >= len(self._preview_fragments):
+                self._preview_parts.append("<br>")
+                self._render_preview()
+                QTimer.singleShot(0, self._preview_next_event)
+                return
+            self._preview_parts.append(self._preview_fragments[self._preview_char])
+            if self._preview_delays:
+                index = min(self._preview_char, len(self._preview_delays) - 1)
+                delay = self._preview_delays[index]
+            else:
+                delay = self.preview_delay.value()
+            self._preview_char += 1
+            self._render_preview()
+            QTimer.singleShot(max(0, round(delay * 1000)), self._preview_write)
+
+        def _render_preview(self) -> None:
+            self.character_panel.setHtml("".join(self._preview_parts))
+            bar = self.character_panel.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+        def _preview_directive(self, event: Directive) -> None:
+            if event.command == "c":
+                self._preview_parts = []
+                self.character_panel.clear()
+                QTimer.singleShot(0, self._preview_next_event)
+            elif event.command == "p":
+                self.status.setText("完全预览：" + self._apply_music(event.value))
+                QTimer.singleShot(0, self._preview_next_event)
+            elif event.command == "s":
+                seconds = _seconds(event.value)
+                self.status.setText("完全预览：暂停 %.2f 秒" % seconds)
+                QTimer.singleShot(max(0, round(seconds * 1000)), self._preview_next_event)
+            else:
+                QTimer.singleShot(0, self._preview_next_event)
 
         def next_page(self) -> None:
             if not self.pages:

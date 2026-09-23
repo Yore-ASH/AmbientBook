@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import string
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
@@ -74,21 +73,24 @@ def visible_characters(text: str) -> List[str]:
 def is_timed_character(character: str) -> bool:
     """Return whether *character* consumes a keyboard timing event.
 
-    Punctuation and whitespace are rendered immediately.  ``unicodedata`` is
-    used instead of an ASCII-only punctuation list so Chinese and full-width
-    punctuation behave the same as their ASCII counterparts.
+    Every visible character is timed, punctuation and symbols included, so an
+    author can give a comma or a full stop its own pause.  Only whitespace is
+    still rendered immediately, because a space has no length of its own to
+    perform.  ``unicodedata`` is used instead of an ASCII-only table so Chinese
+    and full-width punctuation behave the same as their ASCII counterparts.
     """
 
-    if not character or character.isspace() or character in string.punctuation:
+    if not character or character.isspace():
         return False
-    return not unicodedata.category(character).startswith(("P", "Z"))
+    return not unicodedata.category(character).startswith("Z")
 
 
 def timed_character_positions(text: str) -> List[int]:
     """Return visible indices which need a key press.
 
-    Indices refer to :func:`visible_characters`, not the raw string; ANSI
-    escape sequences therefore never affect the positions.
+    Every visible character needs one except whitespace.  Indices refer to
+    :func:`visible_characters`, not the raw string; ANSI escape sequences
+    therefore never affect the positions.
     """
 
     return [

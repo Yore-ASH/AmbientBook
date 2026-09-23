@@ -64,7 +64,7 @@ python Main.py source\dist\ExamplePlot.tscpkg
 python Main.py source\ExamplePlot
 ```
 
-播放前会显示 `__init__.json` 中的 `NAME`、`DESCRIPTION` 和完整路径。
+播放前会显示 `__init__.json` 中的 `NAME` 和 `DESCRIPTION`，不会显示文件路径。
 
 菜单中的“播放”会读取角色样式、校验版本并播放 `Scripts` 下的 `.tscp`。
 音乐控制使用音乐配置中的简称；PyGame 无法加载文件时会报告错误。
@@ -107,7 +107,9 @@ python Main.py source\ExamplePlot
 * `Ts2Tp` 将无间隔的 `.tscps` 原稿转换为带逐字时间的 `.tscp`，支持逐句和连续设计。
   第一次按计时键才是计时起点；「只录选中句」可以只重录一句话而保留其余句的
   时间；`<p>`/`<s>` 在计时期间会真的执行，表格里的「音乐」列显示每一句开始播
-  时音乐所处的位置。
+  时音乐所处的位置。所有可见字符都要按键，**标点也计时**，只有空格自动显示。
+  「完全预览」会按设定好的流程把整个剧本真实播放一遍（逐字节奏、音乐、暂停、
+  清屏都会执行），播放中按 Esc 停止。
 * `PlotManager` 是剧情素材管理器：新建 `.tscpkg`、把旧目录剧情一键打包、插入
   音乐（自动写入 `CONFIG` 简称）、导入 `.tscp` 或把 `.tscps` 编译后导入、删除
   条目、修改剧情名称与简介。
