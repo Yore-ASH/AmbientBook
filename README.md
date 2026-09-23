@@ -51,10 +51,20 @@ python -m tscp_player
 python Main.py
 ```
 
-它默认读取 `Main.py` 同目录下的 `source` 文件夹，列出其中找到的所有剧情包
-（`.tscpkg` 文件或剧情目录）以及各自的 `.tscp`。只有一个剧情时直接显示剧本
-列表，有多个时先选剧情。播放前会显示 `__init__.json` 中的 `NAME` 和
-`DESCRIPTION`。
+它默认读取 `Main.py` 同目录下的 `source` 文件夹，**递归**列出其中找到的所有
+`.tscpkg` 容器和剧情目录（所以 `source/dist/` 里的打包产物也会被找到），每个
+剧情再列出自己的 `.tscp`。只有一个剧情时直接显示剧本列表，有多个时先选剧情，
+同名剧情会附带相对路径以便区分；鼠标悬停能看到完整路径。
+
+某个包损坏或读不出来时**只会被跳过**，界面下方提示「已跳过 N 个」，不会阻止
+其它剧情播放。也可以直接指定要播放的目标：
+
+```powershell
+python Main.py source\dist\ExamplePlot.tscpkg
+python Main.py source\ExamplePlot
+```
+
+播放前会显示 `__init__.json` 中的 `NAME`、`DESCRIPTION` 和完整路径。
 
 菜单中的“播放”会读取角色样式、校验版本并播放 `Scripts` 下的 `.tscp`。
 音乐控制使用音乐配置中的简称；PyGame 无法加载文件时会报告错误。

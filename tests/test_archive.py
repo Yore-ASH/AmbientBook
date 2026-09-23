@@ -10,6 +10,7 @@ from tscp_player.plot import (
     discover_plot,
     discover_plots,
     load_archive_package,
+    load_plot,
     load_plot_package,
 )
 
@@ -154,6 +155,51 @@ def test_discover_plots_lists_containers_and_folders(tmp_path):
     # Two plots in one folder is ambiguous, so the single-plot helper refuses.
     with pytest.raises(PlotPackageError):
         discover_plot(tmp_path)
+
+
+def test_available_plots_finds_containers_in_subfolders(tmp_path):
+    deep = tmp_path / "dist" / "2026"
+    deep.mkdir(parents=True)
+    inner = archive.create(deep / "inner", name="Inner")
+    top = archive.create(tmp_path / "top", name="Top")
+
+    assert set(available_plots(tmp_path)) == {inner, top}
+    assert sorted(package.name for package in discover_plots(tmp_path)) == ["Inner", "Top"]
+
+
+def test_load_plot_dispatches_on_the_carrier(tmp_path):
+    container = _new(tmp_path)
+    assert load_plot(container).name == "Demo"
+    with pytest.raises(PlotPackageError):
+        load_plot(tmp_path / "missing.tscpkg")
+
+
+def test_available_plots_lists_a_broken_container_but_loading_still_raises(tmp_path):
+    broken = tmp_path / "broken.tscpkg"
+    broken.write_text("not a zip file", encoding="utf-8")
+    # Discovery stays honest: the file is listed so the caller can report it.
+    assert available_plots(tmp_path) == [broken]
+    with pytest.raises(PlotPackageError):
+        discover_plots(tmp_path)
+
+
+def test_player_skips_a_broken_container_and_keeps_the_rest(tmp_path):
+    import Main
+
+    good = _populated(tmp_path)
+    (tmp_path / "broken.tscpkg").write_text("not a zip file", encoding="utf-8")
+
+    playlists, problems = Main.load_playlists(tmp_path)
+    assert [package.location for package, _ in playlists] == [good]
+    assert [where.name for where, _ in problems] == ["broken.tscpkg"]
+
+
+def test_player_reports_when_nothing_is_playable(tmp_path):
+    import Main
+
+    (tmp_path / "broken.tscpkg").write_text("not a zip file", encoding="utf-8")
+    with pytest.raises(PlotPackageError):
+        Main.load_playlists(tmp_path)
 
 
 def test_container_without_scripts_still_loads(tmp_path):

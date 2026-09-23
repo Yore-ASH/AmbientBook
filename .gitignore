@@ -15,3 +15,7 @@ source/dist/
 *.swp
 Thumbs.db
 desktop.ini
+
+# 临时脚本与草稿（约定以 _ 开头，永不提交）
+_*.py
+_*.txt

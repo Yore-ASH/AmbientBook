@@ -36,6 +36,7 @@ from .plot import (
     find_music_directory,
     load_archive_package,
     load_music_files,
+    load_plot,
     load_plot_package,
 )
 from .timing import compile_file, compile_script
@@ -59,6 +60,7 @@ __all__ = [
     "PACKAGE_FORMAT_TEXT",
     "load_plot_package",
     "load_archive_package",
+    "load_plot",
     "discover_plot",
     "discover_plots",
     "available_plots",

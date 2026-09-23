@@ -9,7 +9,11 @@ from pathlib import Path
 from tscp_player.audio import MusicPlayer
 from tscp_player.format import ANSI_SEQUENCE_RE, Dialogue, Directive, Script
 from tscp_player.music import STOP_WORDS
-from tscp_player.plot import PlotPackageError, discover_plots
+from tscp_player.plot import (
+    PlotPackageError,
+    available_plots,
+    load_plot,
+)
 
 
 def _plain(text: str) -> str:
@@ -39,14 +43,35 @@ except ImportError:  # pragma: no cover
     QT_AVAILABLE = False
 
 
+def _plot_labels(playlists, source: Path):
+    """Name every plot, appending its location when two share a name."""
+
+    names = [package.name for package, _ in playlists]
+    counts = {name: names.count(name) for name in names}
+    labels = []
+    for package, _ in playlists:
+        if counts[package.name] == 1:
+            labels.append(package.name)
+            continue
+        try:
+            where = package.location.relative_to(source).as_posix()
+        except ValueError:
+            where = package.location.as_posix()
+        labels.append("%s - %s" % (package.name, where))
+    return labels
+
+
 if QT_AVAILABLE:
 
     class PlayerWindow(QMainWindow):
         """Introduction/selection page followed by an incremental player."""
 
-        def __init__(self, playlists) -> None:
+        def __init__(self, playlists, source=None, problems=()) -> None:
             super().__init__()
             self.playlists = list(playlists)
+            self.source = Path(source) if source is not None else Path(".")
+            self.problems = list(problems)
+            self.labels = _plot_labels(self.playlists, self.source)
             self.package = None
             self.script = None
             self.line_index = 0
@@ -96,8 +121,10 @@ if QT_AVAILABLE:
             self.begin_button.clicked.connect(self._begin_selected)
 
             multiple = len(self.playlists) > 1
-            for package, _ in self.playlists:
-                self.plot_list.addItem(QListWidgetItem(package.name))
+            for label, (package, _) in zip(self.labels, self.playlists):
+                item = QListWidgetItem(label)
+                item.setToolTip(str(package.location))
+                self.plot_list.addItem(item)
 
             layout.addWidget(self.title)
             layout.addWidget(self.description)
@@ -106,6 +133,13 @@ if QT_AVAILABLE:
                 layout.addWidget(self.plot_list, 1)
             layout.addWidget(self.script_list, 2)
             layout.addWidget(self.begin_button)
+            if self.problems:
+                note = QLabel("已跳过 %d 个无法读取的剧情包" % len(self.problems))
+                note.setStyleSheet("color: #a55;")
+                note.setToolTip(
+                    "\n".join("%s：%s" % (where, reason) for where, reason in self.problems)
+                )
+                layout.addWidget(note)
             self.plot_list.setCurrentRow(0)
             self._plot_changed(0)
             return page
@@ -114,9 +148,13 @@ if QT_AVAILABLE:
             if row < 0 or row >= len(self.playlists):
                 return
             package, scripts = self.playlists[row]
-            self.title.setText(package.name)
+            self.title.setText(self.labels[row] if row < len(self.labels) else package.name)
             self.description.setText(
-                str(package.metadata.get("DESCRIPTION", "请选择要播放的剧情"))
+                "%s\n%s"
+                % (
+                    package.metadata.get("DESCRIPTION", "请选择要播放的剧情"),
+                    package.location,
+                )
             )
             self.script_list.clear()
             for name in scripts:
@@ -275,34 +313,64 @@ if QT_AVAILABLE:
 
 
 def load_playlists(source: Path):
-    """Every playable plot under *source*, each with its compiled scripts."""
+    """Every playable plot under *source*, each with its compiled scripts.
 
-    packages = discover_plots(source)
-    if not packages:
-        raise PlotPackageError("source 中没有找到剧情包（.tscpkg 或剧情目录）")
+    Returns ``(playlists, problems)``.  Every ``.tscpkg`` and plot directory
+    under *source* is searched recursively, and one unreadable package must not
+    stop the player from opening the rest, so failures are collected rather than
+    raised.
+    """
+
+    source = Path(source)
+    if not source.exists():
+        raise PlotPackageError("source 目录不存在：%s" % source)
+    candidates = available_plots(source)
+    if not candidates:
+        raise PlotPackageError("source 中没有找到剧情包（.tscpkg 或剧情目录）：%s" % source)
+
     playlists = []
-    for package in packages:
-        names = package.script_names()
-        if not names:
-            continue
-        playlists.append((package, {name: package.load_script(name) for name in names}))
+    problems = []
+    for candidate in candidates:
+        try:
+            package = load_plot(candidate)
+            names = package.script_names()
+            if not names:
+                problems.append((candidate, "没有 .tscp 剧本"))
+                continue
+            playlists.append(
+                (package, {name: package.load_script(name) for name in names})
+            )
+        except (PlotPackageError, OSError, ValueError, RuntimeError) as exc:
+            problems.append((candidate, str(exc)))
     if not playlists:
-        raise PlotPackageError("剧情包中没有可播放的 .tscp 文件")
-    return playlists
+        detail = "；".join(
+            "%s：%s" % (where.name, reason) for where, reason in problems[:3]
+        )
+        raise PlotPackageError("没有可播放的剧情包。%s" % detail)
+    return playlists, problems
 
 
-def main() -> int:
-    source = Path(__file__).resolve().parent / "source"
+def main(argv=None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        # ``python Main.py <folder-or-.tscpkg>`` plays that target directly.
+        source = Path(arguments[0]).expanduser()
+        if not source.is_absolute():
+            source = (Path.cwd() / source).resolve()
+    else:
+        source = Path(__file__).resolve().parent / "source"
     try:
-        playlists = load_playlists(source)
+        playlists, problems = load_playlists(source)
     except (PlotPackageError, OSError, ValueError, RuntimeError) as exc:
         print("无法播放剧情: " + str(exc))
         return 1
+    for where, reason in problems:
+        print("已跳过 %s：%s" % (where, reason))
     if not QT_AVAILABLE:
         print("无法播放剧情：主程序需要 PySide6，请在 .venv 中执行 pip install PySide6")
         return 1
     app = QApplication(sys.argv)
-    window = PlayerWindow(playlists)
+    window = PlayerWindow(playlists, source, problems)
     window.show()
     return app.exec()
 

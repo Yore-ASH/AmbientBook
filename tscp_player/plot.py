@@ -269,17 +269,44 @@ def load_archive_package(
     return _load(ArchiveSource(candidate, cache_root))
 
 
-def _load_candidate(candidate: Path) -> PlotPackage:
+#: Directories never worth walking into while looking for plots.
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "__pycache__",
+    ".pytest_cache", ".idea", ".vscode", "node_modules",
+})
+
+
+def _walk(root: Path):
+    """Yield every entry under *root*, skipping obvious noise directories."""
+
+    for child in sorted(root.iterdir()):
+        if child.name in _SKIP_DIRS:
+            continue
+        yield child
+        if child.is_dir() and not child.is_symlink():
+            yield from _walk(child)
+
+
+def _is_plot_directory(path: Path) -> bool:
+    return (path / MUSICS).is_dir() and (path / SCRIPTS).is_dir()
+
+
+def load_plot(path: Union[str, Path]) -> PlotPackage:
+    """Load a plot from either a ``.tscpkg`` container or a plot directory."""
+
+    candidate = Path(path)
     if archive.is_package(candidate):
         return load_archive_package(candidate)
     return load_plot_package(candidate)
 
 
 def available_plots(source: Union[str, Path]) -> List[Path]:
-    """Every plot found at *source*.
+    """Every plot found at *source*, searched recursively.
 
-    Accepts a ``.tscpkg`` file, a plot directory, or a folder holding one or
-    more plots (``.tscpkg`` files and/or plot-shaped subdirectories).
+    A folder that is itself a plot is returned as-is.  Otherwise every
+    ``.tscpkg`` container and every plot-shaped directory underneath it is
+    returned, so a build-output folder such as ``source/dist/`` is picked up as
+    well.  Containers come first, each group sorted, so the listing is stable.
     """
 
     path = Path(source)
@@ -287,15 +314,17 @@ def available_plots(source: Union[str, Path]) -> List[Path]:
         return [path]
     if not path.is_dir():
         return []
-    if (path / MUSICS).is_dir() and (path / SCRIPTS).is_dir():
+    if _is_plot_directory(path):
         return [path]
-    found = [item for item in sorted(path.glob("*" + archive.SUFFIX)) if item.is_file()]
-    found += [
-        child
-        for child in sorted(path.iterdir())
-        if child.is_dir() and (child / MUSICS).is_dir() and (child / SCRIPTS).is_dir()
-    ]
-    return found
+
+    containers: List[Path] = []
+    folders: List[Path] = []
+    for entry in _walk(path):
+        if entry.is_file() and entry.suffix.lower() == archive.SUFFIX:
+            containers.append(entry)
+        elif entry.is_dir() and _is_plot_directory(entry):
+            folders.append(entry)
+    return sorted(containers) + sorted(folders)
 
 
 def discover_plots(source: Union[str, Path]) -> List[PlotPackage]:
@@ -303,10 +332,11 @@ def discover_plots(source: Union[str, Path]) -> List[PlotPackage]:
 
     An unreadable or invalid plot raises, rather than being silently skipped, so
     a broken container is reported instead of quietly disappearing from the
-    player's list.
+    player's list.  Use :func:`available_plots` plus :func:`load_plot` when a
+    single bad file should not stop the others from loading.
     """
 
-    return [_load_candidate(candidate) for candidate in available_plots(source)]
+    return [load_plot(candidate) for candidate in available_plots(source)]
 
 
 def discover_plot(source: Union[str, Path]) -> PlotPackage:
@@ -325,7 +355,7 @@ def discover_plot(source: Union[str, Path]) -> PlotPackage:
         return load_plot_package(path)
     candidates = available_plots(path)
     if len(candidates) == 1:
-        return _load_candidate(candidates[0])
+        return load_plot(candidates[0])
     raise PlotPackageError(
         "source must contain Musics and Scripts, or exactly one plot (found %d)"
         % len(candidates)
