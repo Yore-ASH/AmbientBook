@@ -19,10 +19,12 @@ from tscp_player import archive
 
 try:
     from .model import (
+        MusicDraft,
         PackError,
         PackageInfo,
         add_music,
         add_script,
+        add_tracks,
         create_package,
         export_script,
         inspect,
@@ -34,13 +36,16 @@ try:
         script_text,
         suggest_abbreviation,
         update_metadata,
+        update_track,
     )
 except ImportError:  # Support ``python PlotManager/Main.py``.
     from PlotManager.model import (  # type: ignore
+        MusicDraft,
         PackError,
         PackageInfo,
         add_music,
         add_script,
+        add_tracks,
         create_package,
         export_script,
         inspect,
@@ -52,14 +57,23 @@ except ImportError:  # Support ``python PlotManager/Main.py``.
         script_text,
         suggest_abbreviation,
         update_metadata,
+        update_track,
     )
+
+try:
+    from .recorder import LyricsRecorderDialog
+except ImportError:  # Support ``python PlotManager/Main.py``.
+    from PlotManager.recorder import LyricsRecorderDialog  # type: ignore
+
+from tscp_player.lyrics import lyric_source_lines, serialize_lrc
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import Qt
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QColor, QFont
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
+        QColorDialog,
         QDialog,
         QDialogButtonBox,
         QFileDialog,
@@ -86,6 +100,9 @@ except ImportError:  # pragma: no cover
 AUDIO_FILTER = (
     "音频 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac);;所有文件 (*)"
 )
+
+#: Default colour of the on-screen lyric text.
+LYRIC_COLOR_DEFAULT = "#ffffff"
 
 
 def _size_text(size: int) -> str:
@@ -183,8 +200,10 @@ if QT_AVAILABLE:
             meta_row.addWidget(self.description_edit, 2)
             meta_row.addWidget(apply_button)
 
-            self.music_table = QTableWidget(0, 4)
-            self.music_table.setHorizontalHeaderLabels(["简称", "文件", "大小", "状态"])
+            self.music_table = QTableWidget(0, 6)
+            self.music_table.setHorizontalHeaderLabels(
+                ["简称", "类型", "文件", "大小", "歌词", "颜色"]
+            )
             self.script_table = QTableWidget(0, 4)
             self.script_table.setHorizontalHeaderLabels(["剧本", "事件行", "可见字数", "角色"])
             for table in (self.music_table, self.script_table):
@@ -197,7 +216,8 @@ if QT_AVAILABLE:
                 "音乐",
                 self.music_table,
                 [
-                    ("插入音乐", "把一个或多个音频嵌进包并绑定简称", self.insert_music),
+                    ("插入音乐", "把一个或多个音频嵌进包并绑定简称；\n每个音频都会先问是纯音乐还是带歌词", self.insert_music),
+                    ("设置歌词", "修改选中曲目的类型、歌词来源与显示颜色", self.configure_lyrics),
                     ("删除选中", "解除简称；不再被引用的音频会一并删掉", self.delete_music),
                 ],
             )
@@ -271,24 +291,36 @@ if QT_AVAILABLE:
 
         # -- package level -------------------------------------------------
         def new_package(self) -> None:
-            name, ok = QInputDialog.getText(self, "新建剧情包", "剧情名称")
+            """Pick where the container lives first, then describe it.
+
+            The file dialog comes first because that is where the user is already
+            thinking about the new plot, and the name then defaults to whatever
+            they typed there instead of the other way round.
+            """
+
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "选择新剧情包的位置", "新剧情.tscpkg",
+                "TSCP 剧情包 (*.tscpkg)",
+            )
+            if not filename:
+                return
+            target = Path(filename)
+            if target.suffix.lower() != archive.SUFFIX:
+                target = target.with_suffix(archive.SUFFIX)
+
+            name, ok = QInputDialog.getText(
+                self, "新建剧情包", "剧情名称", text=target.stem
+            )
             if not ok or not name.strip():
                 return
             description, ok = QInputDialog.getText(self, "新建剧情包", "简介（可留空）")
             if not ok:
                 return
-            filename, _ = QFileDialog.getSaveFileName(
-                self, "保存剧情包", "%s.tscpkg" % name.strip(),
-                "TSCP 剧情包 (*.tscpkg)",
-            )
-            if not filename:
-                return
-            path = Path(filename)
             if self._run(
-                lambda: str(create_package(path, name=name, description=description)),
+                lambda: str(create_package(target, name=name, description=description)),
                 "已创建：%s",
             ):
-                self._open(path.with_suffix(".tscpkg"))
+                self._open(target)
 
         def open_package(self) -> None:
             filename, _ = QFileDialog.getOpenFileName(
@@ -380,7 +412,7 @@ if QT_AVAILABLE:
             )
             if not filenames:
                 return
-            entries = []
+            drafts = []
             for filename in filenames:
                 source = Path(filename)
                 abbreviation, ok = QInputDialog.getText(
@@ -390,11 +422,134 @@ if QT_AVAILABLE:
                 )
                 if not ok:
                     return
-                entries.append((source, abbreviation))
+                draft = MusicDraft(source=source, abbreviation=abbreviation)
+                if not self._ask_track_kind(draft):
+                    return
+                drafts.append(draft)
             self._run(
-                lambda: "、".join(add_music(path, entries)),
+                lambda: "、".join(add_tracks(path, drafts)),
                 "已插入音乐并更新简称：%s",
             )
+
+        def _ask_track_kind(self, draft: MusicDraft) -> bool:
+            """Ask whether the track is instrumental, then collect its lyrics."""
+
+            name = Path(draft.source).name
+            answer = QMessageBox.question(
+                self,
+                "音乐类型",
+                "《%s》是纯音乐吗？\n\n"
+                "是 —— 纯音乐，播放时只放声音\n"
+                "否 —— 带歌词，接下来选择歌词来源和显示颜色"
+                % name,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return False
+            if answer == QMessageBox.StandardButton.Yes:
+                draft.kind = "instrumental"
+                return True
+            draft.kind = "lyrics"
+            return self._collect_lyrics(draft)
+
+        def _collect_lyrics(self, draft: MusicDraft) -> bool:
+            """Pick an existing ``.lrc`` or record timings for a ``lyrics.txt``."""
+
+            source = QMessageBox.question(
+                self,
+                "歌词来源",
+                "歌词从哪来？\n\n"
+                "是 —— 选择现成的 .lrc 文件\n"
+                "否 —— 选择 lyrics.txt，现在播放音乐并逐句录制出现时间",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if source == QMessageBox.StandardButton.Cancel:
+                return False
+
+            if source == QMessageBox.StandardButton.Yes:
+                filename, _ = QFileDialog.getOpenFileName(
+                    self, "选择 LRC 歌词", "", "LRC 歌词 (*.lrc);;所有文件 (*)"
+                )
+                if not filename:
+                    return False
+                draft.lyrics_file = Path(filename)
+            else:
+                filename, _ = QFileDialog.getOpenFileName(
+                    self, "选择歌词文本", "", "歌词文本 (*.txt);;所有文件 (*)"
+                )
+                if not filename:
+                    return False
+                text_file = Path(filename)
+                try:
+                    lines = lyric_source_lines(text_file.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError) as exc:
+                    QMessageBox.critical(self, "剧情素材管理器", "无法读取歌词：%s" % exc)
+                    return False
+                if not lines:
+                    QMessageBox.warning(self, "剧情素材管理器", "这个文件里没有歌词行")
+                    return False
+                recorded = LyricsRecorderDialog.record(
+                    self, Path(draft.source), lines
+                )
+                if recorded is None:
+                    return False
+                draft.lyrics_text = serialize_lrc(recorded)
+                draft.lyrics_name = text_file.with_suffix(".lrc").name
+
+            colour = QColorDialog.getColor(
+                QColor(LYRIC_COLOR_DEFAULT), self, "选择歌词显示颜色"
+            )
+            if colour.isValid():
+                draft.color = colour.name()
+            return True
+
+        def configure_lyrics(self) -> None:
+            """Change the selected track's kind, lyrics source and colour."""
+
+            path = self._require()
+            if path is None:
+                return
+            selected = self._selected(self.music_table)
+            if len(selected) != 1:
+                QMessageBox.information(self, "剧情素材管理器", "请先选择恰好一个音乐简称")
+                return
+            abbreviation = selected[0]
+            entry = next(
+                (item for item in self.info.music if item.abbreviation == abbreviation),
+                None,
+            )
+            if entry is None:
+                return
+
+            draft = MusicDraft(
+                abbreviation=abbreviation, kind=entry.kind, color=entry.color
+            )
+            if not self._ask_track_kind(draft):
+                return
+            try:
+                if draft.kind == "lyrics":
+                    update_track(
+                        path,
+                        abbreviation,
+                        kind="lyrics",
+                        lyrics_file=draft.lyrics_file,
+                        lyrics_text=draft.lyrics_text,
+                        lyrics_name=draft.lyrics_name,
+                        color=draft.color or None,
+                    )
+                else:
+                    update_track(
+                        path, abbreviation, kind="instrumental", color=draft.color or None
+                    )
+            except (PackError, archive.PackageError, OSError, ValueError) as exc:
+                QMessageBox.critical(self, "剧情素材管理器", "设置失败：%s" % exc)
+                return
+            self.refresh()
+            self.status.setText("已更新 %s 的歌词设置" % abbreviation)
 
         def delete_music(self) -> None:
             path = self._require()
@@ -503,14 +658,28 @@ if QT_AVAILABLE:
             assert self.info is not None
             self.music_table.setRowCount(len(self.info.music))
             for row, entry in enumerate(self.info.music):
+                if entry.has_lyrics:
+                    kind = "带歌词"
+                    lyrics = entry.lyrics or ""
+                    if not entry.lyrics_present:
+                        lyrics += "（缺少文件）"
+                else:
+                    kind = "纯音乐"
+                    lyrics = "—"
                 values = [
                     entry.abbreviation,
+                    kind,
                     entry.filename,
                     _size_text(entry.size),
-                    "已嵌入" if entry.present else "缺少文件",
+                    lyrics,
+                    entry.color or "—",
                 ]
                 for column, value in enumerate(values):
-                    self.music_table.setItem(row, column, QTableWidgetItem(value))
+                    item = QTableWidgetItem(value)
+                    if column == 5 and entry.color:
+                        item.setForeground(QColor(entry.color))
+                        item.setBackground(QColor("#202124"))
+                    self.music_table.setItem(row, column, item)
             self.music_table.resizeColumnsToContents()
 
             self.script_table.setRowCount(len(self.info.scripts))

@@ -21,7 +21,15 @@ from tscp_player.format import (
     serialize_tscp,
     visible_text_length,
 )
-from tscp_player.plot import PROGRAM_VERSION_TEXT, PlotPackageError, load_plot_package
+from tscp_player.plot import (
+    KIND_INSTRUMENTAL,
+    KIND_LYRICS,
+    PROGRAM_VERSION_TEXT,
+    MusicTrack,
+    PlotPackageError,
+    load_plot_package,
+    parse_tracks,
+)
 
 PathLike = Union[str, Path]
 
@@ -39,6 +47,33 @@ class MusicEntry:
     filename: str
     size: int = 0
     present: bool = True
+    kind: str = KIND_INSTRUMENTAL
+    lyrics: Optional[str] = None
+    lyrics_present: bool = False
+    color: str = ""
+
+    @property
+    def has_lyrics(self) -> bool:
+        return self.kind == KIND_LYRICS and bool(self.lyrics)
+
+
+@dataclass
+class MusicDraft:
+    """One track being inserted, before it is written into the container.
+
+    Lyrics reach the container either as an existing ``.lrc`` file
+    (``lyrics_file``) or as text produced by the built-in recorder
+    (``lyrics_text`` plus the ``lyrics_name`` to store it under).  ``source`` is
+    only used when adding a track; editing an existing one leaves it empty.
+    """
+
+    abbreviation: str
+    source: PathLike = ""
+    kind: str = KIND_INSTRUMENTAL
+    lyrics_file: Optional[PathLike] = None
+    lyrics_text: Optional[str] = None
+    lyrics_name: Optional[str] = None
+    color: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,15 +136,30 @@ def inspect(path: PathLike) -> PackageInfo:
     scripts_meta = script_document(target)
     members = set(archive.members(target))
 
+    document = music_document(target)
+    config = music_config(target)
+    try:
+        tracks = parse_tracks(document, config)
+    except PlotPackageError as exc:
+        raise PackError(str(exc)) from exc
+
     music: List[MusicEntry] = []
-    for abbreviation, filename in sorted(music_config(target).items()):
+    for abbreviation, filename in sorted(config.items()):
         member = "%s/%s" % (archive.MUSICS_DIR, filename)
+        track = tracks[abbreviation]
+        lyrics_member = (
+            "%s/%s" % (archive.MUSICS_DIR, track.lyrics) if track.lyrics else ""
+        )
         music.append(
             MusicEntry(
                 abbreviation,
                 filename,
                 archive.member_size(target, member),
                 member in members,
+                kind=track.kind,
+                lyrics=track.lyrics,
+                lyrics_present=bool(lyrics_member) and lyrics_member in members,
+                color=track.color,
             )
         )
 
@@ -302,50 +352,192 @@ def suggest_abbreviation(filename: PathLike) -> str:
     return first[:12] or "track"
 
 
-def add_music(path: PathLike, entries: Sequence[Tuple[PathLike, str]]) -> List[str]:
-    """Embed audio files and bind them to abbreviations in one rewrite.
+def _track_table(document: dict) -> Dict[str, dict]:
+    raw = document.get("TRACKS") or {}
+    if not isinstance(raw, dict):
+        raise PackError("Musics TRACKS 必须是对象")
+    table: Dict[str, dict] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            raise PackError("音乐 %s 的 TRACKS 必须是对象" % key)
+        table[str(key)] = dict(value)
+    return table
 
-    ``entries`` is a sequence of ``(source_file, abbreviation)`` pairs.  The
-    file keeps its own name inside ``Musics/``; a second abbreviation pointing at
-    the same file is allowed and shares the embedded copy.
+
+def _lyrics_member_name(draft: MusicDraft, key: str) -> str:
+    if draft.lyrics_file is not None:
+        return Path(draft.lyrics_file).name
+    return Path(draft.lyrics_name).name if draft.lyrics_name else "%s.lrc" % key
+
+
+def _normalise_newlines(text: str) -> str:
+    """Store lyrics with LF so a container does not depend on the build OS."""
+
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_lyrics(path: PathLike) -> str:
+    source = Path(path)
+    if not source.is_file():
+        raise PackError("歌词文件不存在：%s" % source)
+    try:
+        return _normalise_newlines(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise PackError("无法读取歌词 %s：%s" % (source, exc)) from exc
+
+
+def add_tracks(path: PathLike, drafts: Sequence[MusicDraft]) -> List[str]:
+    """Embed audio (and lyrics) and record their metadata in one rewrite.
+
+    Each draft either embeds a finished ``.lrc`` file or carries the LRC text
+    produced by the recorder.  The audio, the lyric file and the updated
+    ``Musics/__init__.json`` all land in the container in a single pass.
     """
 
-    if not entries:
+    if not drafts:
         return sorted(music_config(path))
     document = music_document(path)
     config = music_config(path)
+    tracks = _track_table(document)
     additions: Dict[str, Path] = {}
-    for source_value, abbreviation in entries:
-        source = Path(source_value)
+    texts: Dict[str, str] = {}
+
+    for draft in drafts:
+        source = Path(draft.source)
         if not source.is_file():
             raise PackError("音乐文件不存在：%s" % source)
-        key = _check_abbreviation(abbreviation)
+        key = _check_abbreviation(draft.abbreviation)
+        kind = str(draft.kind or KIND_INSTRUMENTAL).strip().lower()
+        if kind not in {KIND_INSTRUMENTAL, KIND_LYRICS}:
+            raise PackError("未知的音乐类型：%s" % draft.kind)
+
         config[key] = source.name
         additions["%s/%s" % (archive.MUSICS_DIR, source.name)] = source
+
+        if kind == KIND_LYRICS:
+            name = _lyrics_member_name(draft, key)
+            member = "%s/%s" % (archive.MUSICS_DIR, name)
+            if draft.lyrics_file is not None:
+                texts[member] = _read_lyrics(draft.lyrics_file)
+            elif draft.lyrics_text is not None:
+                texts[member] = _normalise_newlines(draft.lyrics_text)
+            else:
+                raise PackError("%s 标为带歌词，但没有提供 .lrc 或歌词内容" % key)
+            entry = {"KIND": KIND_LYRICS, "LYRICS": name}
+            if draft.color:
+                entry["COLOR"] = draft.color
+            tracks[key] = entry
+        else:
+            tracks[key] = {"KIND": KIND_INSTRUMENTAL}
+
     document["CONFIG"] = config
-    archive.update(
-        path,
-        add=additions,
-        text={MUSIC_META: _write_json(document)},
-    )
+    document["TRACKS"] = tracks
+    texts[MUSIC_META] = _write_json(document)
+    archive.update(path, add=additions, text=texts)
     return sorted(config)
 
 
+def add_music(path: PathLike, entries: Sequence[Tuple[PathLike, str]]) -> List[str]:
+    """Embed instrumental audio and bind it to abbreviations.
+
+    A convenience wrapper over :func:`add_tracks` for the common case of a plain
+    ``(source_file, abbreviation)`` pair with no lyrics.
+    """
+
+    return add_tracks(
+        path, [MusicDraft(source=item[0], abbreviation=item[1]) for item in entries]
+    )
+
+
+def update_track(
+    path: PathLike,
+    abbreviation: str,
+    *,
+    kind: Optional[str] = None,
+    lyrics_file: Optional[PathLike] = None,
+    lyrics_text: Optional[str] = None,
+    lyrics_name: Optional[str] = None,
+    color: Optional[str] = None,
+) -> None:
+    """Change one existing track's kind, lyrics or colour.
+
+    Lyrics are only touched when new content is supplied, so switching a track
+    back to instrumental keeps its ``.lrc`` on disk in case it is wanted again.
+    """
+
+    key = _check_abbreviation(abbreviation)
+    config = music_config(path)
+    if key not in config:
+        raise PackError("包内没有这个音乐简称：%s" % key)
+    document = music_document(path)
+    tracks = _track_table(document)
+    entry = tracks.get(key, {})
+
+    if kind is not None:
+        wanted = str(kind).strip().lower()
+        if wanted not in {KIND_INSTRUMENTAL, KIND_LYRICS}:
+            raise PackError("未知的音乐类型：%s" % kind)
+        entry["KIND"] = wanted
+    entry.setdefault("KIND", KIND_INSTRUMENTAL)
+
+    if lyrics_file is not None or lyrics_text is not None:
+        draft = MusicDraft(
+            source=path,
+            abbreviation=key,
+            kind=KIND_LYRICS,
+            lyrics_file=lyrics_file,
+            lyrics_text=lyrics_text,
+            lyrics_name=lyrics_name,
+        )
+        name = _lyrics_member_name(draft, key)
+        member = "%s/%s" % (archive.MUSICS_DIR, name)
+        texts: Dict[str, str] = {}
+        if lyrics_file is not None:
+            texts[member] = _read_lyrics(lyrics_file)
+        else:
+            texts[member] = _normalise_newlines(lyrics_text or "")
+        entry["KIND"] = KIND_LYRICS
+        entry["LYRICS"] = name
+        document["TRACKS"] = tracks
+        tracks[key] = entry
+        texts[MUSIC_META] = _write_json(document)
+        archive.update(path, text=texts)
+        return
+
+    if color is not None:
+        entry["COLOR"] = str(color)
+    tracks[key] = entry
+    document["TRACKS"] = tracks
+    archive.update(path, text={MUSIC_META: _write_json(document)})
+
+
 def remove_music(path: PathLike, abbreviations: Iterable[str]) -> List[str]:
-    """Unbind abbreviations and drop audio no other abbreviation still uses."""
+    """Unbind abbreviations, dropping audio and lyrics nobody else references."""
 
     document = music_document(path)
     config = music_config(path)
+    tracks = _track_table(document)
     members = set(archive.members(path))
     removals: List[str] = []
     for key in abbreviations:
-        filename = config.pop(str(key), None)
+        name = str(key)
+        filename = config.pop(name, None)
+        entry = tracks.pop(name, None)
         if filename is None:
             continue
         member = "%s/%s" % (archive.MUSICS_DIR, filename)
         if member in members and filename not in config.values():
             removals.append(member)
+        lyrics = (entry or {}).get("LYRICS")
+        if lyrics:
+            shared = any(
+                other.get("LYRICS") == lyrics for other in tracks.values()
+            )
+            lyrics_member = "%s/%s" % (archive.MUSICS_DIR, lyrics)
+            if not shared and lyrics_member in members:
+                removals.append(lyrics_member)
     document["CONFIG"] = config
+    document["TRACKS"] = tracks
     archive.update(path, remove=removals, text={MUSIC_META: _write_json(document)})
     return sorted(config)
 
@@ -363,6 +555,16 @@ def bind_music(path: PathLike, abbreviation: str, filename: str) -> List[str]:
     document["CONFIG"] = config
     archive.update(path, text={MUSIC_META: _write_json(document)})
     return sorted(config)
+
+
+def track(path: PathLike, abbreviation: str) -> MusicTrack:
+    """The stored metadata for one abbreviation."""
+
+    config = music_config(path)
+    key = str(abbreviation)
+    if key not in config:
+        raise PackError("包内没有这个音乐简称：%s" % key)
+    return parse_tracks(music_document(path), config)[key]
 
 
 # --------------------------------------------------------------------------

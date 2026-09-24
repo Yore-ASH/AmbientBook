@@ -282,6 +282,121 @@ def test_save_copy_rejects_bad_targets(tmp_path):
         model.save_copy(tmp_path / "missing.tscpkg", tmp_path / "out.tscpkg")
 
 
+def test_add_tracks_embeds_audio_and_a_lyrics_file(tmp_path):
+    path = _package(tmp_path)
+    song = _song(tmp_path)
+    lrc = tmp_path / "song.lrc"
+    lrc.write_text("[00:01.00]第一句\n[00:03.50]Second line\n", encoding="utf-8")
+
+    model.add_tracks(path, [model.MusicDraft(
+        source=song,
+        abbreviation="iw",
+        kind="lyrics",
+        lyrics_file=lrc,
+        color="#ffd166",
+    )])
+
+    entry = model.inspect(path).music[0]
+    assert entry.kind == "lyrics"
+    assert entry.has_lyrics is True
+    assert entry.lyrics == "song.lrc"
+    assert entry.lyrics_present is True
+    assert entry.color == "#ffd166"
+    assert model.track(path, "iw").has_lyrics is True
+    assert archive.read_text(path, "Musics/song.lrc") == lrc.read_text(encoding="utf-8")
+
+
+def test_add_tracks_accepts_recorded_lyrics_text(tmp_path):
+    path = _package(tmp_path)
+    model.add_tracks(path, [model.MusicDraft(
+        source=_song(tmp_path),
+        abbreviation="iw",
+        kind="lyrics",
+        lyrics_text="[00:00.00]甲\n[00:02.00]乙\n",
+    )])
+
+    entry = model.inspect(path).music[0]
+    assert entry.lyrics == "iw.lrc"
+    assert entry.lyrics_present is True
+    assert archive.read_text(path, "Musics/iw.lrc").startswith("[00:00.00]甲")
+
+
+def test_add_tracks_rejects_lyrics_without_content(tmp_path):
+    path = _package(tmp_path)
+    song = _song(tmp_path)
+    with pytest.raises(model.PackError):
+        model.add_tracks(path, [model.MusicDraft(
+            source=song, abbreviation="iw", kind="lyrics"
+        )])
+    with pytest.raises(model.PackError):
+        model.add_tracks(path, [model.MusicDraft(
+            source=song, abbreviation="iw", kind="lyrics",
+            lyrics_file=tmp_path / "missing.lrc",
+        )])
+
+
+def test_instrumental_draft_records_its_kind(tmp_path):
+    path = _package(tmp_path)
+    model.add_tracks(path, [model.MusicDraft(
+        source=_song(tmp_path), abbreviation="bgm", kind="instrumental"
+    )])
+    entry = model.inspect(path).music[0]
+    assert entry.kind == "instrumental"
+    assert entry.has_lyrics is False
+    assert entry.lyrics is None
+
+
+def test_update_track_can_attach_and_detach_lyrics(tmp_path):
+    path = _package(tmp_path)
+    model.add_music(path, [(_song(tmp_path), "iw")])
+
+    model.update_track(path, "iw", kind="lyrics", lyrics_text="[00:00.00]甲\n")
+    assert model.track(path, "iw").has_lyrics is True
+
+    model.update_track(path, "iw", kind="instrumental", color="#00ff00")
+    entry = model.inspect(path).music[0]
+    assert entry.kind == "instrumental"
+    assert entry.color == "#00ff00"
+    # The lyric file stays on disk in case the track is switched back.
+    assert archive.has_member(path, "Musics/iw.lrc")
+
+    with pytest.raises(model.PackError):
+        model.update_track(path, "ghost", kind="lyrics")
+
+
+def test_remove_music_drops_unused_lyrics(tmp_path):
+    path = _package(tmp_path)
+    model.add_tracks(path, [model.MusicDraft(
+        source=_song(tmp_path), abbreviation="iw", kind="lyrics",
+        lyrics_text="[00:00.00]甲\n",
+    )])
+    assert archive.has_member(path, "Musics/iw.lrc")
+
+    model.remove_music(path, ["iw"])
+    assert model.inspect(path).music == []
+    assert archive.has_member(path, "Musics/iw.lrc") is False
+    assert archive.has_member(path, "Musics/__init__.json")
+
+
+def test_remove_music_keeps_lyrics_another_track_still_uses(tmp_path):
+    path = _package(tmp_path)
+    song = _song(tmp_path)
+    model.add_tracks(path, [
+        model.MusicDraft(source=song, abbreviation="a", kind="lyrics",
+                         lyrics_text="[00:00.00]共用\n", lyrics_name="shared.lrc"),
+        model.MusicDraft(source=song, abbreviation="b", kind="lyrics",
+                         lyrics_text="[00:00.00]共用\n", lyrics_name="shared.lrc"),
+    ])
+    model.remove_music(path, ["a"])
+    assert archive.has_member(path, "Musics/shared.lrc") is True
+    assert model.track(path, "b").lyrics == "shared.lrc"
+
+
+def test_track_rejects_an_unknown_abbreviation(tmp_path):
+    with pytest.raises(model.PackError):
+        model.track(_package(tmp_path), "ghost")
+
+
 def test_suggest_abbreviation(tmp_path):
     assert model.suggest_abbreviation(tmp_path / "i want.flac") == "i"
     assert model.suggest_abbreviation(tmp_path / "theme.ogg") == "theme"

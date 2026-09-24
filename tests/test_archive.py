@@ -202,6 +202,83 @@ def test_player_reports_when_nothing_is_playable(tmp_path):
         Main.load_playlists(tmp_path)
 
 
+def test_tracks_default_to_instrumental(tmp_path):
+    path = _populated(tmp_path)
+    package = load_archive_package(path, cache_root=tmp_path / "cache")
+    track = package.track("iw")
+    assert track.filename == "song.flac"
+    assert track.instrumental is True
+    assert track.has_lyrics is False
+    assert package.lyrics_path("iw") is None
+    assert package.lyrics("iw").lines == []
+
+
+def _with_tracks(tmp_path, tracks, extra=None):
+    """Rewrite a populated container's Musics metadata with a TRACKS section."""
+
+    path = _populated(tmp_path)
+    texts = {
+        "Musics/__init__.json": json.dumps({
+            "VERSION": "0.0.1",
+            "CONFIG": {"iw": "song.flac"},
+            "TRACKS": tracks,
+        })
+    }
+    texts.update(extra or {})
+    archive.update(path, text=texts)
+    return path
+
+
+def test_track_can_declare_lyrics(tmp_path):
+    path = _with_tracks(
+        tmp_path,
+        {"iw": {"KIND": "lyrics", "LYRICS": "song.lrc", "COLOR": "#ffd166"}},
+        {"Musics/song.lrc": "[00:01.00]第一句\n[00:03.50]Second line\n"},
+    )
+    package = load_archive_package(path, cache_root=tmp_path / "cache")
+    track = package.track("iw")
+    assert track.kind == "lyrics"
+    assert track.has_lyrics is True
+    assert track.instrumental is False
+    assert track.color == "#ffd166"
+
+    assert package.lyrics_path("iw").name == "song.lrc"
+    lyrics = package.lyrics("iw")
+    assert [line.text for line in lyrics.lines] == ["第一句", "Second line"]
+    assert lyrics.at(2.0) == "第一句"
+    assert lyrics.at(3.5) == "Second line"
+
+
+def test_instrumental_track_can_be_stated_explicitly(tmp_path):
+    package = load_archive_package(_with_tracks(tmp_path, {"iw": {"KIND": "instrumental"}}))
+    assert package.track("iw").instrumental is True
+
+
+def test_declared_lyrics_that_are_missing_are_ignored(tmp_path):
+    package = load_archive_package(
+        _with_tracks(tmp_path, {"iw": {"KIND": "lyrics", "LYRICS": "gone.lrc"}})
+    )
+    assert package.track("iw").has_lyrics is True
+    assert package.lyrics_path("iw") is None
+    assert package.lyrics("iw").lines == []
+
+
+def test_unknown_track_kind_is_rejected(tmp_path):
+    path = _with_tracks(tmp_path, {"iw": {"KIND": "humming"}})
+    with pytest.raises(PlotPackageError):
+        load_archive_package(path)
+
+
+def test_malformed_track_sections_are_rejected(tmp_path):
+    with pytest.raises(PlotPackageError):
+        load_archive_package(_with_tracks(tmp_path, "nope"))
+
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(PlotPackageError):
+        load_archive_package(_with_tracks(other, {"iw": "nope"}))
+
+
 def test_container_without_scripts_still_loads(tmp_path):
     path = _new(tmp_path)
     package = load_archive_package(path)

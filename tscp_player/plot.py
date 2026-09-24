@@ -34,6 +34,34 @@ class Character:
     style: str
 
 
+#: ``Musics/__init__.json`` ``TRACKS`` kinds.
+KIND_INSTRUMENTAL = "instrumental"
+KIND_LYRICS = "lyrics"
+
+
+@dataclass(frozen=True)
+class MusicTrack:
+    """One music entry, plus whether it carries lyrics and in what colour.
+
+    A plain ``CONFIG`` string (the original format) means an instrumental track,
+    so plots written before lyrics existed keep working unchanged.
+    """
+
+    abbreviation: str
+    filename: str
+    kind: str = KIND_INSTRUMENTAL
+    lyrics: Optional[str] = None
+    color: str = ""
+
+    @property
+    def has_lyrics(self) -> bool:
+        return self.kind == KIND_LYRICS and bool(self.lyrics)
+
+    @property
+    def instrumental(self) -> bool:
+        return self.kind != KIND_LYRICS
+
+
 class PlotSource:
     """Where a plot's members live."""
 
@@ -119,11 +147,13 @@ class PlotPackage:
         metadata: dict,
         characters: Dict[str, Character],
         music: Dict[str, str],
+        tracks: Optional[Dict[str, MusicTrack]] = None,
     ) -> None:
         self.source = source
         self.metadata = metadata
         self.characters = characters
         self.music = music
+        self.tracks = tracks if tracks is not None else parse_tracks({}, music)
 
     @property
     def location(self) -> Path:
@@ -153,11 +183,42 @@ class PlotPackage:
     def script_names(self) -> List[str]:
         return self.source.list(SCRIPTS, ".tscp")
 
+    def track(self, abbreviation: str) -> MusicTrack:
+        """Metadata for one abbreviation, falling back to a plain filename."""
+
+        known = self.tracks.get(abbreviation)
+        if known is not None:
+            return known
+        return MusicTrack(abbreviation, self.music.get(abbreviation, abbreviation))
+
     def music_path(self, abbreviation: str) -> Path:
         """A real filename for one music abbreviation, extracting if needed."""
 
-        filename = self.music.get(abbreviation, abbreviation)
-        return self.source.materialize("%s/%s" % (MUSICS, filename))
+        return self.source.materialize("%s/%s" % (MUSICS, self.track(abbreviation).filename))
+
+    def lyrics_path(self, abbreviation: str) -> Optional[Path]:
+        """A real filename for a track's lyrics, or ``None`` when it has none."""
+
+        track = self.track(abbreviation)
+        if not track.has_lyrics:
+            return None
+        member = "%s/%s" % (MUSICS, track.lyrics)
+        if not self.source.exists(member):
+            return None
+        return self.source.materialize(member)
+
+    def lyrics(self, abbreviation: str):
+        """The parsed lyrics for one abbreviation, or empty lyrics."""
+
+        from .lyrics import Lyrics, parse_lrc
+
+        path = self.lyrics_path(abbreviation)
+        if path is None:
+            return Lyrics([])
+        try:
+            return parse_lrc(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            return Lyrics([])
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return "PlotPackage(%s, %r)" % (self.location, self.name)
@@ -194,6 +255,7 @@ def _load(source: PlotSource) -> PlotPackage:
         for key, value in scripts_meta["CHARACTERS"].items()
     }
     music = load_music_files_from(music_meta)
+    tracks = parse_tracks(music_meta, music)
     dependency = scripts_meta.get("DEPENDECE", {}).get("MAIN", {}).get("VERSION", "0.0.0")
     if _version(dependency, "Scripts dependency") != PROGRAM_VERSION:
         raise PlotPackageError("script requires main version %s, current is %s"
@@ -209,7 +271,32 @@ def _load(source: PlotSource) -> PlotPackage:
         required_version = _version(music_dependency, "music dependency")
         if actual_version < required_version:
             raise PlotPackageError("music pack is older than script requirement")
-    return PlotPackage(source, metadata, characters, music)
+    return PlotPackage(source, metadata, characters, music, tracks)
+
+
+def parse_tracks(metadata: dict, music: Dict[str, str]) -> Dict[str, MusicTrack]:
+    """Combine the ``CONFIG`` filenames with the optional ``TRACKS`` details."""
+
+    raw = metadata.get("TRACKS") or {}
+    if not isinstance(raw, dict):
+        raise PlotPackageError("Musics TRACKS must be an object")
+    tracks: Dict[str, MusicTrack] = {}
+    for abbreviation, filename in music.items():
+        entry = raw.get(abbreviation) or {}
+        if not isinstance(entry, dict):
+            raise PlotPackageError("music track %s must be an object" % abbreviation)
+        kind = str(entry.get("KIND", KIND_INSTRUMENTAL)).strip().lower()
+        if kind not in {KIND_INSTRUMENTAL, KIND_LYRICS}:
+            raise PlotPackageError("music track %s has an unknown KIND" % abbreviation)
+        lyrics = entry.get("LYRICS")
+        tracks[abbreviation] = MusicTrack(
+            abbreviation=abbreviation,
+            filename=filename,
+            kind=kind,
+            lyrics=str(lyrics) if lyrics else None,
+            color=str(entry.get("COLOR") or ""),
+        )
+    return tracks
 
 
 def load_music_files_from(metadata: dict) -> Dict[str, str]:

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from pathlib import Path
 
 from tscp_player.audio import MusicPlayer
 from tscp_player.format import ANSI_SEQUENCE_RE, Dialogue, Directive, Script
+from tscp_player.lyrics import to_html
 from tscp_player.music import STOP_WORDS
 from tscp_player.plot import (
     PlotPackageError,
@@ -21,10 +23,11 @@ def _plain(text: str) -> str:
 
 
 try:  # pragma: no cover - depends on the optional GUI dependency
-    from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QTimer, Qt
-    from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+    from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QPoint, QTimer, Qt
+    from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextCharFormat, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
+        QGraphicsDropShadowEffect,
         QGraphicsOpacityEffect,
         QLabel,
         QListWidget,
@@ -63,6 +66,99 @@ def _plot_labels(playlists, source: Path):
 
 if QT_AVAILABLE:
 
+    #: Point size of the on-screen lyric text.
+    LYRIC_POINT_SIZE = 26
+
+    class LyricsWindow(QWidget):
+        """A backgroundless window that follows the current lyric line.
+
+        No frame, no fill: only the text is drawn, so it floats over whatever is
+        behind it.  Chinese uses 宋体, Latin uses Times New Roman in italic, and
+        every other script picks the best installed family for it.  Drag it
+        anywhere to place it.
+        """
+
+        def __init__(self, parent=None) -> None:
+            super().__init__(
+                parent,
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool,
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setWindowTitle("歌词")
+
+            self.label = QLabel(self)
+            self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.label.setTextFormat(Qt.TextFormat.RichText)
+            self.label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.label.setFont(QFont("", LYRIC_POINT_SIZE))
+            # A drop shadow keeps the text readable over any wallpaper without
+            # painting a background box behind it.
+            shadow = QGraphicsDropShadowEffect(self)
+            shadow.setBlurRadius(14)
+            shadow.setColor(QColor(0, 0, 0, 210))
+            shadow.setOffset(0, 2)
+            self.label.setGraphicsEffect(shadow)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(28, 14, 28, 14)
+            layout.addWidget(self.label)
+
+            self._families = QFontDatabase.families()
+            self._lyrics = None
+            self._color = "#ffffff"
+            self._dragging = None
+            self.resize(960, 130)
+
+        # -- content -------------------------------------------------------
+        def show_track(self, lyrics, color: str = "", seconds: float = 0.0) -> None:
+            """Start showing *lyrics* in *color*, positioned once per track."""
+
+            self._lyrics = lyrics
+            self._color = color or "#ffffff"
+            if not self.isVisible():
+                self._place()
+                self.show()
+            self.raise_()
+            self.update_line(seconds)
+
+        def update_line(self, seconds: float) -> None:
+            if self._lyrics is None:
+                return
+            text = self._lyrics.at(seconds)
+            self.label.setText("" if not text else to_html(text, self._color, self._families))
+
+        def clear(self) -> None:
+            self._lyrics = None
+            self.label.clear()
+
+        # -- placement -----------------------------------------------------
+        def _place(self) -> None:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            self.move(
+                area.x() + (area.width() - self.width()) // 2,
+                area.y() + int(area.height() * 0.72),
+            )
+
+        def mousePressEvent(self, event) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._dragging = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                event.accept()
+
+        def mouseMoveEvent(self, event) -> None:
+            if self._dragging is not None:
+                self.move(event.globalPosition().toPoint() - self._dragging)
+                event.accept()
+
+        def mouseReleaseEvent(self, event) -> None:
+            self._dragging = None
+            event.accept()
+
     class PlayerWindow(QMainWindow):
         """Introduction/selection page followed by an incremental player."""
 
@@ -79,6 +175,13 @@ if QT_AVAILABLE:
             self.current_delays = []
             self.music = MusicPlayer()
             self._closed = False
+            # The lyric overlay is created only when a track actually has lyrics,
+            # so a plot without any never pops a second window.
+            self.lyrics_window = None
+            self._lyrics_started_at = None
+            self._lyrics_timer = QTimer(self)
+            self._lyrics_timer.setInterval(80)
+            self._lyrics_timer.timeout.connect(self._tick_lyrics)
 
             self.setWindowTitle("剧情播放器")
             self.resize(1000, 700)
@@ -207,6 +310,7 @@ if QT_AVAILABLE:
             if self._closed or self.script is None:
                 return
             if self.line_index >= len(self.script.lines):
+                self._hide_lyrics()
                 self.status.setText("剧情播放完成")
                 return
             item = self.script.lines[self.line_index]
@@ -224,8 +328,10 @@ if QT_AVAILABLE:
                 try:
                     if item.value.strip().lower() in STOP_WORDS:
                         self.music.stop()
+                        self._hide_lyrics()
                     else:
                         self.music.ensure(str(self.package.music_path(item.value)))
+                        self._show_lyrics(item.value)
                 except (OSError, RuntimeError, ValueError) as exc:
                     QMessageBox.critical(self, "无法播放剧情", str(exc))
                     return
@@ -234,6 +340,37 @@ if QT_AVAILABLE:
                 QTimer.singleShot(max(0, round(float(item.value) * 1000)), self._next_event)
             else:
                 raise ValueError("未知控制指令: " + item.command)
+
+        # -- lyrics overlay ------------------------------------------------
+        def _show_lyrics(self, abbreviation: str) -> None:
+            """Open the lyric window when the track actually carries lyrics."""
+
+            lyrics = self.package.lyrics(abbreviation)
+            if not lyrics:
+                self._hide_lyrics()
+                self.status.setText("播放中 · 纯音乐 %s" % abbreviation)
+                return
+            track = self.package.track(abbreviation)
+            if self.lyrics_window is None:
+                self.lyrics_window = LyricsWindow()
+            self._lyrics_started_at = time.monotonic()
+            self.lyrics_window.show_track(lyrics, track.color, 0.0)
+            self._lyrics_timer.start()
+            self.status.setText(
+                "播放中 · 歌词 %s（%d 句）" % (abbreviation, len(lyrics))
+            )
+
+        def _tick_lyrics(self) -> None:
+            if self.lyrics_window is None or self._lyrics_started_at is None:
+                return
+            self.lyrics_window.update_line(time.monotonic() - self._lyrics_started_at)
+
+        def _hide_lyrics(self) -> None:
+            self._lyrics_timer.stop()
+            self._lyrics_started_at = None
+            if self.lyrics_window is not None:
+                self.lyrics_window.clear()
+                self.lyrics_window.hide()
 
         def _begin_dialogue(self, item: Dialogue) -> None:
             width = max((len(value.name) for value in self.package.characters.values()), default=0)
@@ -304,6 +441,10 @@ if QT_AVAILABLE:
 
         def closeEvent(self, event) -> None:
             self._closed = True
+            self._hide_lyrics()
+            if self.lyrics_window is not None:
+                self.lyrics_window.close()
+                self.lyrics_window = None
             self.music.close()
             event.accept()
 
