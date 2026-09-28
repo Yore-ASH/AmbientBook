@@ -480,6 +480,11 @@ def update_track(
         entry["KIND"] = wanted
     entry.setdefault("KIND", KIND_INSTRUMENTAL)
 
+    # Colour is applied up front so it survives the lyrics branch below, which
+    # returns early: passing lyrics and a colour together must set both.
+    if color is not None:
+        entry["COLOR"] = str(color)
+
     if lyrics_file is not None or lyrics_text is not None:
         draft = MusicDraft(
             source=path,
@@ -504,8 +509,6 @@ def update_track(
         archive.update(path, text=texts)
         return
 
-    if color is not None:
-        entry["COLOR"] = str(color)
     tracks[key] = entry
     document["TRACKS"] = tracks
     archive.update(path, text={MUSIC_META: _write_json(document)})

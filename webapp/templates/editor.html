@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}编写剧情 - TSCP 剧情工坊{% endblock %}
+
+{% block content %}
+<div class="row" style="justify-content: space-between; margin-bottom: 14px;">
+  <div>
+    <h1 id="plot-title" style="font-size: 20px; margin: 0;">加载中…</h1>
+    <div id="plot-desc" class="muted"></div>
+  </div>
+  <div class="row">
+    <button id="edit-meta" class="ghost" type="button">改信息</button>
+    <a id="play-link" class="button ghost" href="#">播放</a>
+    <a id="download-link" class="button" href="#">下载 .tscpkg</a>
+  </div>
+</div>
+
+<div class="split">
+  <section class="card">
+    <div class="row" style="justify-content: space-between;">
+      <h2 style="margin: 0;">剧本</h2>
+      <div class="row">
+        <button id="import-script" class="small" type="button">导入</button>
+        <button id="save-script" class="small" type="button">保存</button>
+        <button id="delete-script" class="small danger" type="button">删除</button>
+      </div>
+    </div>
+    <select id="script-select" size="5" style="height: auto; margin: 8px 0;"></select>
+    <textarea id="script-text" class="editor-area" spellcheck="false"
+              placeholder="选择左边列表里的剧本，或点「导入」上传 .tscp / .tscps"></textarea>
+    <div id="script-hint" class="muted"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content: space-between;">
+      <h2 style="margin: 0;">音乐</h2>
+      <div class="row">
+        <button id="insert-music" class="small" type="button">插入音乐</button>
+        <button id="edit-lyrics" class="small ghost" type="button">设置歌词</button>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>简称</th><th>类型</th><th>文件</th><th>歌词</th><th>颜色</th><th></th></tr>
+      </thead>
+      <tbody id="music-rows"></tbody>
+    </table>
+    <div id="music-empty" class="empty" hidden>还没有音乐。</div>
+  </section>
+</div>
+
+<input id="script-file" type="file" accept=".tscp,.tscps" hidden>
+<input id="audio-file" type="file" accept="audio/*" hidden>
+<input id="lrc-file" type="file" accept=".lrc,.txt" hidden>
+{% endblock %}
+
+{% block scripts %}
+<script>window.PLOT_ID = {{ plot_id|tojson }};</script>
+<script src="{{ url_for('static', filename='editor.js') }}"></script>
+{% endblock %}

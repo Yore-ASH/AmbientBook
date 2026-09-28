@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}管理后台 - TSCP 剧情工坊{% endblock %}
+
+{% block content %}
+<h1 style="font-size: 20px; margin: 0 0 14px;">管理后台</h1>
+
+<section class="card" style="margin-bottom: 16px;">
+  <div class="row" id="overview"></div>
+</section>
+
+<section class="card" style="margin-bottom: 16px;">
+  <div class="row" style="justify-content: space-between;">
+    <h2 style="margin: 0;">用户</h2>
+    <button id="new-user">新建用户</button>
+  </div>
+  <table>
+    <thead>
+      <tr><th>用户名</th><th>显示名</th><th>邮箱</th><th>角色</th><th>状态</th><th>剧情包</th><th>注册时间</th><th></th></tr>
+    </thead>
+    <tbody id="user-rows"></tbody>
+  </table>
+</section>
+
+<section class="card">
+  <div class="row" style="justify-content: space-between;">
+    <h2 style="margin: 0;">全部剧情包</h2>
+    <button id="reload-plots" class="ghost">刷新</button>
+  </div>
+  <table>
+    <thead>
+      <tr><th>名称</th><th>所有者</th><th>大小</th><th>更新时间</th><th></th></tr>
+    </thead>
+    <tbody id="plot-rows"></tbody>
+  </table>
+  <div id="plot-empty" class="empty" hidden>还没有任何剧情包。</div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='admin.js') }}"></script>
+{% endblock %}

@@ -3,6 +3,18 @@
 这是一套用来编写、计时和播放文字剧情的工具链：把 `.tscps` 原稿编译成带逐字
 时间的 `.tscp`，装进剧情包，再用黑底窗口逐字播放并配乐。
 
+既有 **桌面版**（PySide6 / pygame），也有 **网页版**（Flask，浏览器里编写、录音、
+打包、下载、播放）。两边产出和读取的 `.tscpkg` 完全一致，可以互相交换。
+
+```powershell
+python -m pip install ".[gui,web]"
+python Main.py            # 桌面播放器
+python Editor/Main.py     # 桌面制作工具箱
+python -m webapp          # 网页版：http://127.0.0.1:5000
+```
+
+网页版的安装、部署、环境变量与 API 见 [webapp/README.md](webapp/README.md)。
+
 ## 剧情包
 
 一次剧情由三份元数据和若干剧本、音乐组成，可以有两种存放方式。

@@ -7,6 +7,11 @@
 *.tscp  text eol=lf
 *.tscps text eol=lf
 
+# 网页版资源同样是文本，部署到 Linux 服务器前就统一成 LF
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+
 # 音频与剧情包容器是二进制，禁止任何行尾转换
 *.flac   binary
 *.mp3    binary

@@ -1,0 +1,212 @@
+/* Dark theme matching the desktop player: black canvas, light text. */
+
+:root {
+  --bg: #0b0c0e;
+  --panel: #14161a;
+  --panel-2: #1b1e24;
+  --line: #2a2f37;
+  --text: #e6e8eb;
+  --muted: #8b939e;
+  --accent: #ffd166;
+  --accent-dim: #8a7133;
+  --ok: #4ec97a;
+  --warn: #ffb454;
+  --bad: #ff6b6b;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre, .mono {
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+}
+
+/* ---- layout ---------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.brand { font-weight: 700; color: var(--text); font-size: 16px; }
+.topbar nav { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.topbar .who { color: var(--muted); }
+
+main { padding: 20px; max-width: 1280px; margin: 0 auto; }
+
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.grid { display: grid; gap: 16px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.card h2, .card h3 { margin: 0 0 12px; font-size: 15px; color: var(--muted); font-weight: 600; }
+
+/* ---- controls -------------------------------------------------------- */
+
+button, .button {
+  font: inherit;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-dim);
+  background: var(--accent);
+  color: #191919;
+  cursor: pointer;
+}
+button:hover:not(:disabled), .button:hover { filter: brightness(1.08); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+button.ghost, .button.ghost {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--line);
+}
+button.danger { background: transparent; color: var(--bad); border-color: #5a2a2a; }
+button.small { padding: 4px 10px; font-size: 13px; }
+
+input, select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent-dim); }
+label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+.field { margin-bottom: 12px; }
+
+/* ---- tables ---------------------------------------------------------- */
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 13px; }
+tbody tr:hover { background: var(--panel-2); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- misc ------------------------------------------------------------ */
+
+.muted { color: var(--muted); }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 18px;
+  z-index: 50;
+  max-width: 80vw;
+}
+.toast.bad { border-left-color: var(--bad); }
+.toast.ok { border-left-color: var(--ok); }
+
+dialog.modal {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px;
+  min-width: min(520px, 92vw);
+  max-width: min(720px, 92vw);
+}
+dialog.modal::backdrop { background: rgba(0, 0, 0, .6); }
+dialog.modal h3 { margin: 0 0 14px; }
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+.pill.lyrics { color: var(--accent); border-color: var(--accent-dim); }
+
+.tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+.tabs button {
+  background: transparent; color: var(--muted); border: none;
+  border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 12px;
+}
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+.editor-area {
+  width: 100%;
+  min-height: 380px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 13px;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+/* ---- player ---------------------------------------------------------- */
+
+.stage {
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 32px;
+  min-height: 340px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 18px;
+  line-height: 1.9;
+  white-space: pre-wrap;
+}
+.stage .speaker { font-weight: 700; }
+
+.lyric-overlay {
+  position: fixed;
+  left: 0; right: 0;
+  bottom: 8vh;
+  text-align: center;
+  pointer-events: none;
+  font-size: 30px;
+  line-height: 1.4;
+  z-index: 30;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, .9), 0 0 3px rgba(0, 0, 0, .85);
+}
+
+/* 汉字宋体、英文 Times New Roman 斜体、其他语言按脚本给出候选字体 */
+
+.lyric-zh  { font-family: "宋体", SimSun, "Noto Serif CJK SC", "Source Han Serif SC", serif; }
+.lyric-en  { font-family: "Times New Roman", "Liberation Serif", "DejaVu Serif", serif; font-style: italic; }
+.lyric-jp  { font-family: "ＭＳ 明朝", "MS Mincho", "Yu Mincho", "Noto Serif CJK JP", serif; }
+.lyric-kr  { font-family: "바탕", Batang, "Noto Serif CJK KR", "Malgun Gothic", serif; }
+.lyric-cyr { font-family: "Times New Roman", "Liberation Serif", "DejaVu Serif", serif; }
+.lyric-grk { font-family: "Times New Roman", "Liberation Serif", "DejaVu Serif", serif; }
+.lyric-ar  { font-family: "Traditional Arabic", Amiri, "Noto Naskh Arabic", "Segoe UI", sans-serif; }
+.lyric-he  { font-family: David, "Noto Serif Hebrew", Arial, sans-serif; }
+.lyric-thai { font-family: "Angsana New", "Noto Serif Thai", Tahoma, sans-serif; }
+.lyric-dev { font-family: "Nirmala UI", "Noto Serif Devanagari", Mangal, sans-serif; }
+.lyric-other { font-family: "Noto Sans", "Segoe UI", Arial, sans-serif; }

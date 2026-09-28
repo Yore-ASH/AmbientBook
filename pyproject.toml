@@ -11,12 +11,14 @@ dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
+web = ["Flask>=3.0"]
 
 [project.scripts]
 tscp-player = "tscp_player.cli:main"
 tscp-editor = "TSCPEditor.Main:main"
 ts2tp = "Ts2Tp.Main:main"
 tscp-pack = "PlotManager.Main:main"
+tscp-web = "webapp.app:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

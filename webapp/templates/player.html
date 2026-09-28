@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}播放剧情 - TSCP 剧情工坊{% endblock %}
+
+{% block content %}
+<section id="intro" class="card" style="max-width: 720px; margin: 6vh auto;">
+  <h1 id="intro-title" style="font-size: 26px; margin: 0 0 6px;">加载中…</h1>
+  <p id="intro-desc" class="muted" style="min-height: 24px;"></p>
+
+  <div class="field">
+    <label for="plot-select">剧情包</label>
+    <select id="plot-select"></select>
+  </div>
+  <div class="field">
+    <label for="script-select">剧本</label>
+    <select id="script-select"></select>
+  </div>
+  <div class="row">
+    <button id="begin">开始播放</button>
+    <a id="edit-link" class="button ghost" href="#">去编写</a>
+  </div>
+  <p id="intro-status" class="muted" style="margin-top: 12px;"></p>
+</section>
+
+<section id="stage-wrap" hidden>
+  <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
+    <div id="status" class="muted"></div>
+    <div class="row">
+      <button id="fullscreen" class="ghost small" type="button">全屏</button>
+      <button id="stop" class="ghost small" type="button">停止</button>
+    </div>
+  </div>
+  <div id="stage" class="stage"></div>
+</section>
+
+<div id="lyric-overlay" class="lyric-overlay" hidden></div>
+<audio id="audio" hidden></audio>
+{% endblock %}
+
+{% block scripts %}
+<script>window.PLOT_ID = {{ plot_id|tojson }};</script>
+<script src="{{ url_for('static', filename='player.js') }}"></script>
+{% endblock %}
