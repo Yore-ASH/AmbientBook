@@ -131,9 +131,33 @@ QLabel#railTitle {
 QSplitter::handle { background: %(line)s; }
 QSplitter::handle:horizontal { width: 3px; }
 QLabel#hint { color: %(dim)s; }
-QMenuBar, QMenu { background: %(panel)s; }
-QMenuBar::item:selected, QMenu::item:selected { background: %(sel)s; }
-QMenu { border: 1px solid %(line)s; }
+
+/* The menu bar is chrome, not content: it must follow the theme exactly. Some
+   platform styles paint it (and the strip beside the last menu) from the window
+   role, which is why it needs its own background and no border. */
+QMenuBar {
+    background: %(panel)s;
+    color: %(fg)s;
+    border: none;
+    padding: 1px 2px;
+}
+QMenuBar::item {
+    background: transparent;
+    padding: 3px 10px;
+    margin: 0px;
+    border-radius: 3px;
+}
+QMenuBar::item:selected { background: %(sel)s; }
+QMenuBar::item:pressed { background: %(sel)s; }
+QMenu {
+    background: %(panel)s;
+    color: %(fg)s;
+    border: 1px solid %(line)s;
+    padding: 3px;
+}
+QMenu::item { padding: 4px 22px; border-radius: 3px; }
+QMenu::item:selected { background: %(sel)s; }
+QMenu::separator { height: 1px; background: %(line)s; margin: 4px 8px; }
 QCheckBox, QRadioButton { spacing: 6px; }
 """
 
@@ -182,6 +206,43 @@ def apply(widget, name: str = "light") -> None:
     # Order matters: the stylesheet is what wins where both apply.
     widget.setPalette(palette(name))
     widget.setStyleSheet(stylesheet(name))
+    apply_titlebar(widget, str(name).lower() == "dark")
+
+
+def apply_titlebar(widget, dark: bool) -> bool:
+    """Ask Windows to draw this window's *title bar* dark.
+
+    The caption is drawn by the operating system, so no stylesheet reaches it --
+    which is exactly why a dark editor ended up with a bright white strip along
+    the very top.  Only this window is touched, so the player keeps its own look.
+    """
+
+    import sys
+
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        widget.winId()                       # make sure the native handle exists
+        handle = wintypes.HWND(int(widget.winId()))
+        value = ctypes.c_int(1 if dark else 0)
+        for attribute in (20, 19):           # 20H1+, then the older attribute
+            try:
+                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    handle,
+                    ctypes.c_uint(attribute),
+                    ctypes.byref(value),
+                    ctypes.sizeof(value),
+                )
+            except (AttributeError, OSError):
+                continue
+            if result == 0:
+                return True
+    except (ImportError, ValueError, TypeError):  # pragma: no cover - platform
+        return False
+    return False
 
 
 THEMES = (("light", "浅色"), ("dark", "深色"))

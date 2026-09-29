@@ -25,3 +25,7 @@
 *.ogg    binary
 *.wav    binary
 *.tscpkg binary
+
+# 图标同样是二进制
+*.ico    binary
+*.png    binary

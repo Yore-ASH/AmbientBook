@@ -12,7 +12,7 @@ from PlotManager.model import MusicDraft
 from Studio import model as studio_model
 from Studio.model import StudioProject
 from tscp_player import archive
-from tscp_player.format import Dialogue, Directive
+from tscp_player.format import Dialogue, Directive, Script
 from tscp_player.plot import load_archive_package
 
 pytest.importorskip("PySide6")
@@ -60,6 +60,14 @@ def no_modal_dialogs(monkeypatch, qapp):
         monkeypatch.setattr(
             QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Ok
         )
+    except (AttributeError, TypeError):  # pragma: no cover
+        pass
+    # A real modal QDialog waits for a click that never comes offscreen, so any
+    # dialog a shortcut happens to open is dismissed rather than hanging the run.
+    from PySide6.QtWidgets import QDialog
+
+    try:
+        monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
     except (AttributeError, TypeError):  # pragma: no cover
         pass
 
@@ -175,9 +183,326 @@ def test_story_step_labels_every_row_kind(studio, tmp_path):
 def test_story_step_offers_every_editing_action(studio):
     step = studio.steps[1]
     assert set(step.action_buttons) == {
-        "添加对白", "添加旁白", "添加暂停", "清空屏幕",
-        "插入音乐", "编辑", "上移", "下移", "删除",
+        "添加对白", "添加旁白", "添加暂停", "清空屏幕", "插入音乐",
+        "停止音乐", "编辑", "上移", "下移", "删除",
     }
+
+
+# --------------------------------------------------------------------------
+# story-step shortcuts
+# --------------------------------------------------------------------------
+
+EXPECTED_SHORTCUTS = {
+    "Ctrl+A": "添加旁白",
+    "Ctrl+D": "添加对白",
+    "Ctrl+M": "插入音乐",
+    "Ctrl+P": "停止音乐",
+    "Ctrl+E": "清空屏幕",
+    "Ctrl+T": "添加暂停",
+}
+
+
+def test_story_shortcuts_are_bound_to_the_right_actions(studio):
+    from PySide6.QtGui import QKeySequence
+
+    step = studio.steps[1]
+    bound = {key: label for key, label, _shortcut in step.shortcuts}
+    assert bound == EXPECTED_SHORTCUTS
+    # ...and they really are Qt shortcuts, not just labels in a dict.
+    for key, _label, shortcut in step.shortcuts:
+        assert shortcut.key() == QKeySequence(key)
+        assert shortcut.isEnabled() is True
+
+
+def test_story_shortcuts_cannot_leak_off_the_page(studio):
+    """Six keys on one page must not fire while another step has focus."""
+
+    from PySide6.QtCore import Qt
+
+    for _key, _label, shortcut in studio.steps[1].shortcuts:
+        assert shortcut.context() == Qt.ShortcutContext.WidgetWithChildrenShortcut
+        assert shortcut.parent() is studio.steps[1]
+
+
+def test_story_shortcuts_do_not_clash_with_the_window_menu(studio):
+    from PySide6.QtGui import QAction, QKeySequence
+
+    step = studio.steps[1]
+    page = {QKeySequence(key).toString() for key, _l, _s in step.shortcuts}
+    window = {
+        action.shortcut().toString()
+        for action in studio.findChildren(QAction)
+        if not action.shortcut().isEmpty()
+    }
+    assert page.isdisjoint(window), page & window
+
+
+def _focus_story(window):
+    """Show the story page and give it focus so shortcuts can actually fire.
+
+    Qt only routes a key press through the shortcut map when a window is visible
+    and active, so a hidden window silently swallows everything.
+    """
+
+    app = QApplication.instance()
+    window.show()
+    window.activateWindow()
+    window.setFocus()
+    app.processEvents()
+    window.step_list.setCurrentRow(1)
+    step = window.steps[1]
+    step.setFocus()
+    step.table.setFocus()
+    app.processEvents()
+    return step
+
+
+def test_ctrl_a_really_adds_narration(studio, tmp_path, monkeypatch):
+    """Drive a real key press, not just the signal."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    window = studio
+    name = _story(window, tmp_path)
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def values(self):
+            return Dialogue(None, "快捷键写的旁白")
+
+    monkeypatch.setattr("Studio.Main.DialogueDialog", FakeDialog)
+    _focus_story(window)
+    app = QApplication.instance()
+
+    before = len(window.project.script(name).lines)
+    QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+
+    lines = window.project.script(name).lines
+    assert len(lines) == before + 1
+    assert lines[-1] == Dialogue(None, "快捷键写的旁白")
+
+
+def test_ctrl_d_really_adds_dialogue(studio, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    window = studio
+    name = _story(window, tmp_path)
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def values(self):
+            return Dialogue("f", "快捷键写的对白")
+
+    monkeypatch.setattr("Studio.Main.DialogueDialog", FakeDialog)
+    _focus_story(window)
+    app = QApplication.instance()
+
+    QTest.keyClick(window, Qt.Key.Key_D, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+
+    lines = window.project.script(name).lines
+    assert lines[-1] == Dialogue("f", "快捷键写的对白")
+
+
+def test_the_instant_shortcuts_do_their_thing(studio, tmp_path, monkeypatch):
+    """Ctrl+E and Ctrl+T need no dialog, so they can be driven directly."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    window = studio
+    name = _story(window, tmp_path)
+
+    class FakeSleep:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def value(self):
+            return "2.5"
+
+    monkeypatch.setattr("Studio.Main.SleepDialog", FakeSleep)
+    _focus_story(window)
+    app = QApplication.instance()
+
+    QTest.keyClick(window, Qt.Key.Key_E, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert window.project.script(name).lines[-1] == Directive("c")
+
+    QTest.keyClick(window, Qt.Key.Key_T, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert window.project.script(name).lines[-1] == Directive("s", "2.5")
+
+
+def test_buttons_advertise_their_shortcut(studio):
+    step = studio.steps[1]
+    assert "Ctrl+A" in step.action_buttons["添加旁白"].toolTip()
+    assert "Ctrl+P" in step.action_buttons["停止音乐"].toolTip()
+    assert "Ctrl+A" in step.hint.text() and "Ctrl+P" in step.hint.text()
+
+
+# --------------------------------------------------------------------------
+# stopping the music is a control directive, and now a button
+# --------------------------------------------------------------------------
+
+def test_stop_music_button_inserts_the_directive(studio, tmp_path):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    window = studio
+    name = _story(window, tmp_path)
+    step = _focus_story(window)
+    app = QApplication.instance()
+
+    QTest.keyClick(window, Qt.Key.Key_P, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+
+    inserted = window.project.script(name).lines[-1]
+    assert inserted == Directive("p", "")
+    assert step.table.item(step.table.rowCount() - 1, 1).text() == "播放音乐"
+    assert step.table.item(step.table.rowCount() - 1, 3).text() == "（停止音乐）"
+
+
+def test_stop_music_survives_a_save_and_the_player_reads_it_as_a_stop(tmp_path):
+    """The command the author inserts must actually stop playback."""
+
+    from tscp_player.format import parse_tscp, serialize_tscp
+    from tscp_player.music import STOP_WORDS, build_timeline
+
+    script = Script([
+        Directive("p", "night"),
+        Dialogue("f", "音乐还在响", [0.1, 0.1, 0.1, 0.1, 0.1]),
+        Directive("p", ""),
+        Dialogue(None, "音乐停了", [0.1, 0.1, 0.1, 0.1]),
+    ])
+    text = serialize_tscp(script)
+    assert "P|night" in text
+    assert "P|\n" in text                      # an empty value is the stop
+
+    back = parse_tscp(text)
+    assert back.lines[2] == Directive("p", "")
+    assert back.lines[2].value in STOP_WORDS
+
+    timeline = build_timeline(back)
+    assert timeline.at(0).track == "night"
+    assert timeline.at(0).playing is True
+    # From the stop line onwards nothing is playing.
+    assert timeline.at(2).playing is False
+    assert timeline.at(3).playing is False
+
+    # And a project round trip keeps it intact.
+    project = studio_model.StudioProject.create(tmp_path / "x.tscpkg", name="X", description="")
+    name = project.new_script()
+    for event in script.lines:
+        project.add_event(name, event)
+    project.save()
+    reloaded = StudioProject.load(project.path)
+    assert reloaded.scripts["plot.tscp"].lines[2] == Directive("p", "")
+
+
+# --------------------------------------------------------------------------
+# menu bar and window chrome
+# --------------------------------------------------------------------------
+
+def test_the_menu_bar_follows_the_theme(studio):
+    from Studio import theme
+
+    dark = theme.stylesheet("dark")
+    # Both the bar and its items need their own rule; the platform style
+    # otherwise paints the strip beside the last menu from the window role.
+    assert "QMenuBar {" in dark
+    assert "QMenuBar::item" in dark
+    assert theme.DARK["panel"] in dark
+    assert "QMenu::item:selected" in dark
+
+
+def test_the_menu_bar_renders_the_themed_colour(studio, tmp_path):
+    """Sample the pixels: the reported palette can look right while paint is not."""
+
+    from Studio import theme
+
+    studio.set_theme("dark", remember=False)
+    _story(studio, tmp_path)
+    studio.show()
+    QApplication.instance().processEvents()
+    image = studio.grab().toImage()
+    bar = studio.menuBar()
+    y = max(1, bar.height() // 2)
+    # Far right of the bar: the empty strip that used to stay light.
+    sample = image.pixelColor(image.width() - 8, y).name()
+    assert sample == theme.DARK["panel"], sample
+
+
+def test_the_titlebar_helper_is_safe_everywhere(studio):
+    """It is a Windows nicety; on anything else it must quietly do nothing."""
+
+    import sys
+
+    from Studio import theme
+
+    result = theme.apply_titlebar(studio, True)
+    if sys.platform == "win32":
+        assert isinstance(result, bool)
+    else:
+        assert result is False
+    # Either way it must not disturb the widget.
+    assert studio.windowTitle() != ""
+
+
+def test_setting_the_theme_asks_for_a_matching_titlebar(studio, monkeypatch):
+    from Studio import theme
+
+    calls = []
+    monkeypatch.setattr(
+        theme, "apply_titlebar", lambda widget, dark: calls.append(dark) or True
+    )
+    studio.set_theme("dark", remember=False)
+    studio.set_theme("light", remember=False)
+    assert calls == [True, False]
+
+
+# --------------------------------------------------------------------------
+# the icon
+# --------------------------------------------------------------------------
+
+def test_the_window_carries_the_shipped_icon(studio):
+    from Studio.Main import ICON_PATH
+
+    assert ICON_PATH.is_file(), "the .ico must be committed next to Studio/Main.py"
+    icon = studio.windowIcon()
+    assert icon.isNull() is False
+    # Multi-size, so Windows can pick the right one for the taskbar.
+    sizes = {(size.width(), size.height()) for size in icon.availableSizes()}
+    assert (16, 16) in sizes
+    assert (256, 256) in sizes
+
+
+def test_the_icon_generator_reproduces_the_shipped_file(tmp_path):
+    """The icon is a build artefact; its generator must still make the same one."""
+
+    from Studio import make_icon
+    from Studio.Main import ICON_PATH
+
+    icon, _preview = make_icon.build(tmp_path)
+    assert icon.read_bytes() == ICON_PATH.read_bytes()
 
 
 def test_story_buttons_follow_the_selection(studio, tmp_path):

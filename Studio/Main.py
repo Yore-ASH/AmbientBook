@@ -53,7 +53,14 @@ from tscp_player.music import STOP_WORDS
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, Qt, QTimer
-    from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut, QTextCursor
+    from PySide6.QtGui import (
+        QAction,
+        QColor,
+        QIcon,
+        QKeySequence,
+        QShortcut,
+        QTextCursor,
+    )
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -100,6 +107,9 @@ LYRIC_COLOR_DEFAULT = "#ffffff"
 AUTO_SNAPSHOT_SECONDS = 300
 AUTO_SNAPSHOT_MAX_BACKOFF = 12          # 5 min -> ... -> 1 hour
 AUTO_SNAPSHOT_MENU_LABEL = "自动快照（每 5 分钟）"
+
+#: Shipped alongside this module; regenerate with ``python Studio/make_icon.py``.
+ICON_PATH = Path(__file__).resolve().with_name("tscp-studio.ico")
 
 
 # --------------------------------------------------------------------------
@@ -1277,28 +1287,43 @@ if QT_AVAILABLE:
             self.table.itemDoubleClicked.connect(lambda _item: self.edit_event())
             self.table.itemSelectionChanged.connect(self._update_buttons)
 
+            # label, slot, shortcut, tooltip
             self.actions = [
-                ("添加对白", self.add_dialogue),
-                ("添加旁白", self.add_narration),
-                ("添加暂停", self.add_sleep),
-                ("清空屏幕", self.add_clear),
-                ("插入音乐", self.add_music),
-                ("编辑", self.edit_event),
-                ("上移", lambda: self.move(-1)),
-                ("下移", lambda: self.move(1)),
-                ("删除", self.delete_event),
+                ("添加对白", self.add_dialogue, "Ctrl+D", "新建一句角色对白"),
+                ("添加旁白", self.add_narration, "Ctrl+A", "新建一句旁白"),
+                ("添加暂停", self.add_sleep, "Ctrl+T", "插入一段等待时间"),
+                ("清空屏幕", self.add_clear, "Ctrl+E", "插入清屏指令"),
+                ("插入音乐", self.add_music, "Ctrl+M", "选择已有曲目或插入新音乐"),
+                ("停止音乐", self.add_stop_music, "Ctrl+P", "停止当前正在播放的音乐"),
+                ("编辑", self.edit_event, "", "编辑选中的一行"),
+                ("上移", lambda: self.move(-1), "", "把选中的一行往上挪"),
+                ("下移", lambda: self.move(1), "", "把选中的一行往下挪"),
+                ("删除", self.delete_event, "", "删除选中的一行"),
             ]
             self.action_buttons: Dict[str, QPushButton] = {}
+            self.shortcuts: List[tuple] = []
             buttons = QHBoxLayout()
-            for label, slot in self.actions:
+            for label, slot, key, tip in self.actions:
                 button = QPushButton(label)
+                button.setToolTip("%s（%s）" % (tip, key) if key else tip)
                 button.clicked.connect(lambda _checked=False, s=slot: s())
                 self.action_buttons[label] = button
                 buttons.addWidget(button)
+                if key:
+                    shortcut = QShortcut(QKeySequence(key), self)
+                    # Scoped to this page: the keys must not fire while another
+                    # step, a dialog, or the player has focus.
+                    shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                    shortcut.activated.connect(lambda s=slot: s())
+                    self.shortcuts.append((key, label, shortcut))
             buttons.addStretch(1)
 
-            self.hint = QLabel("双击一行即可编辑；所有内容都用对话框填写，不用手写脚本格式。")
-            self.hint.setStyleSheet("color:#777;")
+            self.hint = QLabel(
+                "双击一行即可编辑；所有内容都用对话框填写，不用手写脚本格式。"
+                "　快捷键：Ctrl+A 旁白、Ctrl+D 对白、Ctrl+M 音乐、"
+                "Ctrl+P 停止音乐、Ctrl+E 清屏、Ctrl+T 暂停。"
+            )
+            self.hint.setObjectName("hint")
 
             layout = QVBoxLayout(self)
             layout.addLayout(top)
@@ -1352,7 +1377,10 @@ if QT_AVAILABLE:
             has_row = has_script and self._selected_row() is not None
             for label in ("编辑", "上移", "下移", "删除"):
                 self.action_buttons[label].setEnabled(bool(has_row))
-            for label in ("添加对白", "添加旁白", "添加暂停", "清空屏幕", "插入音乐"):
+            for label in (
+                "添加对白", "添加旁白", "添加暂停",
+                "清空屏幕", "插入音乐", "停止音乐",
+            ):
                 self.action_buttons[label].setEnabled(bool(has_script))
 
         def _selected_event(self):
@@ -1456,6 +1484,16 @@ if QT_AVAILABLE:
 
         def add_clear(self) -> None:
             self._add(Directive("c"))
+
+        def add_stop_music(self) -> None:
+            """The format's stop-the-music directive, as a first-class action.
+
+            An empty ``P|`` value is what ``STOP_WORDS`` reads as "stop", so this
+            is the same event the music dialog's first entry produces — it just
+            does not make you go through that dialog to get it.
+            """
+
+            self._add(Directive("p", ""))
 
         def add_music(self) -> None:
             if not self.studio.require_project():
@@ -2313,6 +2351,9 @@ if QT_AVAILABLE:
             self._autosave.timeout.connect(self._auto_snapshot)
             self.setWindowTitle("剧情工坊")
             self.resize(1240, 820)
+            icon = QIcon(str(ICON_PATH))
+            if not icon.isNull():
+                self.setWindowIcon(icon)
             self._build_ui()
             QApplication.instance().installEventFilter(self)
             if path:
