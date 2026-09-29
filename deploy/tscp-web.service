@@ -1,0 +1,39 @@
+[Unit]
+Description=TSCP 剧情工坊 (Flask + gunicorn)
+Documentation=file:///opt/tscp/webapp/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tscp
+Group=tscp
+WorkingDirectory=/opt/tscp
+EnvironmentFile=-/etc/tscp-web.env
+
+# 直接监听 8888。若前面挂了 nginx，把 --bind 改成 127.0.0.1:8000，
+# 并在 /etc/tscp-web.env 里设 TSCP_PROXY_HOPS=1。
+# --timeout 放宽是必要的：往剧情包里塞大 FLAC 时打包会花不少时间。
+ExecStart=/opt/tscp/.venv/bin/gunicorn "webapp:create_app()" \
+    --bind 0.0.0.0:8888 \
+    --workers 2 \
+    --threads 4 \
+    --timeout 180 \
+    --graceful-timeout 30 \
+    --access-logfile - \
+    --error-logfile -
+
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+
+# 基本加固：只读的系统目录 + 只允许写数据目录
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/tscp-web
+
+[Install]
+WantedBy=multi-user.target

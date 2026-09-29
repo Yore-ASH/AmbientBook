@@ -1,5 +1,9 @@
 import io
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from werkzeug.datastructures import MultiDict
@@ -550,3 +554,114 @@ def test_create_app_without_a_config_object_keeps_its_defaults(tmp_path):
     assert app.config["MAX_CONTENT_LENGTH"] > 0
     assert app.config["DATA_DIR"] == tmp_path / "data"
     assert app.test_client().get("/").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# deployment defaults (Ubuntu server, port 8888)
+# --------------------------------------------------------------------------
+
+def test_the_shipped_default_listens_on_8888():
+    """Pin the documented default so a stray edit cannot quietly move it."""
+
+    if os.environ.get("TSCP_PORT") or os.environ.get("TSCP_HOST"):
+        pytest.skip("TSCP_PORT/TSCP_HOST is set in this environment")
+    from webapp import config as config_module
+
+    assert config_module.Config.PORT == 8888
+    assert config_module.Config.HOST == "0.0.0.0"
+
+
+def test_dev_runner_passes_the_configured_host_and_port(monkeypatch):
+    from webapp import app as runner
+
+    seen = {}
+
+    class FakeApp:
+        def run(self, host=None, port=None, debug=None):
+            seen.update(host=host, port=port)
+
+    monkeypatch.setattr(runner, "create_app", lambda *args, **kwargs: FakeApp())
+    monkeypatch.setattr(runner.Config, "HOST", "0.0.0.0", raising=False)
+    monkeypatch.setattr(runner.Config, "PORT", 8888, raising=False)
+    assert runner.main([]) == 0
+    assert seen == {"host": "0.0.0.0", "port": 8888}
+
+
+def test_wal_mode_keeps_concurrent_workers_happy(tmp_path):
+    """Several gunicorn workers share one SQLite file, so WAL is not optional."""
+
+    from webapp import db as db_module
+
+    path = db_module.init_db(tmp_path / "data")
+    connection = db_module.open_db(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+NO_DESKTOP_DEPS = r'''
+import sys
+from importlib.abc import MetaPathFinder
+
+BLOCKED = {"pygame", "PySide6", "shiboken6", "pyside6"}
+
+
+class Blocker(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in BLOCKED:
+            raise ImportError("not installed on this headless server: " + fullname)
+        return None
+
+
+sys.meta_path.insert(0, Blocker())
+
+from webapp import create_app
+
+app = create_app(DATA_DIR=__DATA_DIR__)
+client = app.test_client()
+assert client.get("/").status_code == 200
+created = client.post(
+    "/api/auth/register", json={"username": "smoke", "password": "secret1"}
+)
+assert created.status_code == 201, created.get_data(as_text=True)
+plot = client.post("/api/plots", json={"name": "Smoke"})
+assert plot.status_code == 201, plot.get_data(as_text=True)
+print("OK")
+'''
+
+
+def test_webapp_runs_without_the_desktop_dependencies(tmp_path):
+    """A headless Ubuntu box must not need PySide6 or pygame to serve the site."""
+
+    # Plain token replacement: the script is full of braces that ``format`` would
+    # try to interpret as fields.
+    script = NO_DESKTOP_DEPS.replace("__DATA_DIR__", repr(str(tmp_path / "data")))
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_importing_the_webapp_does_not_pull_in_qt_or_audio():
+    script = (
+        "import sys\n"
+        "from webapp import create_app\n"
+        "heavy = sorted("
+        "n for n in sys.modules if n.split('.')[0] in "
+        "{'pygame', 'PySide6', 'shiboken6'})\n"
+        "print('HEAVY:' + ','.join(heavy))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "HEAVY:\n" in result.stdout, result.stdout

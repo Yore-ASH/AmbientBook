@@ -8,13 +8,18 @@
 
 ## 安装与运行
 
-```powershell
-python -m pip install ".[web]"     # 或 pip install -r requirements.txt
-python -m webapp                   # 默认 http://127.0.0.1:5000
-python -m webapp --port 8000 --host 0.0.0.0
+```bash
+python -m pip install ".[web]"          # 或者 pip install -r requirements-web.txt
+python -m webapp                        # 默认 http://0.0.0.0:8888
+python -m webapp --port 9000            # 换端口
 ```
 
 **第一个注册的账号自动成为管理员**，之后注册的都是普通用户。
+
+> **服务器上只装 `requirements-web.txt`**（Flask + gunicorn）。根目录
+> `requirements.txt` 里的 PySide6 / pygame 是桌面工具的依赖，headless Ubuntu 上
+> 装了只会拖一堆系统库。这一点有测试兜底：网页版在**完全屏蔽这两个库**的环境里
+> 也能正常启动、注册和建包。
 
 ### 环境变量
 
@@ -22,23 +27,32 @@ python -m webapp --port 8000 --host 0.0.0.0
 | --- | --- | --- |
 | `TSCP_SECRET_KEY` | `dev-secret-change-me` | **上线必须改**，会话签名用 |
 | `TSCP_DATA_DIR` | `webapp/data` | 数据库与剧情包存放目录 |
+| `TSCP_HOST` | `0.0.0.0` | 监听地址 |
+| `TSCP_PORT` | `8888` | 监听端口 |
 | `TSCP_MAX_UPLOAD_MB` | `512` | 单个请求的大小上限 |
 | `TSCP_SECURE_COOKIES` | 关 | 走 HTTPS 时设为 `1` |
 | `TSCP_ALLOW_REGISTRATION` | 开 | 设为 `0` 关闭公开注册（管理员仍可建号） |
 | `TSCP_FIRST_USER_IS_ADMIN` | 开 | 设 `0` 则第一个账号也是普通用户 |
-| `TSCP_HOST` / `TSCP_PORT` / `TSCP_DEBUG` | `127.0.0.1` / `5000` / 关 | 开发服务器参数 |
+| `TSCP_PROXY_HOPS` | `1` | 前置反向代理层数；直接对外时设 `0` |
 
-### 生产部署
+### 生产部署（Ubuntu）
 
 ```bash
-pip install gunicorn
-export TSCP_SECRET_KEY='...'
-export TSCP_DATA_DIR=/var/lib/tscp
-gunicorn "webapp:create_app()" --bind 127.0.0.1:8000 --workers 2 --timeout 120
+sudo ./deploy/install-ubuntu.sh          # 一键：系统用户 + venv + systemd + 8888
 ```
 
-`--timeout` 要放宽：给剧情包塞一个大 FLAC 时打包会比较久。放在 nginx 后面时记得
-`client_max_body_size` 也要调大（默认 1 MB，音频肯定超）。
+完整的 Ubuntu 流程（手动步骤、nginx 反代、更新、备份、排错表）见
+[deploy/README.md](../deploy/README.md)。手动跑 gunicorn 长这样：
+
+```bash
+export TSCP_SECRET_KEY='...'
+export TSCP_DATA_DIR=/var/lib/tscp-web
+gunicorn "webapp:create_app()" --bind 0.0.0.0:8888 \
+    --workers 2 --threads 4 --timeout 180
+```
+
+`--timeout` 要放宽：给剧情包塞一个大 FLAC 时打包会比较久。SQLite 已开启 WAL 并设了
+busy timeout，所以多个 worker 同时读写不会报 `database is locked`。
 
 ## 目录结构
 

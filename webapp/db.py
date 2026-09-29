@@ -61,9 +61,13 @@ def db_path(data_dir) -> Path:
 def open_db(path: Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path))
+    # A busy timeout plus WAL lets several gunicorn workers read at once while
+    # one writes, instead of failing with "database is locked" under load.
+    connection = sqlite3.connect(str(path), timeout=15.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = NORMAL")
     return connection
 
 

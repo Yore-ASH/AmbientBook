@@ -10,10 +10,18 @@
 python -m pip install ".[gui,web]"
 python Main.py            # 桌面播放器
 python Editor/Main.py     # 桌面制作工具箱
-python -m webapp          # 网页版：http://127.0.0.1:5000
+python -m webapp          # 网页版：http://0.0.0.0:8888
 ```
 
-网页版的安装、部署、环境变量与 API 见 [webapp/README.md](webapp/README.md)。
+部署到 Ubuntu 服务器（8888 端口、gunicorn + systemd、可选 nginx 反代）：
+
+```bash
+sudo ./deploy/install-ubuntu.sh
+```
+
+服务器上**只需要** `requirements-web.txt`（Flask + gunicorn），不用装 PySide6 /
+pygame。网页版的安装、环境变量与 API 见 [webapp/README.md](webapp/README.md)，
+部署细节见 [deploy/README.md](deploy/README.md)。
 
 ## 剧情包
 

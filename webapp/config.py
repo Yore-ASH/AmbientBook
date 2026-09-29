@@ -32,6 +32,11 @@ class Config:
     SECRET_KEY = os.environ.get("TSCP_SECRET_KEY", "dev-secret-change-me")
     DATA_DIR = _env_path("TSCP_DATA_DIR", ROOT / "webapp" / "data")
 
+    #: Where the bundled dev runner listens.  ``0.0.0.0`` so a fresh Ubuntu box
+    #: is reachable straight away; put nginx in front for anything public.
+    HOST = os.environ.get("TSCP_HOST", "0.0.0.0")
+    PORT = int(os.environ.get("TSCP_PORT", "8888"))
+
     #: Audio uploads are large, so this is generous by default.
     MAX_CONTENT_LENGTH = int(os.environ.get("TSCP_MAX_UPLOAD_MB", "512")) * 1024 * 1024
 
@@ -45,6 +50,10 @@ class Config:
     FIRST_USER_IS_ADMIN = _env_flag("TSCP_FIRST_USER_IS_ADMIN", True)
     #: Set to False to close public sign-up (admins still create accounts).
     ALLOW_REGISTRATION = _env_flag("TSCP_ALLOW_REGISTRATION", True)
+
+    #: Number of reverse-proxy hops to trust for ``X-Forwarded-*`` headers.
+    #: 1 is right for a single nginx sitting in front; 0 disables it.
+    PROXY_HOPS = int(os.environ.get("TSCP_PROXY_HOPS", "1"))
 
 
 class TestConfig(Config):

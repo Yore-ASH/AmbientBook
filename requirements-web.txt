@@ -1,0 +1,8 @@
+# 网页版（服务器）依赖：Ubuntu / 任何 headless Linux 都能直接装。
+#
+# 这里刻意不含 PySide6 和 pygame —— 网页版根本不需要它们，
+# 而在没有桌面环境的服务器上装 PySide6 要拖一堆系统库。
+# 桌面工具请用根目录的 requirements.txt。
+
+Flask>=3.0
+gunicorn>=21.2
