@@ -8,6 +8,7 @@ Nothing here imports Qt, so the flow can be tested without a display.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -97,16 +98,30 @@ def event_label(event) -> str:
     return EVENT_LABELS.get(event_kind(event), event_kind(event))
 
 
-def describe_event(event) -> str:
-    """The middle column of the story table."""
+def describe_event(
+    event,
+    characters: Optional[Dict[str, Character]] = None,
+    tracks: Optional[Dict[str, MusicTrack]] = None,
+) -> str:
+    """The middle column of the story table, in human terms."""
 
     if isinstance(event, Dialogue):
         return event.text
     if event.command == "s":
         return "%s 秒" % event.value
     if event.command == "p":
-        return event.value or "（停止）"
+        if not event.value:
+            return "（停止音乐）"
+        return "♪ " + track_label(event.value, tracks)
     return "—"
+
+
+def event_character(event, characters: Optional[Dict[str, Character]] = None) -> str:
+    """The character column: the display name, never the file key."""
+
+    if not isinstance(event, Dialogue):
+        return ""
+    return character_label(event.character, characters)
 
 
 def dialogue_count(script: Script) -> int:
@@ -178,14 +193,86 @@ def next_script_name(existing: Iterable[str], base: str = "plot") -> str:
 def safe_script_name(value: str) -> str:
     """Normalise a user-typed script name into ``something.tscp``."""
 
-    name = Path(str(value).strip()).name
+    return script_base_name(value) + ".tscp"
+
+
+#: Characters that are illegal in a file name on Windows, plus control codes.
+_ILLEGAL_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_NAMES = (
+    {"con", "prn", "aux", "nul"}
+    | {"com%d" % index for index in range(1, 10)}
+    | {"lpt%d" % index for index in range(1, 10)}
+)
+
+
+def script_base_name(value: str) -> str:
+    """Validate a typed script name and return it *without* the extension.
+
+    The dialog only ever asks for the bare name, so a stray ``.tscp`` (or an
+    outright wrong extension) is stripped here rather than becoming a member
+    name nobody expected.
+    """
+
+    name = str(value).strip()
+    if name.lower().endswith(".tscp"):
+        name = name[: -len(".tscp")].strip()
     if not name:
         raise StudioError("剧本名不能为空")
-    if not name.lower().endswith(".tscp"):
-        name += ".tscp"
-    if "/" in name or "\\" in name:
-        raise StudioError("剧本名不能包含路径分隔符")
+    if name in {".", ".."}:
+        raise StudioError("这个名字不能用")
+    if name.lower() in _RESERVED_NAMES:
+        raise StudioError("「%s」是系统保留名，换一个" % name)
+    illegal = _ILLEGAL_NAME.search(name)
+    if illegal:
+        raise StudioError("剧本名不能包含 %s" % illegal.group(0))
+    if name != name.rstrip(" ."):
+        raise StudioError("剧本名不能以句点或空格结尾")
     return name
+
+
+#: A character/track key only ever lives inside the file; it must survive
+#: ``[key]``, ``D|key|`` and ``P|key``, so keep it to plain ASCII word chars.
+_KEY_UNSAFE = re.compile(r"[^0-9A-Za-z_]+")
+
+
+def suggest_key(name: str, taken: Iterable[str] = (), prefix: str = "c") -> str:
+    """Derive a short, unique, format-safe key from a display name.
+
+    With a GUI nobody needs to type or read the abbreviation, but the format
+    still needs one, so it is generated here instead of being asked for.
+    """
+
+    used = {str(item) for item in taken}
+    cleaned = _KEY_UNSAFE.sub("", str(name))
+    base = (cleaned[:4] or prefix).lower()
+    if base[0].isdigit():
+        base = prefix + base
+    candidate = base
+    index = 2
+    while candidate in used:
+        candidate = "%s%d" % (base, index)
+        index += 1
+    return candidate
+
+
+def character_label(key: Optional[str], characters: Optional[Dict[str, Character]] = None) -> str:
+    """What to show for a character: its name, never its key."""
+
+    if not key:
+        return ""
+    character = (characters or {}).get(key)
+    return character.name if character is not None else key
+
+
+def track_label(key: Optional[str], tracks: Optional[Dict[str, MusicTrack]] = None) -> str:
+    """What to show for a music track: the audio file, not its key."""
+
+    if not key:
+        return ""
+    track = (tracks or {}).get(key)
+    if track is None:
+        return key
+    return Path(track.filename).stem or track.filename or key
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +291,9 @@ HISTORY_DIR = "History"
 HISTORY_INDEX = HISTORY_DIR + "/__init__.json"
 HISTORY_FORMAT = "tscpks-history 1"
 MAX_REVISIONS = 200
+#: Automatic snapshots are capped separately from the named checkpoints, so a
+#: long session cannot push out the versions the author actually cares about.
+MAX_AUTO_SNAPSHOTS = 5
 
 #: ``.tscpc`` — a small, portable character file.
 CHARACTERS_SUFFIX = ".tscpc"
@@ -525,12 +615,19 @@ def _write_history(path: PathLike, revisions: List[Dict[str, Any]], snapshot: Op
     archive.update(path, text=texts)
 
 
-def _digest(document: Dict[str, Any]) -> str:
-    """Hash the parts of a snapshot that mean 'the content changed'."""
+def _digest(document: Dict[str, Any], keys: Optional[Iterable[str]] = None) -> str:
+    """Hash the parts of a snapshot that mean 'the content changed'.
+
+    ``keys`` restricts the comparison to a subset, which is what lets a
+    writing-only snapshot be compared against a full one on equal terms.
+    """
 
     import hashlib
 
-    payload = {key: value for key, value in document.items() if key not in {"ID", "TIME", "LABEL"}}
+    chosen = sorted(
+        set(keys) if keys is not None else set(document) - {"ID", "TIME", "LABEL"}
+    )
+    payload = {key: document.get(key) for key in chosen}
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha1(blob).hexdigest()
 
@@ -551,6 +648,8 @@ class StudioProject:
     tracks: Dict[str, MusicTrack] = field(default_factory=dict)
     dirty: bool = False
     extra_notes: List[str] = field(default_factory=list)
+    #: Set by :meth:`save` so callers can tell whether a revision was written.
+    last_revision_id: Optional[str] = None
 
     # -- creating and loading ------------------------------------------
     @classmethod
@@ -614,7 +713,13 @@ class StudioProject:
     def has_history(self) -> bool:
         return self.path.suffix.lower() == PROJECT_SUFFIX or bool(_read_history(self.path))
 
-    def save(self, label: Optional[str] = None) -> Path:
+    def save(
+        self,
+        label: Optional[str] = None,
+        *,
+        include_music: bool = True,
+        auto: bool = False,
+    ) -> Path:
         """Write characters, metadata and every script back into the container.
 
         On a project file this also records a revision, so the history lives in
@@ -636,13 +741,30 @@ class StudioProject:
                 model.write_script(self.path, filename, serialize_tscp(normalise_script(script)))
         except (PackError, archive.PackageError, OSError, ValueError) as exc:
             raise StudioError(str(exc)) from exc
+        self.last_revision_id = None
         if self.has_history:
             try:
-                self._record_revision(label)
+                self.last_revision_id = self._record_revision(
+                    label, include_music=include_music, auto=auto
+                )
             except (archive.PackageError, OSError, ValueError) as exc:
                 raise StudioError("保存历史版本失败：%s" % exc) from exc
         self.dirty = False
         return self.path
+
+    def auto_snapshot(self) -> Optional[str]:
+        """Flush the current work and record a scripts-only snapshot.
+
+        Returns the new revision id, or ``None`` when nothing changed since the
+        last one — the caller uses that to stretch the next interval.
+        """
+
+        if not self.has_history:
+            return None
+        # Music is left out on purpose: a snapshot only needs to capture the
+        # writing, and audio would make every snapshot enormous.
+        self.save(include_music=False, auto=True)
+        return self.last_revision_id
 
     def export(self, target: PathLike) -> Path:
         """Write a clean ``.tscpkg``: current state, no history."""
@@ -654,10 +776,10 @@ class StudioProject:
             raise StudioError(str(exc)) from exc
 
     # -- revision history ----------------------------------------------
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self, include_music: bool = True) -> Dict[str, Any]:
         """The full editable state, as JSON."""
 
-        return {
+        document: Dict[str, Any] = {
             "NAME": self.name,
             "DESCRIPTION": self.description,
             "CHARACTERS": {
@@ -668,7 +790,9 @@ class StudioProject:
                 filename: serialize_tscp(normalise_script(script))
                 for filename, script in self.scripts.items()
             },
-            "MUSIC": {
+        }
+        if include_music:
+            document["MUSIC"] = {
                 key: {
                     "KIND": track.kind,
                     "COLOR": track.color,
@@ -677,50 +801,79 @@ class StudioProject:
                     "LYRICS_TEXT": self.lyrics_text(key),
                 }
                 for key, track in self.tracks.items()
-            },
-        }
+            }
+        return document
 
     def revisions(self) -> List[Dict[str, Any]]:
         """Newest first."""
 
         return list(reversed(_read_history(self.path)))
 
-    def revision(self, revision_id: str) -> Dict[str, Any]:
+    def _read_snapshot(self, revision_id: str) -> Optional[Dict[str, Any]]:
         member = "%s/%s.json" % (HISTORY_DIR, revision_id)
         try:
             document = archive.read_json(self.path, member, None)
-        except (archive.PackageError, OSError, ValueError) as exc:
-            raise StudioError(str(exc)) from exc
-        if not isinstance(document, dict):
+        except (archive.PackageError, OSError, ValueError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    def revision(self, revision_id: str) -> Dict[str, Any]:
+        document = self._read_snapshot(revision_id)
+        if document is None:
             raise StudioError("找不到版本 %s" % revision_id)
         return document
 
-    def _record_revision(self, label: Optional[str]) -> Optional[str]:
-        document = self.snapshot()
-        digest = _digest(document)
+    def _record_revision(
+        self,
+        label: Optional[str],
+        *,
+        include_music: bool = True,
+        auto: bool = False,
+    ) -> Optional[str]:
+        document = self.snapshot(include_music=include_music)
+        keys = set(document)
+        digest = _digest(document, keys)
         history = _read_history(self.path)
-        if history and history[-1].get("HASH") == digest and not label:
-            return None                      # nothing actually changed
+        if history and not label:
+            # Compare like with like: a snapshot without music is checked against
+            # the previous one on the same fields, so "nothing changed" is still
+            # detected instead of every automatic pass looking like an edit.
+            previous = self._read_snapshot(history[-1]["ID"])
+            if previous is not None and _digest(previous, keys) == digest:
+                return None                  # nothing actually changed
         revision_id = "R%06d" % (len(history) + 1)
         document["ID"] = revision_id
         document["TIME"] = datetime.now().isoformat(timespec="seconds")
-        document["LABEL"] = label or "自动保存"
+        document["LABEL"] = label or ("自动快照" if auto else "自动保存")
         entry = {
             "ID": revision_id,
             "TIME": document["TIME"],
             "LABEL": document["LABEL"],
             "HASH": digest,
+            "AUTO": bool(auto),
             "CHARACTERS": len(self.characters),
             "SCRIPTS": len(self.scripts),
         }
         history.append(entry)
-        if len(history) > MAX_REVISIONS:
-            # Drop the oldest snapshot so a long-lived project cannot grow forever.
-            for stale in history[:-MAX_REVISIONS]:
-                archive.update(
-                    self.path, remove=["%s/%s.json" % (HISTORY_DIR, stale["ID"])]
-                )
-            history = history[-MAX_REVISIONS:]
+
+        # Drop the oldest automatic snapshots first, keeping the named ones, then
+        # trim the overall cap so a long-lived project cannot grow forever.
+        drop: List[str] = []
+        if auto:
+            autos = [item for item in history if item.get("AUTO")]
+            drop.extend(item["ID"] for item in autos[:-MAX_AUTO_SNAPSHOTS])
+        remaining = [item for item in history if item["ID"] not in drop]
+        if len(remaining) > MAX_REVISIONS:
+            drop.extend(
+                item["ID"] for item in remaining[: len(remaining) - MAX_REVISIONS]
+            )
+        if drop:
+            archive.update(
+                self.path,
+                remove=["%s/%s.json" % (HISTORY_DIR, key) for key in drop],
+            )
+            history = [item for item in history if item["ID"] not in drop]
+
         _write_history(self.path, history, (revision_id, document))
         return revision_id
 

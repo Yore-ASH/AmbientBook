@@ -21,7 +21,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import CharacterCreator.model as characters_model
-from PlotManager.model import MusicDraft, PackError, suggest_abbreviation
+from PlotManager.model import MusicDraft, PackError
 from PlotManager.recorder import LyricsRecorderDialog
 from Studio import model as studio
 from Studio import theme
@@ -53,7 +53,7 @@ from tscp_player.music import STOP_WORDS
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, Qt, QTimer
-    from PySide6.QtGui import QAction, QColor, QKeySequence, QTextCursor
+    from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut, QTextCursor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -94,6 +94,12 @@ AUDIO_FILTER = (
     "音频 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac);;所有文件 (*)"
 )
 LYRIC_COLOR_DEFAULT = "#ffffff"
+
+#: Automatic snapshots: every five minutes, backing off while nothing changes so
+#: an idle window does not keep rewriting the file.
+AUTO_SNAPSHOT_SECONDS = 300
+AUTO_SNAPSHOT_MAX_BACKOFF = 12          # 5 min -> ... -> 1 hour
+AUTO_SNAPSHOT_MENU_LABEL = "自动快照（每 5 分钟）"
 
 
 # --------------------------------------------------------------------------
@@ -188,17 +194,27 @@ if QT_AVAILABLE:
     # ----------------------------------------------------------------------
 
     class CharacterFields(QWidget):
-        """缩写 / 名字 / 颜色 / 粗体 / 下划线 / 自定义 SGR, with a live preview.
+        """名字 / 颜色 / 粗体 / 下划线 / 自定义 SGR, with a live preview.
 
-        Shared by the single-character dialog and the batch dialog, so both offer
-        exactly the same controls and the same preview.
+        The file-level key still exists (``[f]`` and ``D|f|`` need one) but it is
+        derived from the name and tucked away, so the normal flow never asks for
+        it.  It only appears when editing a character that already has one, or
+        when somebody deliberately wants to pick their own.
         """
 
-        def __init__(self, parent=None, key: str = "", name: str = "", style: str = "") -> None:
+        def __init__(
+            self,
+            parent=None,
+            key: str = "",
+            name: str = "",
+            style: str = "",
+            taken: Iterable[str] = (),
+        ) -> None:
             super().__init__(parent)
+            self.original_key = key
+            # The key being edited does not count as a collision with itself.
+            self.taken = {str(item) for item in taken} - ({key} if key else set())
 
-            self.key_edit = QLineEdit(key)
-            self.key_edit.setPlaceholderText("在剧本里写作 [缩写]")
             self.name_edit = QLineEdit(name)
             self.name_edit.setPlaceholderText("显示在屏幕上的名字")
 
@@ -217,26 +233,47 @@ if QT_AVAILABLE:
                 "background:#111; color:#ddd; border:1px solid #333;"
             )
 
+            # -- the tucked-away file key ----------------------------------
+            self.key_edit = QLineEdit(key)
+            self.key_edit.setMaximumWidth(140)
+            self.key_edit.setPlaceholderText("自动")
+            self.manual_key = QCheckBox("手动指定文件内标识")
+            self.manual_key.setToolTip(
+                "只是 .tscp 文件内部的记号，剧本里看不见它；一般不用管"
+            )
+            self.manual_key.setChecked(bool(key))
+            self.key_edit.setEnabled(bool(key))
+            self.key_hint = QLabel()
+            self.key_hint.setObjectName("hint")
+
+            key_row = QHBoxLayout()
+            key_row.addWidget(self.manual_key)
+            key_row.addWidget(self.key_edit)
+            key_row.addWidget(self.key_hint, 1)
+
             attrs = QHBoxLayout()
             attrs.addWidget(self.bold)
             attrs.addWidget(self.underline)
             attrs.addStretch(1)
             holder = QWidget()
             holder.setLayout(attrs)
+            key_holder = QWidget()
+            key_holder.setLayout(key_row)
 
             form = QFormLayout(self)
-            form.addRow("缩写", self.key_edit)
             form.addRow("名字", self.name_edit)
             form.addRow("颜色", self.color_combo)
             form.addRow("样式", holder)
             form.addRow("自定义", self.custom_edit)
             form.addRow("预览", self.preview)
+            form.addRow("标识", key_holder)
 
-            for widget in (self.key_edit, self.name_edit, self.custom_edit):
+            for widget in (self.name_edit, self.custom_edit, self.key_edit):
                 widget.textChanged.connect(self._refresh_preview)
             self.color_combo.currentIndexChanged.connect(self._refresh_preview)
             self.bold.toggled.connect(self._refresh_preview)
             self.underline.toggled.connect(self._refresh_preview)
+            self.manual_key.toggled.connect(self._toggle_key_field)
 
             if style:
                 self.custom_edit.setText(self._as_spelling(style))
@@ -249,6 +286,19 @@ if QT_AVAILABLE:
             match = re.search(r"\[([0-9;]*)m", str(style).replace("\x1b", r"\033"))
             return r"\033[%sm" % match.group(1) if match else ""
 
+        def _toggle_key_field(self) -> None:
+            self.key_edit.setEnabled(self.manual_key.isChecked())
+            if self.manual_key.isChecked() and not self.key_edit.text().strip():
+                self.key_edit.setText(self.resolved_key())
+            self._refresh_preview()
+
+        def resolved_key(self) -> str:
+            if self.manual_key.isChecked():
+                chosen = self.key_edit.text().strip()
+                if chosen:
+                    return chosen
+            return studio.suggest_key(self.name_edit.text(), self.taken)
+
         def resolved_style(self) -> str:
             custom = self.custom_edit.text().strip()
             if custom:
@@ -260,6 +310,10 @@ if QT_AVAILABLE:
             )
 
         def _refresh_preview(self) -> None:
+            if self.manual_key.isChecked():
+                self.key_hint.setText("")
+            else:
+                self.key_hint.setText("自动：%s" % self.resolved_key())
             name = self.name_edit.text().strip() or "角色名"
             try:
                 css = _style_css(self.resolved_style())
@@ -274,7 +328,7 @@ if QT_AVAILABLE:
 
         def values(self) -> tuple:
             return (
-                self.key_edit.text().strip(),
+                self.resolved_key(),
                 self.name_edit.text().strip(),
                 self.resolved_style(),
             )
@@ -282,22 +336,31 @@ if QT_AVAILABLE:
         def reset(self) -> None:
             """Empty the fields, ready for the next character."""
 
-            self.key_edit.clear()
             self.name_edit.clear()
             self.custom_edit.clear()
             self.bold.setChecked(False)
             self.underline.setChecked(False)
-            self.key_edit.setFocus()
+            self.manual_key.setChecked(False)
+            self.key_edit.clear()
+            self.key_edit.setEnabled(False)
+            self.name_edit.setFocus()
 
     class CharacterDialog(QDialog):
         """Create or edit one character, with a live style preview."""
 
-        def __init__(self, parent, key: str = "", name: str = "", style: str = "") -> None:
+        def __init__(
+            self,
+            parent,
+            key: str = "",
+            name: str = "",
+            style: str = "",
+            taken: Iterable[str] = (),
+        ) -> None:
             super().__init__(parent)
             self.setWindowTitle("角色")
-            self.resize(480, 400)
+            self.resize(500, 440)
 
-            self.fields = CharacterFields(self, key, name, style)
+            self.fields = CharacterFields(self, key, name, style, taken)
 
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -313,10 +376,7 @@ if QT_AVAILABLE:
             return self.fields.values()
 
         def accept(self) -> None:
-            key, name, _style = self.values()
-            if not key:
-                QMessageBox.warning(self, "角色", "角色缩写不能为空")
-                return
+            _key, name, _style = self.values()
             if not name:
                 QMessageBox.warning(self, "角色", "角色名字不能为空")
                 return
@@ -337,8 +397,13 @@ if QT_AVAILABLE:
             self.resize(860, 460)
             self.rows: List[tuple] = []
             self.existing = dict(existing or {})
+            # A name already in the project identifies that character, so adding
+            # it again is an update rather than a second entry under a new key.
+            self.by_name = {
+                character.name: key for key, character in self.existing.items()
+            }
 
-            self.fields = CharacterFields(self)
+            self.fields = CharacterFields(self, taken=list(self.existing))
 
             add_button = QPushButton("添加到列表")
             add_button.setDefault(True)
@@ -350,7 +415,7 @@ if QT_AVAILABLE:
             remove_button.clicked.connect(self.remove_row)
 
             self.table = QTableWidget(0, 3)
-            self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            self.table.setHorizontalHeaderLabels(["名字", "样式", "标识"])
             compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -393,20 +458,31 @@ if QT_AVAILABLE:
             layout.addWidget(splitter, 1)
             layout.addWidget(buttons)
 
+        def _key_for(self, name: str) -> str:
+            """Reuse a key when this name is already known, else derive one."""
+
+            if name in self.by_name:
+                return self.by_name[name]
+            for key, staged, _style in self.rows:
+                if staged == name:
+                    return key
+            return self.fields.resolved_key()
+
         def add_row(self) -> None:
-            key, name, style = self.fields.values()
-            if not key:
-                QMessageBox.warning(self, "角色", "角色缩写不能为空")
-                return
+            name = self.fields.name_edit.text().strip()
             if not name:
                 QMessageBox.warning(self, "角色", "角色名字不能为空")
                 return
+            style = self.fields.resolved_style()
+            key = self._key_for(name)
             for index, (existing_key, _n, _s) in enumerate(self.rows):
                 if existing_key == key:
                     self.rows[index] = (key, name, style)
                     break
             else:
                 self.rows.append((key, name, style))
+                # Keep the next derived key from colliding with this one.
+                self.fields.taken.add(key)
             self._refresh_table()
             self.fields.reset()
 
@@ -422,10 +498,12 @@ if QT_AVAILABLE:
             self.table.setRowCount(len(self.rows))
             for row, (key, name, style) in enumerate(self.rows):
                 note = "（更新）" if key in self.existing else ""
-                for column, value in enumerate(
-                    (key, name + note, CharactersStep._style_text(style))
-                ):
-                    self.table.setItem(row, column, QTableWidgetItem(value))
+                values = (name + note, CharactersStep._style_text(style), key)
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, key)
+                    self.table.setItem(row, column, item)
             self.table.resizeColumnsToContents()
 
         def accept(self) -> None:
@@ -435,59 +513,221 @@ if QT_AVAILABLE:
             super().accept()
 
     class DialogueDialog(QDialog):
-        """Write one line of dialogue or narration."""
+        """Write one line of dialogue or narration.
+
+        Characters are picked by **name** — the file key never appears.  Narration
+        is a single line and Enter finishes it, because that is how it is written.
+        Either kind can drop a coloured character name into the text.
+        """
 
         def __init__(self, parent, studio_window, event: Optional[Dialogue], narrator: bool) -> None:
             super().__init__(parent)
-            self.setWindowTitle("旁白" if narrator else "角色对白")
-            self.resize(620, 420)
+            self.setWindowTitle("添加旁白" if narrator else "角色对白")
+            self.resize(640, 300 if narrator else 480)
+            self.studio = studio_window
             self.narrator = narrator
+            self.characters = dict(studio_window.project.characters)
 
+            # -- who (dialogue only) ---------------------------------------
             self.character_combo = QComboBox()
-            for key in studio_window.project.characters:
-                self.character_combo.addItem(key)
-            self.text_edit = QPlainTextEdit()
-            self.text_edit.setPlaceholderText("这一句要说的话")
-            self.text_edit.setMinimumHeight(200)
+            for key, character in self.characters.items():
+                self.character_combo.addItem(character.name, key)
 
-            form = QFormLayout()
-            if not narrator:
-                form.addRow("角色", self.character_combo)
+            # -- what ------------------------------------------------------
+            if narrator:
+                self.text_edit = QLineEdit()
+                self.text_edit.setPlaceholderText("这一句旁白，按 Enter 完成")
+                self.text_edit.returnPressed.connect(self.accept)
+            else:
+                self.text_edit = QPlainTextEdit()
+                self.text_edit.setPlaceholderText("这一句要说的话")
+                self.text_edit.setMinimumHeight(170)
+
+            # -- drop in a coloured name -----------------------------------
+            self.name_combo = QComboBox()
+            self.name_combo.addItem("（选择角色）", "")
+            for key, character in self.characters.items():
+                self.name_combo.addItem(character.name, key)
+            insert_button = QPushButton("插入角色名")
+            insert_button.setToolTip("把带颜色的角色名字插到光标处")
+            insert_button.clicked.connect(self.insert_name)
+
+            insert_row = QHBoxLayout()
+            insert_row.addWidget(QLabel("插入"))
+            insert_row.addWidget(self.name_combo, 1)
+            insert_row.addWidget(insert_button)
+            insert_row.addStretch(1)
+
+            self.preview = QLabel()
+            self.preview.setWordWrap(True)
+            self.preview.setMinimumHeight(38)
+            # Without a ceiling a one-line narration dialog stretches the preview
+            # panel to fill the whole window.
+            self.preview.setMaximumHeight(110)
+            self.preview.setTextFormat(Qt.TextFormat.RichText)
+            self.preview.setStyleSheet(
+                "background:#111; color:#eee; padding:8px; border:1px solid #333;"
+            )
+
             layout = QVBoxLayout(self)
-            layout.addLayout(form)
+            if not narrator:
+                form = QFormLayout()
+                form.addRow("角色", self.character_combo)
+                layout.addLayout(form)
             layout.addWidget(QLabel("内容"))
-            layout.addWidget(self.text_edit, 1)
+            # A single-line editor has no business absorbing vertical space.
+            if narrator:
+                layout.addWidget(self.text_edit)
+            else:
+                layout.addWidget(self.text_edit, 1)
+            layout.addLayout(insert_row)
+            layout.addWidget(QLabel("预览（播放时的样子；上面框里的颜色代码不可见）"))
+            layout.addWidget(self.preview)
 
-            hint = QLabel("标点和符号也会参与计时，只有空格自动显示。")
-            hint.setStyleSheet("color:#777;")
+            hint = QLabel(
+                "标点和符号也会参与计时，只有空格是自动显示的。"
+                + ("" if narrator else "　Ctrl+Enter 也可以完成。")
+            )
+            hint.setObjectName("hint")
             layout.addWidget(hint)
+            if narrator:
+                # Nothing above wants to grow, so push the buttons to the bottom.
+                layout.addStretch(1)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+                "完成" if narrator else "确定"
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+            self.text_edit.textChanged.connect(self._refresh_preview)
+            if not narrator:
+                shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+                shortcut.activated.connect(self.accept)
+
+            if event is not None:
+                self._set_text(event.text)
+                if event.character:
+                    index = self.character_combo.findData(event.character)
+                    if index >= 0:
+                        self.character_combo.setCurrentIndex(index)
+            self._refresh_preview()
+
+        def text(self) -> str:
+            return (
+                self.text_edit.text() if self.narrator else self.text_edit.toPlainText()
+            )
+
+        def _set_text(self, value: str) -> None:
+            if self.narrator:
+                self.text_edit.setText(value)
+            else:
+                self.text_edit.setPlainText(value)
+
+        def insert_name(self) -> None:
+            key = self.name_combo.currentData()
+            character = self.characters.get(key) if key else None
+            if character is None:
+                return
+            snippet = (
+                "%s%s\033[0m" % (character.style, character.name)
+                if character.style
+                else character.name
+            )
+            # A one-line editor has no plain-text API beyond insert().
+            if self.narrator:
+                self.text_edit.insert(snippet)
+            else:
+                self.text_edit.insertPlainText(snippet)
+            self._refresh_preview()
+
+        def _refresh_preview(self) -> None:
+            text = self.text()
+            if not text:
+                self.preview.setText("<span style='color:#777'>（还没有内容）</span>")
+                return
+            self.preview.setText(_styled_html(text))
+
+        def values(self) -> Optional[Dialogue]:
+            text = self.text().strip()
+            if not text:
+                return None
+            character = None if self.narrator else self.character_combo.currentData()
+            return Dialogue(character, text)
+
+        def accept(self) -> None:
+            if self.values() is None:
+                QMessageBox.warning(self, "旁白" if self.narrator else "对白", "内容不能为空")
+                return
+            super().accept()
+
+    class ScriptNameDialog(QDialog):
+        """Ask for a script name, showing the bare name and a fixed ``.tscp``.
+
+        The extension is never editable: the dialog simply will not accept a name
+        that would become a different file type.
+        """
+
+        def __init__(self, parent, title: str, name: str = "") -> None:
+            super().__init__(parent)
+            self.setWindowTitle(title)
+            self.resize(430, 0)
+
+            self.name_edit = QLineEdit(name)
+            self.name_edit.selectAll()
+            self.name_edit.returnPressed.connect(self.accept)
+            suffix = QLabel(".tscp")
+            suffix.setObjectName("hint")
+
+            row = QHBoxLayout()
+            row.addWidget(self.name_edit, 1)
+            row.addWidget(suffix)
+
+            self.hint = QLabel()
+            self.hint.setObjectName("hint")
+            self.hint.setWordWrap(True)
 
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
             )
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
+
+            form = QFormLayout()
+            form.addRow("剧本名", row)
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(self.hint)
+            layout.addStretch(1)
             layout.addWidget(buttons)
 
-            if event is not None:
-                self.text_edit.setPlainText(event.text)
-                if event.character:
-                    index = self.character_combo.findText(event.character)
-                    if index >= 0:
-                        self.character_combo.setCurrentIndex(index)
+            self.name_edit.textChanged.connect(self._refresh_hint)
+            self._refresh_hint()
 
-        def values(self) -> Optional[Dialogue]:
-            text = self.text_edit.toPlainText().strip()
-            if not text:
-                return None
-            character = None if self.narrator else self.character_combo.currentText()
-            return Dialogue(character, text)
+        def _refresh_hint(self) -> None:
+            try:
+                base = studio.script_base_name(self.name_edit.text())
+            except StudioError as exc:
+                self.hint.setText(str(exc))
+                return
+            self.hint.setText("会保存为 %s.tscp" % base)
+
+        def value(self) -> str:
+            return studio.script_base_name(self.name_edit.text())
 
         def accept(self) -> None:
-            if self.values() is None:
-                QMessageBox.warning(self, "对白", "内容不能为空")
+            try:
+                self.value()
+            except StudioError as exc:
+                QMessageBox.warning(self, self.windowTitle(), str(exc))
                 return
             super().accept()
+
 
     class SleepDialog(QDialog):
         """How long the player should hold before the next event."""
@@ -598,19 +838,22 @@ if QT_AVAILABLE:
             super().accept()
 
     class MusicDialog(QDialog):
-        """Choose a track for a ``<p>`` event, or insert a brand new one."""
+        """Choose a track for a ``<p>`` event, or insert a brand new one.
+
+        Tracks are listed by their audio file, never by the internal key.
+        """
 
         def __init__(self, parent, studio_window, current: str = "") -> None:
             super().__init__(parent)
             self.setWindowTitle("播放音乐")
             self.studio = studio_window
-            self.resize(520, 260)
+            self.resize(540, 260)
             self.new_track: Optional[MusicDraft] = None
 
             self.combo = QComboBox()
             self.combo.addItem("（停止音乐）", "")
-            for key in self.studio.project.tracks:
-                self.combo.addItem(key, key)
+            for key, track in self.studio.project.tracks.items():
+                self.combo.addItem("♪ %s" % studio.track_label(key, self.studio.project.tracks), key)
             index = self.combo.findData(current)
             if index >= 0:
                 self.combo.setCurrentIndex(index)
@@ -625,8 +868,12 @@ if QT_AVAILABLE:
             form = QFormLayout()
             form.addRow("曲目", row)
 
-            hint = QLabel("还没有的音乐可以先「插入新音乐」，它会直接存进剧情包。")
-            hint.setStyleSheet("color:#777;")
+            hint = QLabel(
+                "还没有的音乐可以先「插入新音乐」，它会直接存进剧情包；"
+                "曲目在文件里的简称会自动生成。"
+            )
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
 
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -645,7 +892,8 @@ if QT_AVAILABLE:
             if draft is None:
                 return
             self.new_track = draft
-            self.combo.addItem(draft.abbreviation, draft.abbreviation)
+            label = Path(draft.source).stem if draft.source else draft.abbreviation
+            self.combo.addItem("♪ %s" % label, draft.abbreviation)
             self.combo.setCurrentIndex(self.combo.count() - 1)
 
         def value(self) -> str:
@@ -663,14 +911,10 @@ if QT_AVAILABLE:
         if not filename:
             return None
         source = Path(filename)
-        key, ok = QInputDialog.getText(
-            parent,
-            "音乐简称",
-            "为 %s 指定 <p> 使用的简称：" % source.name,
-            text=suggest_abbreviation(source),
-        )
-        if not ok or not key.strip():
-            return None
+        # The internal key is derived from the file, not asked for: nobody should
+        # have to invent a short code just to drop a song into a scene.
+        taken = set(studio_window.project.tracks)
+        key = studio.suggest_key(source.stem, taken, prefix="m")
 
         answer = QMessageBox.question(
             parent,
@@ -684,7 +928,7 @@ if QT_AVAILABLE:
         if answer == QMessageBox.StandardButton.Cancel:
             return None
 
-        draft = MusicDraft(abbreviation=key.strip(), source=source)
+        draft = MusicDraft(abbreviation=key, source=source)
         if answer == QMessageBox.StandardButton.Yes:
             draft.kind = "instrumental"
             return draft
@@ -765,7 +1009,7 @@ if QT_AVAILABLE:
 
         def _build(self) -> None:
             self.table = QTableWidget(0, 3)
-            self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            self.table.setHorizontalHeaderLabels(["名字", "样式", "标识"])
             compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -774,10 +1018,10 @@ if QT_AVAILABLE:
             self.table.itemDoubleClicked.connect(lambda _item: self.edit_character())
 
             self.hint = QLabel(
-                "角色缩写就是剧本里写的 [f]，样式决定它在播放器里的颜色。"
-                "支持批量粘贴或从已有剧情包／JSON 直接导入。"
+                "名字就是播放时显示的样子，颜色决定它的样式。"
+                "「标识」只是文件内部用的记号，会自动从名字生成，平时不用管。"
             )
-            self.hint.setStyleSheet("color:#777;")
+            self.hint.setObjectName("hint")
 
             self.buttons: Dict[str, QPushButton] = {}
             buttons = QHBoxLayout()
@@ -813,15 +1057,22 @@ if QT_AVAILABLE:
             if self.project is None:
                 return
             for row, (key, name, style) in enumerate(self.project.character_rows()):
-                self.table.setItem(row, 0, QTableWidgetItem(key))
-                self.table.setItem(row, 1, QTableWidgetItem(name))
-                item = QTableWidgetItem(self._style_text(style))
+                item = QTableWidgetItem(name)
+                # The key rides along invisibly; the column shows the name.
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                self.table.setItem(row, 0, item)
+
+                style_item = QTableWidgetItem(self._style_text(style))
                 css = _style_css(style)
                 if css:
                     colour = re.search(r"color:(#[0-9a-fA-F]{6})", css)
                     if colour:
-                        item.setForeground(QColor(colour.group(1)))
-                self.table.setItem(row, 2, item)
+                        style_item.setForeground(QColor(colour.group(1)))
+                self.table.setItem(row, 1, style_item)
+
+                key_item = QTableWidgetItem(key)
+                key_item.setForeground(QColor("#888888"))
+                self.table.setItem(row, 2, key_item)
             self.table.resizeColumnsToContents()
 
         @staticmethod
@@ -833,16 +1084,19 @@ if QT_AVAILABLE:
 
         def _selected_key(self) -> Optional[str]:
             rows = self.table.selectionModel().selectedRows()
-            return self.table.item(rows[0].row(), 0).text() if rows else None
+            if not rows:
+                return None
+            item = self.table.item(rows[0].row(), 0)
+            return item.data(Qt.ItemDataRole.UserRole) if item else None
 
         def add_character(self) -> None:
             if not self.studio.require_project():
                 return
-            dialog = CharacterDialog(self)
+            dialog = CharacterDialog(self, taken=list(self.project.characters))
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             key, name, style = dialog.values()
-            self.studio.run(lambda: self.project.set_character(key, name, style), "已添加角色 %s" % key)
+            self.studio.run(lambda: self.project.set_character(key, name, style), "已添加角色 %s" % name)
 
         def edit_character(self) -> None:
             if not self.studio.require_project():
@@ -852,7 +1106,9 @@ if QT_AVAILABLE:
                 QMessageBox.information(self, "角色", "请先选择一个角色")
                 return
             current = self.project.characters[key]
-            dialog = CharacterDialog(self, key, current.name, current.style)
+            dialog = CharacterDialog(
+                self, key, current.name, current.style, taken=list(self.project.characters)
+            )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             new_key, name, style = dialog.values()
@@ -861,7 +1117,7 @@ if QT_AVAILABLE:
                     self.project.remove_character(key)
                     self._rename_in_scripts(key, new_key)
                 self.project.set_character(new_key, name, style)
-            self.studio.run(apply, "已更新角色 %s" % new_key)
+            self.studio.run(apply, "已更新角色 %s" % name)
 
         def _rename_in_scripts(self, old: str, new: str) -> None:
             for filename, script in self.project.scripts.items():
@@ -1072,13 +1328,15 @@ if QT_AVAILABLE:
                 self._update_buttons()
                 return
             script = self.project.script(name)
+            characters = self.project.characters
+            tracks = self.project.tracks
             self.table.setRowCount(len(script.lines))
             for row, event in enumerate(script.lines):
                 values = [
                     str(row + 1),
                     event_label(event),
-                    getattr(event, "character", "") or "",
-                    describe_event(event),
+                    studio.event_character(event, characters),
+                    studio.describe_event(event, characters, tracks),
                 ]
                 for column, value in enumerate(values):
                     self.table.setItem(row, column, QTableWidgetItem(value))
@@ -1108,11 +1366,15 @@ if QT_AVAILABLE:
         def new_script(self) -> None:
             if not self.studio.require_project():
                 return
-            suggestion = next_script_name(self.project.scripts)
-            name, ok = QInputDialog.getText(self, "新建剧本", "剧本名", text=suggestion)
-            if not ok:
+            suggestion = studio.script_base_name(
+                next_script_name(self.project.scripts)
+            )
+            dialog = ScriptNameDialog(self, "新建剧本", suggestion)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
-            created = self.studio.run(lambda: self.project.new_script(name), "已新建 %s")
+            created = self.studio.run(
+                lambda: self.project.new_script(dialog.value()), "已新建 %s.tscp" % dialog.value()
+            )
             if created:
                 self.refresh()
                 self.script_combo.setCurrentText(created)
@@ -1123,10 +1385,12 @@ if QT_AVAILABLE:
             name = self.current_script_name()
             if name is None:
                 return
-            new_name, ok = QInputDialog.getText(self, "重命名剧本", "新名字", text=name)
-            if not ok:
+            dialog = ScriptNameDialog(self, "重命名剧本", studio.script_base_name(name))
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
-            self.studio.run(lambda: self.project.rename_script(name, new_name), "已重命名")
+            self.studio.run(
+                lambda: self.project.rename_script(name, dialog.value()), "已重命名"
+            )
             self.refresh()
 
         def delete_script(self) -> None:
@@ -1200,9 +1464,11 @@ if QT_AVAILABLE:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             if dialog.new_track is not None:
+                label = Path(dialog.new_track.source).stem if dialog.new_track.source \
+                    else dialog.new_track.abbreviation
                 self.studio.run(
                     lambda: self.project.add_music([dialog.new_track]),
-                    "已插入音乐 %s" % dialog.new_track.abbreviation,
+                    "已插入音乐 %s" % label,
                 )
             self._add(Directive("p", dialog.value()))
 
@@ -1230,9 +1496,11 @@ if QT_AVAILABLE:
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     return
                 if dialog.new_track is not None:
+                    label = Path(dialog.new_track.source).stem if dialog.new_track.source \
+                        else dialog.new_track.abbreviation
                     self.studio.run(
                         lambda: self.project.add_music([dialog.new_track]),
-                        "已插入音乐 %s" % dialog.new_track.abbreviation,
+                        "已插入音乐 %s" % label,
                     )
                 replacement = Directive("p", dialog.value())
             else:
@@ -1358,13 +1626,15 @@ if QT_AVAILABLE:
                 self.table.setRowCount(0)
                 return
             script = self.project.script(name)
+            characters = self.project.characters
             self.table.setRowCount(len(script.lines))
             for row, event in enumerate(script.lines):
                 if isinstance(event, Dialogue):
                     needed = studio.timed_slots(event)
                     done = needed if len(event.delays) == visible_text_length(event.text) else 0
                     values = [
-                        str(row + 1), event_label(event), event.character or "旁白",
+                        str(row + 1), event_label(event),
+                        studio.character_label(event.character, characters) or "旁白",
                         "%d/%d" % (done, needed),
                     ]
                 else:
@@ -1615,7 +1885,7 @@ if QT_AVAILABLE:
 
         def _build(self) -> None:
             self.table = QTableWidget(0, 4)
-            self.table.setHorizontalHeaderLabels(["简称", "类型", "文件", "颜色"])
+            self.table.setHorizontalHeaderLabels(["曲目", "类型", "歌词文件", "颜色"])
             compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1704,13 +1974,15 @@ if QT_AVAILABLE:
             for row, key in enumerate(tracks):
                 track = self.project.tracks[key]
                 values = [
-                    key,
+                    studio.track_label(key, self.project.tracks),
                     "带歌词" if track.has_lyrics else "纯音乐",
                     track.lyrics or track.filename,
                     track.color or "—",
                 ]
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, key)
                     if column == 3 and track.color:
                         item.setForeground(QColor(track.color))
                     self.table.setItem(row, column, item)
@@ -1723,7 +1995,7 @@ if QT_AVAILABLE:
             if not rows:
                 return None
             item = self.table.item(rows[0].row(), 0)
-            return item.text() if item else None
+            return item.data(Qt.ItemDataRole.UserRole) if item else None
 
         def _load_selected(self) -> None:
             key = self._selected_abbreviation()
@@ -1747,8 +2019,9 @@ if QT_AVAILABLE:
             draft = collect_new_track(self, self.studio)
             if draft is None:
                 return
+            label = Path(draft.source).stem if draft.source else draft.abbreviation
             self.studio.run(
-                lambda: self.project.add_music([draft]), "已插入 %s" % draft.abbreviation
+                lambda: self.project.add_music([draft]), "已插入 %s" % label
             )
             self.refresh()
 
@@ -2033,6 +2306,11 @@ if QT_AVAILABLE:
             self._player = None
             self.theme_name = "light"
             self._theme_actions: Dict[str, QAction] = {}
+            self._autosave_enabled = True
+            self._backoff = 1
+            self._autosave = QTimer(self)
+            self._autosave.setInterval(AUTO_SNAPSHOT_SECONDS * 1000)
+            self._autosave.timeout.connect(self._auto_snapshot)
             self.setWindowTitle("剧情工坊")
             self.resize(1240, 820)
             self._build_ui()
@@ -2126,6 +2404,7 @@ if QT_AVAILABLE:
             self._build_menu()
             self._restore_theme()
             self.step_list.setCurrentRow(0)
+            self._autosave.start(AUTO_SNAPSHOT_SECONDS * 1000)
 
         def _build_menu(self) -> None:
             """A file menu, so Ctrl+S and friends are discoverable."""
@@ -2158,6 +2437,58 @@ if QT_AVAILABLE:
                 )
                 view.addAction(action)
                 self._theme_actions[key] = action
+
+            view.addSeparator()
+            self.autosave_action = QAction(AUTO_SNAPSHOT_MENU_LABEL, self)
+            self.autosave_action.setCheckable(True)
+            self.autosave_action.setChecked(True)
+            self.autosave_action.toggled.connect(self.set_autosave)
+            view.addAction(self.autosave_action)
+
+        # -- automatic snapshots ---------------------------------------
+        def set_autosave(self, enabled: bool) -> None:
+            self._autosave_enabled = bool(enabled)
+            if self._autosave_enabled:
+                self._backoff = 1
+                self._autosave.start(AUTO_SNAPSHOT_SECONDS * 1000)
+                self.status.setText(
+                    "自动快照已开启：每 %d 分钟一次，无改动会自动延长"
+                    % (AUTO_SNAPSHOT_SECONDS // 60)
+                )
+            else:
+                self._autosave.stop()
+                self.status.setText("自动快照已关闭")
+
+        def _auto_snapshot(self) -> None:
+            """Take a lightweight snapshot, stretching the interval when idle."""
+
+            if self.project is None or not self.project.has_history:
+                # Nothing to snapshot into; try again at the slowest rate.
+                self._backoff = AUTO_SNAPSHOT_MAX_BACKOFF
+                self._reschedule_autosave()
+                return
+            try:
+                revision = self.project.auto_snapshot()
+            except StudioError as exc:
+                self.status.setText("自动快照失败：%s" % exc)
+                self._reschedule_autosave()
+                return
+            if revision is None:
+                # No change since last time: wait longer before looking again.
+                self._backoff = min(self._backoff * 2, AUTO_SNAPSHOT_MAX_BACKOFF)
+                self.status.setText(
+                    "自动快照：没有改动，下次 %d 分钟后再看"
+                    % (AUTO_SNAPSHOT_SECONDS * self._backoff // 60)
+                )
+            else:
+                self._backoff = 1
+                self._refresh_all()
+                self.status.setText("已记录自动快照 %s" % revision)
+            self._reschedule_autosave()
+
+        def _reschedule_autosave(self) -> None:
+            if self._autosave_enabled:
+                self._autosave.start(AUTO_SNAPSHOT_SECONDS * self._backoff * 1000)
 
         # -- theme -----------------------------------------------------
         def _restore_theme(self) -> None:

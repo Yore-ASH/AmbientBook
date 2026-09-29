@@ -59,9 +59,14 @@ def test_event_kind_and_labels_cover_all_five_rows():
 def test_describe_event():
     assert describe_event(Dialogue("f", "你好")) == "你好"
     assert describe_event(Directive("s", "1.5")) == "1.5 秒"
-    assert describe_event(Directive("p", "iw")) == "iw"
-    assert describe_event(Directive("p", "")) == "（停止）"
+    assert describe_event(Directive("p", "iw")) == "♪ iw"
+    assert describe_event(Directive("p", "")) == "（停止音乐）"
     assert describe_event(Directive("c")) == "—"
+    # With the project's tracks to hand it shows the audio file, not the key.
+    from tscp_player.plot import MusicTrack
+
+    tracks = {"iw": MusicTrack("iw", "night train.flac")}
+    assert describe_event(Directive("p", "iw"), tracks=tracks) == "♪ night train"
 
 
 def test_normalise_script_pads_and_truncates_delays():
@@ -906,6 +911,156 @@ def test_a_project_reopens_with_its_history(tmp_path):
     assert reopened.path.suffix == ".tscpkgs"
     assert [item["LABEL"] for item in reopened.revisions()] == ["加了剧本", "起点"]
     assert reopened.has_history is True
+
+
+# --------------------------------------------------------------------------
+# script names never expose the extension
+# --------------------------------------------------------------------------
+
+def test_script_base_name_strips_the_extension():
+    assert studio_model.script_base_name("序章.tscp") == "序章"
+    assert studio_model.script_base_name("序章") == "序章"
+    assert studio_model.script_base_name("  序章.tscp  ") == "序章"
+    assert studio_model.script_base_name("序章.TSCP") == "序章"
+    assert studio_model.safe_script_name("序章") == "序章.tscp"
+
+
+def test_script_base_name_refuses_anything_that_could_bite():
+    for bad in (
+        "",
+        "   ",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a:b",
+        "a*b",
+        "a?b",
+        "trailing.",
+        "con",
+        "NUL",
+        "com1",
+    ):
+        with pytest.raises(StudioError):
+            studio_model.script_base_name(bad)
+
+
+def test_script_base_name_trims_whitespace():
+    # Surrounding whitespace is simply normalised away, not an error.
+    assert studio_model.script_base_name("  序章  ") == "序章"
+
+
+def test_script_base_name_keeps_a_wrong_extension_out_of_the_way():
+    # ".exe" is not stripped, but it can never become the final extension.
+    assert studio_model.safe_script_name("plot.exe") == "plot.exe.tscp"
+
+
+# --------------------------------------------------------------------------
+# keys are derived, not typed
+# --------------------------------------------------------------------------
+
+def test_suggest_key_derives_from_the_name():
+    assert studio_model.suggest_key("FISH") == "fish"
+    assert studio_model.suggest_key("Bister") == "bist"
+    assert studio_model.suggest_key("Teiresias") == "teir"
+    # Nothing usable in the name: fall back to the prefix.
+    assert studio_model.suggest_key("???") == "c"
+    assert studio_model.suggest_key("???", prefix="m") == "m"
+    # A leading digit would be awkward in the file format.
+    assert studio_model.suggest_key("42") == "c42"
+    # Uniqueness.
+    assert studio_model.suggest_key("Fish", ["fish"]) == "fish2"
+    assert studio_model.suggest_key("Fish", ["fish", "fish2"]) == "fish3"
+
+
+def test_labels_never_show_the_key():
+    from tscp_player.plot import Character, MusicTrack
+
+    characters = {"f": Character("FISH", "")}
+    assert studio_model.character_label("f", characters) == "FISH"
+    # An unknown key still shows something rather than nothing.
+    assert studio_model.character_label("ghost", characters) == "ghost"
+    assert studio_model.character_label(None, characters) == ""
+
+    tracks = {"night": MusicTrack("night", "末班车.flac")}
+    assert studio_model.track_label("night", tracks) == "末班车"
+    assert studio_model.track_label("ghost", tracks) == "ghost"
+
+
+def test_event_character_resolves_names():
+    from tscp_player.plot import Character
+
+    characters = {"f": Character("FISH", "")}
+    assert studio_model.event_character(Dialogue("f", "你好"), characters) == "FISH"
+    assert studio_model.event_character(Dialogue(None, "旁白"), characters) == ""
+    assert studio_model.event_character(Directive("c"), characters) == ""
+
+
+# --------------------------------------------------------------------------
+# automatic snapshots
+# --------------------------------------------------------------------------
+
+def test_auto_snapshot_captures_the_writing_only(tmp_path):
+    project = _project_file(tmp_path)
+    project.add_music([model.MusicDraft(
+        abbreviation="iw", source=_song(tmp_path), kind="lyrics",
+        lyrics_text="[00:01.00]第一句\n", color="#ffd166",
+    )])
+    project.set_character("f", "FISH", "")
+    name = project.new_script()
+    project.add_event(name, Dialogue("f", "第一版"))
+    project.save(label="起点")
+
+    project.add_event(name, Dialogue("f", "第二版"))
+    revision = project.auto_snapshot()
+    assert revision is not None
+    document = project.revision(revision)
+    # Music is deliberately left out: a snapshot only needs the writing.
+    assert "MUSIC" not in document
+    # Scripts are stored compiled, so read them back rather than substring them.
+    restored = studio_model.parse_script_text(document["SCRIPTS"]["plot.tscp"], ".tscp")
+    assert [item.text for item in restored.lines] == ["第一版", "第二版"]
+    assert document["LABEL"] == "自动快照"
+
+    entry = project.revisions()[0]
+    assert entry["AUTO"] is True
+    # The lyrics in the container are untouched by the snapshot.
+    assert project.tracks["iw"].has_lyrics is True
+
+
+def test_auto_snapshot_reports_nothing_to_do(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    project.save(label="起点")
+    # Nothing changed since the last revision.
+    assert project.auto_snapshot() is None
+
+
+def test_auto_snapshot_needs_a_project_file(tmp_path):
+    project = _project(tmp_path)          # plain .tscpkg, no history
+    project.set_character("f", "FISH", "")
+    project.save()
+    assert project.auto_snapshot() is None
+    assert project.revisions() == []
+
+
+def test_auto_snapshots_are_capped_but_named_ones_survive(tmp_path, monkeypatch):
+    monkeypatch.setattr(studio_model, "MAX_AUTO_SNAPSHOTS", 2)
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    project.save(label="手动留档")
+
+    for index in range(4):
+        project.set_character("c%d" % index, "名字 %d" % index, "")
+        assert project.auto_snapshot() is not None
+
+    history = project.revisions()
+    autos = [item for item in history if item.get("AUTO")]
+    assert len(autos) == 2
+    assert any(item["LABEL"] == "手动留档" for item in history)
+    # The dropped snapshots are really gone from the container.
+    with pytest.raises(StudioError):
+        project.revision("R000002")
 
 
 def test_import_from_a_project_file(tmp_path):

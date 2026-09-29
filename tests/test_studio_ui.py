@@ -96,7 +96,8 @@ def studio(tmp_path, qapp, no_modal_dialogs):
     window._refresh_all()
     yield window
     # Closing a dirty window asks to save; make the teardown deterministic.
-    window.project.dirty = False
+    if window.project is not None:
+        window.project.dirty = False
     window.close()
 
 
@@ -140,10 +141,17 @@ def test_characters_step_lists_the_project(studio, tmp_path):
 
     step = window.steps[0]
     assert step.table.rowCount() == 2
-    assert [step.table.item(row, 0).text() for row in range(2)] == ["f", "t"]
-    assert step.table.item(0, 1).text() == "FISH"
+    # The name comes first; the file key is tucked into the last column.
+    assert [step.table.item(row, 0).text() for row in range(2)] == ["FISH", "Teiresias"]
+    assert step.table.item(0, 2).text() == "f"
     # The style column shows the escaped spelling, not a real ESC byte.
-    assert step.table.item(0, 2).text() == r"\033[1;33m"
+    assert step.table.item(0, 1).text() == r"\033[1;33m"
+    # The row still knows which character it is.
+    from PySide6.QtCore import Qt
+
+    assert step.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "f"
+    step.table.selectRow(1)
+    assert step._selected_key() == "t"
 
 
 def test_story_step_labels_every_row_kind(studio, tmp_path):
@@ -156,8 +164,10 @@ def test_story_step_labels_every_row_kind(studio, tmp_path):
     assert [step.table.item(row, 1).text() for row in range(4)] == [
         "播放音乐", "角色对白", "暂停", "旁白",
     ]
-    assert step.table.item(1, 2).text() == "f"
+    # Characters appear by name, music by its audio file — never by file key.
+    assert step.table.item(1, 2).text() == "FISH"
     assert step.table.item(1, 3).text() == "你好，世界！"
+    assert step.table.item(0, 3).text() == "♪ song"
     assert step.table.item(2, 3).text() == "0 秒"
     assert step.table.item(3, 2).text() == ""
 
@@ -653,60 +663,282 @@ def test_window_title_shows_whether_history_is_on(studio):
     assert studio.project.has_history is False
 
 
+# --------------------------------------------------------------------------
+# script names never expose the extension
+# --------------------------------------------------------------------------
+
+def test_script_name_dialog_shows_the_bare_name(studio):
+    from Studio.Main import ScriptNameDialog
+
+    dialog = ScriptNameDialog(studio, "新建剧本", "序章")
+    assert dialog.name_edit.text() == "序章"
+    assert dialog.value() == "序章"
+    assert "序章.tscp" in dialog.hint.text()
+    # A typed extension is simply understood, not doubled up.
+    dialog.name_edit.setText("第一章.tscp")
+    assert dialog.value() == "第一章"
+
+
+def test_script_name_dialog_refuses_an_illegal_name(studio, messages):
+    from Studio.Main import ScriptNameDialog
+
+    dialog = ScriptNameDialog(studio, "新建剧本", "序章")
+    dialog.name_edit.setText("a/b")
+    dialog.accept()
+    assert any("不能包含" in text for _kind, text in messages)
+    # Refused, so the dialog is still open (never accepted).
+    assert dialog.result() != dialog.DialogCode.Accepted
+
+
+def test_new_script_uses_the_name_dialog(studio, monkeypatch):
+    from Studio.Main import ScriptNameDialog
+
+    window = studio
+
+    class AutoAccept(ScriptNameDialog):
+        def exec(self):
+            self.name_edit.setText("第二幕")
+            return self.DialogCode.Accepted
+
+    monkeypatch.setattr("Studio.Main.ScriptNameDialog", AutoAccept)
+    window.steps[1].new_script()
+    assert "第二幕.tscp" in window.project.scripts
+
+
+# --------------------------------------------------------------------------
+# characters are picked by name
+# --------------------------------------------------------------------------
+
+def test_dialogue_dialog_lists_characters_by_name(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    labels = [dialog.character_combo.itemText(i) for i in range(dialog.character_combo.count())]
+    assert labels == ["FISH", "Teiresias"]
+    # ...while each entry still carries the file key.
+    assert dialog.character_combo.itemData(0) == "f"
+    dialog.text_edit.setPlainText("你好")
+    assert dialog.values() == Dialogue("f", "你好")
+
+
+def test_dialogue_dialog_preselects_the_existing_character(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, Dialogue("t", "旧台词"), narrator=False)
+    assert dialog.values().character == "t"
+    assert dialog.text() == "旧台词"
+
+
+def test_narration_is_a_single_line_and_enter_commits(studio, tmp_path):
+    from PySide6.QtWidgets import QLineEdit
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=True)
+    # One line of narration, and Enter finishes it.
+    assert isinstance(dialog.text_edit, QLineEdit)
+    dialog.text_edit.setText("雨声盖过了广播。")
+    dialog.text_edit.returnPressed.emit()
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert dialog.values() == Dialogue(None, "雨声盖过了广播。")
+
+
+def test_dialogue_inserts_a_coloured_character_name(studio, tmp_path):
+    from PySide6.QtGui import QTextCursor
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    dialog.text_edit.setPlainText("说：")
+    dialog.text_edit.moveCursor(QTextCursor.MoveOperation.End)
+    dialog.name_combo.setCurrentIndex(1)          # FISH
+    dialog.insert_name()
+
+    text = dialog.text_edit.toPlainText()
+    assert text == "说：\033[1;33mFISH\033[0m"
+    # The preview renders the colour rather than the escape codes.
+    assert "#cccc33" in dialog.preview.text() or "font-weight:bold" in dialog.preview.text()
+    assert "\\033" not in dialog.preview.text()
+
+
+def test_narration_can_also_take_a_coloured_name(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=True)
+    dialog.name_combo.setCurrentIndex(1)
+    dialog.insert_name()
+    assert dialog.text() == "\033[1;33mFISH\033[0m"
+
+
+def test_music_dialog_lists_tracks_by_file(studio, tmp_path):
+    from Studio.Main import MusicDialog
+
+    window = studio
+    _story(window, tmp_path)                       # adds song.flac under key "iw"
+    dialog = MusicDialog(window, window, "iw")
+    labels = [dialog.combo.itemText(i) for i in range(dialog.combo.count())]
+    assert labels[0] == "（停止音乐）"
+    assert labels[1] == "♪ song"
+    assert dialog.value() == "iw"
+
+
+# --------------------------------------------------------------------------
+# automatic snapshots
+# --------------------------------------------------------------------------
+
+def test_auto_snapshot_records_then_backs_off(tmp_path, qapp, no_modal_dialogs):
+    window = _project_with_history(tmp_path, qapp, no_modal_dialogs)
+    try:
+        window.project.set_character("f", "FISH", "")
+        window.save("起点")
+
+        # A real change is snapshotted and the interval resets.
+        window.project.set_character("t", "Teiresias", "")
+        window._auto_snapshot()
+        assert window._backoff == 1
+        assert window.project.revisions()[0]["AUTO"] is True
+
+        # Nothing changed this time, so the next look is further away.
+        before = len(window.project.revisions())
+        window._auto_snapshot()
+        assert window._backoff == 2
+        assert len(window.project.revisions()) == before
+        assert "没有改动" in window.status.text()
+        assert window._autosave.interval() == 300 * 2 * 1000
+    finally:
+        window.project.dirty = False
+        window.close()
+
+
+def test_auto_snapshot_backs_off_all_the_way_up_to_the_cap(tmp_path, qapp, no_modal_dialogs):
+    from Studio.Main import AUTO_SNAPSHOT_MAX_BACKOFF
+
+    window = _project_with_history(tmp_path, qapp, no_modal_dialogs)
+    try:
+        window.project.set_character("f", "FISH", "")
+        window.save("起点")
+        for _ in range(10):
+            window._auto_snapshot()
+        assert window._backoff == AUTO_SNAPSHOT_MAX_BACKOFF
+    finally:
+        window.project.dirty = False
+        window.close()
+
+
+def test_auto_snapshot_survives_having_no_project(studio):
+    """No project open: the timer must idle quietly, not raise."""
+
+    from Studio.Main import AUTO_SNAPSHOT_MAX_BACKOFF
+
+    studio.project = None
+    studio._auto_snapshot()
+    assert studio._backoff == AUTO_SNAPSHOT_MAX_BACKOFF
+
+
+def test_autosave_can_be_switched_off(studio):
+    assert studio._autosave.isActive() is True
+    studio.set_autosave(False)
+    assert studio._autosave.isActive() is False
+    assert "已关闭" in studio.status.text()
+    studio.set_autosave(True)
+    assert studio._autosave.isActive() is True
+
+
+def test_the_autosave_menu_item_reflects_the_state(studio):
+    assert studio.autosave_action.isChecked() is True
+    studio.autosave_action.setChecked(False)
+    assert studio._autosave_enabled is False
+
+
 def test_batch_add_dialog_accumulates_before_committing(studio):
-    """The old generator's batch flow: keep filling fields, commit once."""
+    """The old generator's batch flow: keep filling fields, commit once.
+
+    Only the name is typed now — the file key is derived and kept unique.
+    """
 
     from Studio.Main import BatchAddDialog
 
     window = studio
-    window.project.set_character("t", "旧名字", "")
+    window.project.set_character("t", "Teiresias", "")     # already in the project
     dialog = BatchAddDialog(window, window.project.characters)
 
-    for key, name in (("f", "FISH"), ("t", "Teiresias"), ("g", "Guide")):
-        dialog.fields.key_edit.setText(key)
+    for name in ("FISH", "Teiresias", "Guide"):
         dialog.fields.name_edit.setText(name)
         dialog.add_row()
 
-    # Adding a second time updates in place rather than duplicating.
-    dialog.fields.key_edit.setText("f")
-    dialog.fields.name_edit.setText("FISH 改")
-    dialog.add_row()
-
-    assert [row[0] for row in dialog.rows] == ["f", "t", "g"]
-    assert dialog.rows[0][1] == "FISH 改"
+    assert [row[1] for row in dialog.rows] == ["FISH", "Teiresias", "Guide"]
+    keys = [row[0] for row in dialog.rows]
+    assert len(set(keys)) == 3, keys
+    # A name the project already knows keeps its existing key.
+    assert keys[1] == "t"
+    assert keys[0] != "t"
     assert dialog.table.rowCount() == 3
-    assert "（更新）" in dialog.table.item(1, 1).text()
-    # The fields are emptied, ready for the next name.
-    assert dialog.fields.key_edit.text() == ""
+    # The known one is flagged as an update of what is already there.
+    assert "（更新）" in dialog.table.item(1, 0).text()
+
+    # Adding a staged name again updates that row instead of duplicating it.
+    dialog.fields.name_edit.setText("FISH")
+    dialog.add_row()
+    assert [row[1] for row in dialog.rows] == ["FISH", "Teiresias", "Guide"]
+    assert dialog.fields.name_edit.text() == ""      # fields cleared, ready again
 
     window.project.merge_characters(dialog.rows)
-    assert window.project.characters["g"].name == "Guide"
-    assert window.project.characters["t"].name == "Teiresias"
-    assert window.project.characters["f"].name == "FISH 改"
+    names = {key: value.name for key, value in window.project.characters.items()}
+    assert names["t"] == "Teiresias"
+    assert names[keys[2]] == "Guide"
 
 
 def test_batch_add_dialog_can_remove_a_row(studio):
     from Studio.Main import BatchAddDialog
 
     dialog = BatchAddDialog(studio)
-    for key, name in (("f", "FISH"), ("t", "Teiresias")):
-        dialog.fields.key_edit.setText(key)
+    for name in ("FISH", "Teiresias"):
         dialog.fields.name_edit.setText(name)
         dialog.add_row()
     dialog.table.selectRow(0)
     dialog.remove_row()
-    assert [row[0] for row in dialog.rows] == ["t"]
+    assert [row[1] for row in dialog.rows] == ["Teiresias"]
 
 
-def test_batch_add_dialog_derives_a_style_from_the_colour(studio):
+def test_batch_add_dialog_derives_the_key_from_the_name(studio):
     from Studio.Main import BatchAddDialog
 
     dialog = BatchAddDialog(studio)
-    dialog.fields.key_edit.setText("f")
-    dialog.fields.name_edit.setText("FISH")
+    dialog.fields.name_edit.setText("Bister")
     dialog.fields.custom_edit.setText(r"\033[33m")
     dialog.add_row()
-    assert dialog.rows[0][2] == "\033[33m"
+    key, name, style = dialog.rows[0]
+    assert name == "Bister"
+    assert key == "bist"
+    assert style == "\033[33m"
+    # The same name twice is the same character, not a second one.
+    dialog.fields.name_edit.setText("Bister")
+    dialog.add_row()
+    assert [row[0] for row in dialog.rows] == ["bist"]
+
+
+def test_editing_keeps_the_existing_key(studio):
+    """Renaming a character must not silently rewrite every reference."""
+
+    from Studio.Main import CharacterDialog
+
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    dialog = CharacterDialog(window, "f", "FISH", "", taken=["f"])
+    assert dialog.fields.manual_key.isChecked() is True
+    assert dialog.fields.resolved_key() == "f"
+    dialog.fields.name_edit.setText("FISH 改")
+    assert dialog.fields.resolved_key() == "f"
 
 
 def test_characters_step_imports_a_json_file(studio, tmp_path, monkeypatch):
