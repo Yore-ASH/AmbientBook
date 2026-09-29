@@ -348,10 +348,14 @@ def load_plot_package(root: Union[str, Path]) -> PlotPackage:
 def load_archive_package(
     path: Union[str, Path], cache_root: Optional[Union[str, Path]] = None
 ) -> PlotPackage:
-    """Load a plot stored as a single ``.tscpkg`` container."""
+    """Load a plot stored as a single container.
+
+    A studio project (``.tscpkgs``) carries the same playable members plus its
+    own revision history, so it loads here too — the history is simply ignored.
+    """
 
     candidate = Path(path)
-    if not archive.is_package(candidate):
+    if not archive.is_package(candidate) and not archive.is_container(candidate):
         raise PlotPackageError("plot must be a .tscpkg file: " + str(path))
     return _load(ArchiveSource(candidate, cache_root))
 

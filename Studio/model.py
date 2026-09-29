@@ -8,7 +8,9 @@ Nothing here imports Qt, so the flow can be tested without a display.
 from __future__ import annotations
 
 import json
+import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -192,6 +194,34 @@ def safe_script_name(value: str) -> str:
 
 COMPILED_HEADER = "TSCP "
 
+#: A studio *project* is a ``.tscpkg`` container plus a ``History/`` folder, so
+#: the playable part stays byte-for-byte what the player expects and exporting a
+#: clean ``.tscpkg`` is just "copy everything except History/".
+PROJECT_SUFFIX = archive.PROJECT_SUFFIX
+PROJECT_FORMAT = archive.PROJECT_FORMAT
+PLOT_SUFFIX = archive.SUFFIX
+HISTORY_DIR = "History"
+HISTORY_INDEX = HISTORY_DIR + "/__init__.json"
+HISTORY_FORMAT = "tscpks-history 1"
+MAX_REVISIONS = 200
+
+#: ``.tscpc`` — a small, portable character file.
+CHARACTERS_SUFFIX = ".tscpc"
+CHARACTERS_FORMAT = "tscpc 1"
+
+
+def is_project(path: PathLike) -> bool:
+    """Whether *path* is a studio project (``.tscpkgs``) rather than a plot."""
+
+    candidate = Path(path)
+    if not candidate.is_file() or candidate.suffix.lower() != PROJECT_SUFFIX:
+        return False
+    try:
+        manifest = archive.read_json(candidate, archive.MANIFEST, {}) or {}
+    except (archive.PackageError, OSError, ValueError):
+        return False
+    return str(manifest.get("FORMAT", "")) == PROJECT_FORMAT
+
 
 def parse_script_text(text: str, suffix: str = "") -> Script:
     """Parse a compiled ``.tscp`` or a source ``.tscps`` from text."""
@@ -264,23 +294,75 @@ def parse_character_json(text: str) -> List[Tuple[str, str, str]]:
     return rows
 
 
+def parse_characters(text: str) -> List[Tuple[str, str, str]]:
+    """Read characters from either supported spelling.
+
+    A pasted blob may be JSON (what the character generator writes) or the
+    tab-separated batch table, so the paste dialog simply hands it over here and
+    the shape is worked out from the content.
+    """
+
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        return parse_character_json(text)
+    return parse_character_text(text)
+
+
+def characters_document(rows: Iterable[Tuple[str, str, str]]) -> Dict[str, Any]:
+    """The ``.tscpc`` document for *rows*."""
+
+    table: Dict[str, Dict[str, str]] = {}
+    for key, name, style in rows:
+        abbreviation = str(key).strip()
+        label = str(name).strip()
+        if not abbreviation or not label:
+            raise StudioError("角色的缩写和名字都不能为空")
+        table[abbreviation] = {
+            "NAME": label,
+            "STYLE": _normalise_style(abbreviation, style),
+        }
+    if not table:
+        raise StudioError("没有可导出的角色")
+    return {"FORMAT": CHARACTERS_FORMAT, "CHARACTERS": table}
+
+
+def characters_text(rows: Iterable[Tuple[str, str, str]]) -> str:
+    """Pretty JSON for a ``.tscpc`` file; the same shape can be pasted back."""
+
+    return json.dumps(characters_document(rows), ensure_ascii=False, indent=2) + "\n"
+
+
+def write_characters(path: PathLike, rows: Iterable[Tuple[str, str, str]]) -> Path:
+    """Save characters next to the project so they can be reused later."""
+
+    target = Path(path)
+    if target.suffix.lower() != CHARACTERS_SUFFIX:
+        target = target.with_suffix(CHARACTERS_SUFFIX)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.write_text(characters_text(rows), encoding="utf-8")
+    except OSError as exc:
+        raise StudioError("无法写入 %s：%s" % (target, exc)) from exc
+    return target
+
+
 def is_importable(source: PathLike) -> bool:
     """Whether :func:`collect_source` knows how to read *source*."""
 
     path = Path(source)
-    return archive.is_package(path) or path.is_dir()
+    return archive.is_package(path) or is_project(path) or path.is_dir()
 
 
 def collect_source(source: PathLike) -> Dict[str, Any]:
-    """Gather characters, scripts and music from a ``.tscpkg`` or a folder."""
+    """Gather characters, scripts and music from a plot, project or folder."""
 
     path = Path(source)
-    if archive.is_package(path):
+    if archive.is_package(path) or is_project(path):
         return _collect_from_package(path)
     if path.is_dir():
         return _collect_from_directory(path)
     raise StudioError(
-        "只能从 .tscpkg 文件或包含 Musics/Scripts 的文件夹导入：%s" % path
+        "只能从 .tscpkg / .tscpkgs 文件或包含 Musics/Scripts 的文件夹导入：%s" % path
     )
 
 
@@ -369,6 +451,90 @@ def _collect_from_directory(root: Path) -> Dict[str, Any]:
     return {"characters": rows, "scripts": scripts, "music": music}
 
 
+def export_playable(source: PathLike, target: PathLike) -> Path:
+    """Write a clean ``.tscpkg``: current state only, no ``History/``.
+
+    The project file and the playable file share every other member, so this is
+    a straight copy with the history stripped and the manifest relabelled.
+    """
+
+    origin = Path(source)
+    if not origin.is_file():
+        raise StudioError("找不到项目文件：%s" % origin)
+    requested = Path(target)
+    # Check "same file" before any suffix fixup, so exporting a project onto its
+    # own path is refused instead of quietly writing a sibling .tscpkg.
+    if requested.resolve() == origin.resolve():
+        raise StudioError("导出目标和项目文件是同一个文件")
+    destination = requested
+    if destination.suffix.lower() != archive.SUFFIX:
+        destination = destination.with_suffix(archive.SUFFIX)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise StudioError("目标已存在：%s" % destination)
+
+    try:
+        with zipfile.ZipFile(origin) as reader, zipfile.ZipFile(destination, "w") as writer:
+            for info in reader.infolist():
+                name = info.filename
+                if info.is_dir() or name.startswith(HISTORY_DIR + "/"):
+                    continue
+                data = reader.read(name)
+                if name == archive.MANIFEST:
+                    manifest = json.loads(data.decode("utf-8"))
+                    manifest["FORMAT"] = archive.FORMAT_TEXT
+                    data = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                writer.writestr(
+                    name,
+                    data,
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if archive.is_audio(name)
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )
+    except (OSError, zipfile.BadZipFile, ValueError) as exc:
+        if destination.exists():
+            destination.unlink()
+        raise StudioError("导出失败：%s" % exc) from exc
+    return destination
+
+
+def _read_history(path: PathLike) -> List[Dict[str, Any]]:
+    try:
+        document = archive.read_json(path, HISTORY_INDEX, None)
+    except (archive.PackageError, OSError, ValueError):
+        return []
+    if not isinstance(document, dict):
+        return []
+    entries = document.get("REVISIONS")
+    return list(entries) if isinstance(entries, list) else []
+
+
+def _write_history(path: PathLike, revisions: List[Dict[str, Any]], snapshot: Optional[Tuple[str, Dict[str, Any]]] = None) -> None:
+    texts = {
+        HISTORY_INDEX: json.dumps(
+            {"FORMAT": HISTORY_FORMAT, "REVISIONS": revisions}, ensure_ascii=False, indent=2
+        )
+    }
+    if snapshot is not None:
+        revision_id, document = snapshot
+        texts["%s/%s.json" % (HISTORY_DIR, revision_id)] = (
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+        )
+    archive.update(path, text=texts)
+
+
+def _digest(document: Dict[str, Any]) -> str:
+    """Hash the parts of a snapshot that mean 'the content changed'."""
+
+    import hashlib
+
+    payload = {key: value for key, value in document.items() if key not in {"ID", "TIME", "LABEL"}}
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()
+
+
 # --------------------------------------------------------------------------
 # the project
 # --------------------------------------------------------------------------
@@ -393,7 +559,20 @@ class StudioProject:
     ) -> "StudioProject":
         target = Path(path)
         try:
-            model.create_package(target, name=name, description=description)
+            if target.suffix.lower() == PROJECT_SUFFIX:
+                # A project carries its own revision history alongside the very
+                # same playable members.
+                archive.create(
+                    target,
+                    name=name,
+                    description=description,
+                    suffix=PROJECT_SUFFIX,
+                    format_text=PROJECT_FORMAT,
+                )
+                _write_history(target, [])
+            else:
+                model.create_package(target, name=name, description=description)
+                target = target.with_suffix(archive.SUFFIX)
         except (PackError, archive.PackageError, OSError) as exc:
             raise StudioError(str(exc)) from exc
         project = cls(path=target, name=name.strip(), description=description)
@@ -431,8 +610,16 @@ class StudioProject:
         self.dirty = False
 
     # -- saving --------------------------------------------------------
-    def save(self) -> Path:
-        """Write characters, metadata and every script back into the container."""
+    @property
+    def has_history(self) -> bool:
+        return self.path.suffix.lower() == PROJECT_SUFFIX or bool(_read_history(self.path))
+
+    def save(self, label: Optional[str] = None) -> Path:
+        """Write characters, metadata and every script back into the container.
+
+        On a project file this also records a revision, so the history lives in
+        the same file as the work itself.
+        """
 
         try:
             model.update_metadata(
@@ -449,17 +636,137 @@ class StudioProject:
                 model.write_script(self.path, filename, serialize_tscp(normalise_script(script)))
         except (PackError, archive.PackageError, OSError, ValueError) as exc:
             raise StudioError(str(exc)) from exc
+        if self.has_history:
+            try:
+                self._record_revision(label)
+            except (archive.PackageError, OSError, ValueError) as exc:
+                raise StudioError("保存历史版本失败：%s" % exc) from exc
         self.dirty = False
         return self.path
 
     def export(self, target: PathLike) -> Path:
-        """Save, then write an independent copy to *target*."""
+        """Write a clean ``.tscpkg``: current state, no history."""
 
         self.save()
         try:
-            return model.save_copy(self.path, target)
+            return export_playable(self.path, target)
         except (PackError, archive.PackageError, OSError, ValueError) as exc:
             raise StudioError(str(exc)) from exc
+
+    # -- revision history ----------------------------------------------
+    def snapshot(self) -> Dict[str, Any]:
+        """The full editable state, as JSON."""
+
+        return {
+            "NAME": self.name,
+            "DESCRIPTION": self.description,
+            "CHARACTERS": {
+                key: {"NAME": character.name, "STYLE": character.style}
+                for key, character in self.characters.items()
+            },
+            "SCRIPTS": {
+                filename: serialize_tscp(normalise_script(script))
+                for filename, script in self.scripts.items()
+            },
+            "MUSIC": {
+                key: {
+                    "KIND": track.kind,
+                    "COLOR": track.color,
+                    "FILENAME": track.filename,
+                    "LYRICS": track.lyrics,
+                    "LYRICS_TEXT": self.lyrics_text(key),
+                }
+                for key, track in self.tracks.items()
+            },
+        }
+
+    def revisions(self) -> List[Dict[str, Any]]:
+        """Newest first."""
+
+        return list(reversed(_read_history(self.path)))
+
+    def revision(self, revision_id: str) -> Dict[str, Any]:
+        member = "%s/%s.json" % (HISTORY_DIR, revision_id)
+        try:
+            document = archive.read_json(self.path, member, None)
+        except (archive.PackageError, OSError, ValueError) as exc:
+            raise StudioError(str(exc)) from exc
+        if not isinstance(document, dict):
+            raise StudioError("找不到版本 %s" % revision_id)
+        return document
+
+    def _record_revision(self, label: Optional[str]) -> Optional[str]:
+        document = self.snapshot()
+        digest = _digest(document)
+        history = _read_history(self.path)
+        if history and history[-1].get("HASH") == digest and not label:
+            return None                      # nothing actually changed
+        revision_id = "R%06d" % (len(history) + 1)
+        document["ID"] = revision_id
+        document["TIME"] = datetime.now().isoformat(timespec="seconds")
+        document["LABEL"] = label or "自动保存"
+        entry = {
+            "ID": revision_id,
+            "TIME": document["TIME"],
+            "LABEL": document["LABEL"],
+            "HASH": digest,
+            "CHARACTERS": len(self.characters),
+            "SCRIPTS": len(self.scripts),
+        }
+        history.append(entry)
+        if len(history) > MAX_REVISIONS:
+            # Drop the oldest snapshot so a long-lived project cannot grow forever.
+            for stale in history[:-MAX_REVISIONS]:
+                archive.update(
+                    self.path, remove=["%s/%s.json" % (HISTORY_DIR, stale["ID"])]
+                )
+            history = history[-MAX_REVISIONS:]
+        _write_history(self.path, history, (revision_id, document))
+        return revision_id
+
+    def restore(self, revision_id: str) -> Dict[str, Any]:
+        """Load a revision back into memory (the file is untouched until save)."""
+
+        document = self.revision(revision_id)
+        self.name = str(document.get("NAME", self.name))
+        self.description = str(document.get("DESCRIPTION", self.description))
+        self.characters = {
+            str(key): Character(str(value.get("NAME", key)), str(value.get("STYLE", "")))
+            for key, value in (document.get("CHARACTERS") or {}).items()
+        }
+        scripts: Dict[str, Script] = {}
+        for filename, text in (document.get("SCRIPTS") or {}).items():
+            try:
+                scripts[str(filename)] = parse_script_text(str(text), ".tscp")
+            except StudioError:
+                continue
+        self.scripts = scripts
+        self.dirty = True
+
+        restored, missing = 0, []
+        for key, entry in (document.get("MUSIC") or {}).items():
+            if key not in self.tracks:
+                missing.append(str(key))
+                continue
+            try:
+                model.update_track(
+                    self.path,
+                    key,
+                    kind=str(entry.get("KIND") or "instrumental"),
+                    lyrics_text=entry.get("LYRICS_TEXT") or None,
+                    color=str(entry.get("COLOR") or ""),
+                )
+                restored += 1
+            except (PackError, archive.PackageError, OSError, ValueError):
+                missing.append(str(key))
+        if restored:
+            self._reload_tracks()
+        return {
+            "id": revision_id,
+            "label": str(document.get("LABEL", "")),
+            "music_restored": restored,
+            "music_missing": missing,
+        }
 
     # -- characters ----------------------------------------------------
     def character_rows(self) -> List[Tuple[str, str, str]]:

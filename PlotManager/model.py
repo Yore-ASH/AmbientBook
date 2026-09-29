@@ -168,7 +168,7 @@ def inspect(path: PathLike) -> PackageInfo:
     """Read everything the manager shows for one container."""
 
     target = Path(path)
-    if not archive.is_package(target):
+    if not archive.is_container(target):
         raise PackError("不是 .tscpkg 文件：%s" % target)
     manifest = _document(target, archive.MANIFEST, {})
     scripts_meta = script_document(target)
@@ -280,7 +280,9 @@ def update_metadata(
         manifest["NAME"] = label
     if description is not None:
         manifest["DESCRIPTION"] = str(description).strip()
-    manifest["FORMAT"] = archive.FORMAT_TEXT
+    # Only stamp a format when the container does not declare one: a studio
+    # project (.tscpkgs) must not be relabelled as a plain plot on save.
+    manifest.setdefault("FORMAT", archive.FORMAT_TEXT)
     archive.update(path, text={archive.MANIFEST: _write_json(manifest)})
 
 
@@ -347,7 +349,7 @@ def save_copy(source: PathLike, target: PathLike) -> Path:
     """
 
     origin = Path(source)
-    if not archive.is_package(origin):
+    if not archive.is_container(origin):
         raise PackError("不是 .tscpkg 文件：%s" % origin)
     try:
         archive.members(origin)

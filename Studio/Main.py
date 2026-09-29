@@ -12,6 +12,7 @@ import argparse
 import html
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -23,6 +24,7 @@ import CharacterCreator.model as characters_model
 from PlotManager.model import MusicDraft, PackError, suggest_abbreviation
 from PlotManager.recorder import LyricsRecorderDialog
 from Studio import model as studio
+from Studio import theme
 from Studio.model import (
     CLEAR,
     DIALOGUE,
@@ -64,6 +66,7 @@ try:  # pragma: no cover - depends on the optional GUI package
         QFileDialog,
         QFormLayout,
         QHBoxLayout,
+        QHeaderView,
         QInputDialog,
         QLabel,
         QLineEdit,
@@ -153,6 +156,29 @@ def _style_css(style: str) -> str:
     """CSS for a character style, usable on a ``QLabel`` or table cell."""
 
     return _ansi_css(style)
+
+
+#: Rows in the studio's tables are 22 px: one line of text with no wasted space.
+COMPACT_ROW_HEIGHT = 22
+
+
+def compact_table(table) -> None:
+    """Make a table dense: no row-number gutter, fixed short rows.
+
+    A plot with a hundred lines has to stay readable without becoming a
+    scrolling maze, so every table in the studio goes through here.
+    """
+
+    if not QT_AVAILABLE:  # pragma: no cover - the whole UI is absent
+        return
+    header = table.verticalHeader()
+    header.setVisible(False)
+    header.setDefaultSectionSize(COMPACT_ROW_HEIGHT)
+    header.setMinimumSectionSize(COMPACT_ROW_HEIGHT)
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+    table.setShowGrid(False)
+    if table.alternatingRowColors() is False:
+        table.setAlternatingRowColors(True)
 
 
 if QT_AVAILABLE:
@@ -325,6 +351,7 @@ if QT_AVAILABLE:
 
             self.table = QTableWidget(0, 3)
             self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -492,28 +519,39 @@ if QT_AVAILABLE:
             return "%g" % self.spin.value()
 
     class BatchCharactersDialog(QDialog):
-        """Paste many characters at once, one per line.
+        """Paste a whole cast at once.
 
-        This is the batch format the standalone character generator uses, so an
-        existing list can be dropped straight in.
+        Both spellings are accepted: the JSON the character generator copies to
+        the clipboard (``{"f": {"NAME": "FISH", "STYLE": "\\u001b[1;33m"}}``), and
+        the tab-separated table.
         """
 
         def __init__(self, parent) -> None:
             super().__init__(parent)
-            self.setWindowTitle("批量添加角色")
-            self.resize(620, 440)
+            self.setWindowTitle("粘贴导入角色")
+            self.resize(680, 480)
 
             hint = QLabel(
-                "每行一个角色：<b>缩写 &lt;TAB&gt; 全名 &lt;TAB&gt; ANSI 样式</b>"
-                "（样式可以省略）<br>例如："
-                "<code>f&#9;FISH&#9;\\033[33m</code>、<code>t&#9;Teiresias</code>"
+                "直接粘贴即可，两种格式都认：<br>"
+                "• JSON —— 角色生成器复制出来的那种，"
+                "<code>{ \"f\": { \"NAME\": \"FISH\", \"STYLE\": \"\\u001b[1;33m\" } }</code><br>"
+                "• 表格 —— 每行 <b>缩写 &lt;TAB&gt; 全名 &lt;TAB&gt; ANSI 样式</b>"
+                "（样式可省略），例如 <code>f&#9;FISH&#9;\\033[33m</code>"
             )
             hint.setWordWrap(True)
-            hint.setStyleSheet("color:#777;")
+            hint.setObjectName("hint")
 
             self.editor = QPlainTextEdit()
-            self.editor.setPlaceholderText("f\tFISH\t\\033[33m\nt\tTeiresias")
-            self.editor.setMinimumHeight(260)
+            self.editor.setPlaceholderText(
+                "{\n    \"f\": {\n        \"NAME\": \"FISH\",\n"
+                "        \"STYLE\": \"\\u001b[1;33m\"\n    }\n}"
+            )
+            self.editor.setMinimumHeight(280)
+
+            self.preview = QLabel()
+            self.preview.setObjectName("hint")
+            detect = QPushButton("识别")
+            detect.clicked.connect(self._detect)
 
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -521,13 +559,43 @@ if QT_AVAILABLE:
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
 
+            row = QHBoxLayout()
+            row.addWidget(detect)
+            row.addWidget(self.preview, 1)
+
             layout = QVBoxLayout(self)
             layout.addWidget(hint)
             layout.addWidget(self.editor, 1)
+            layout.addLayout(row)
             layout.addWidget(buttons)
 
         def text(self) -> str:
             return self.editor.toPlainText()
+
+        def _detect(self) -> None:
+            """Show what the current text parses to, without committing it."""
+
+            try:
+                rows = studio.parse_characters(self.text())
+            except StudioError as exc:
+                self.preview.setText("读不出来：%s" % exc)
+                return
+            self.preview.setText(
+                "识别到 %d 个角色：%s"
+                % (len(rows), "、".join(key for key, _n, _s in rows[:8]))
+                + ("…" if len(rows) > 8 else "")
+            )
+
+        def accept(self) -> None:
+            try:
+                rows = studio.parse_characters(self.text())
+            except StudioError as exc:
+                QMessageBox.warning(self, "角色", str(exc))
+                return
+            if not rows:
+                QMessageBox.information(self, "角色", "没有识别到任何角色")
+                return
+            super().accept()
 
     class MusicDialog(QDialog):
         """Choose a track for a ``<p>`` event, or insert a brand new one."""
@@ -698,6 +766,7 @@ if QT_AVAILABLE:
         def _build(self) -> None:
             self.table = QTableWidget(0, 3)
             self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -723,7 +792,9 @@ if QT_AVAILABLE:
                 ("从 JSON 导入…", self.import_json,
                  "从 Scripts/__init__.json 或角色 JSON 导入"),
                 ("从剧情包导入…", self.import_from_plot,
-                 "从已有 .tscpkg／剧情文件夹导入角色"),
+                 "从已有 .tscpkg／.tscpkgs／剧情文件夹导入角色"),
+                ("导出角色…", self.export_characters,
+                 "把当前角色存成 .tscpc 文件，下次可直接导入"),
             ):
                 button = QPushButton(label)
                 button.setToolTip(tip)
@@ -852,7 +923,7 @@ if QT_AVAILABLE:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             try:
-                rows = studio.parse_character_text(dialog.text())
+                rows = studio.parse_characters(dialog.text())
             except StudioError as exc:
                 QMessageBox.warning(self, "角色", str(exc))
                 return
@@ -886,6 +957,35 @@ if QT_AVAILABLE:
                 studio.collect_source(source)["characters"], Path(source).name
             )
 
+        def export_characters(self) -> None:
+            """Save the cast as a ``.tscpc`` so it can be reused next time."""
+
+            if not self.studio.require_project():
+                return
+            if not self.project.characters:
+                QMessageBox.information(self, "角色", "还没有角色可以导出")
+                return
+            suggestion = self.project.path.with_suffix(studio.CHARACTERS_SUFFIX)
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                "导出角色",
+                str(suggestion),
+                "TSCP 角色文件 (*.tscpc);;JSON (*.json)",
+            )
+            if not filename:
+                return
+            try:
+                target = studio.write_characters(
+                    Path(filename), self.project.character_rows()
+                )
+            except StudioError as exc:
+                QMessageBox.warning(self, "角色", str(exc))
+                return
+            self.studio.status.setText(
+                "已导出 %d 个角色到 %s（下次用「从 JSON 导入…」或直接粘贴即可取回）"
+                % (len(self.project.characters), target.name)
+            )
+
     class StoryStep(Step):
         title = "② 剧情"
 
@@ -913,6 +1013,7 @@ if QT_AVAILABLE:
 
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "内容"])
+            compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1198,6 +1299,7 @@ if QT_AVAILABLE:
 
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "进度"])
+            compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1514,6 +1616,7 @@ if QT_AVAILABLE:
         def _build(self) -> None:
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["简称", "类型", "文件", "颜色"])
+            compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1744,7 +1847,10 @@ if QT_AVAILABLE:
             self.summary.setWordWrap(True)
 
             save_button = QPushButton("保存到剧情包")
-            save_button.clicked.connect(self.studio.save)
+            save_button.clicked.connect(lambda: self.studio.save())
+            bookmark_button = QPushButton("保存为新版本…")
+            bookmark_button.setToolTip("给当前状态起个名字，之后可以随时回溯")
+            bookmark_button.clicked.connect(self.save_version)
             export_button = QPushButton("另存为 .tscpkg…")
             export_button.clicked.connect(self.studio.export_as)
             play_button = QPushButton("试播")
@@ -1752,29 +1858,61 @@ if QT_AVAILABLE:
             folder_button = QPushButton("打开所在文件夹")
             folder_button.clicked.connect(self.open_folder)
             import_button = QPushButton("从已有剧情导入…")
-            import_button.setToolTip("把一个 .tscpkg 或旧式 Musics/Scripts 文件夹合并进来")
+            import_button.setToolTip("把一个 .tscpkg／.tscpkgs 或旧式 Musics/Scripts 文件夹合并进来")
             import_button.clicked.connect(self.import_from_source)
 
             buttons = QHBoxLayout()
-            for button in (save_button, export_button, play_button, folder_button, import_button):
+            for button in (
+                save_button, bookmark_button, export_button,
+                play_button, folder_button, import_button,
+            ):
                 buttons.addWidget(button)
             buttons.addStretch(1)
 
             self.issues = QLabel()
             self.issues.setWordWrap(True)
-            self.issues.setStyleSheet("color:#cc9;")
+            self.issues.setObjectName("hint")
+
+            # -- revision history ------------------------------------------
+            self.history = QTableWidget(0, 4)
+            self.history.setHorizontalHeaderLabels(["版本", "时间", "标签", "规模"])
+            compact_table(self.history)
+            self.history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.history.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.history.horizontalHeader().setStretchLastSection(True)
+            self.history.itemDoubleClicked.connect(lambda _item: self.restore_version())
+
+            restore_button = QPushButton("回溯到这个版本")
+            restore_button.clicked.connect(self.restore_version)
+            refresh_button = QPushButton("刷新历史")
+            refresh_button.clicked.connect(self.refresh_history)
+
+            history_buttons = QHBoxLayout()
+            history_buttons.addWidget(restore_button)
+            history_buttons.addWidget(refresh_button)
+            history_buttons.addStretch(1)
+
+            self.history_hint = QLabel()
+            self.history_hint.setWordWrap(True)
+            self.history_hint.setObjectName("hint")
 
             layout = QVBoxLayout(self)
             layout.addWidget(QLabel("检查"))
             layout.addWidget(self.summary)
             layout.addWidget(self.issues)
-            layout.addStretch(1)
+            layout.addWidget(QLabel("版本历史（保存在项目文件里，导出时不会带走）"))
+            layout.addWidget(self.history_hint)
+            layout.addWidget(self.history, 1)
+            layout.addLayout(history_buttons)
             layout.addLayout(buttons)
 
         def refresh(self) -> None:
             if self.project is None:
                 self.summary.setText("还没有打开剧情包。")
                 self.issues.setText("")
+                self.history.setRowCount(0)
+                self.history_hint.setText("")
                 return
             data = self.project.summary()
             lines = [
@@ -1799,6 +1937,72 @@ if QT_AVAILABLE:
             if not data["dirty"] and self.project.path.is_file():
                 problems.append("所有改动都已经写进剧情包了")
             self.issues.setText("\n".join(problems))
+            self.refresh_history()
+
+        def refresh_history(self) -> None:
+            if self.project is None:
+                return
+            if not self.project.has_history:
+                self.history.setRowCount(0)
+                self.history_hint.setText(
+                    "这是一个普通 .tscpkg，没有版本历史。"
+                    "新建时选 .tscpkgs，每次保存都会在同一个文件里记一版。"
+                )
+                return
+            revisions = self.project.revisions()
+            self.history.setRowCount(len(revisions))
+            for row, item in enumerate(revisions):
+                values = [
+                    item.get("ID", ""),
+                    str(item.get("TIME", "")).replace("T", " "),
+                    item.get("LABEL", ""),
+                    "%d 角色 / %d 剧本" % (item.get("CHARACTERS", 0), item.get("SCRIPTS", 0)),
+                ]
+                for column, value in enumerate(values):
+                    self.history.setItem(row, column, QTableWidgetItem(str(value)))
+            self.history.resizeColumnsToContents()
+            self.history_hint.setText("共 %d 个版本，最新的在最上面。" % len(revisions))
+
+        def save_version(self) -> None:
+            if not self.studio.require_project():
+                return
+            if not self.project.has_history:
+                QMessageBox.information(
+                    self, "版本", "普通 .tscpkg 不记录历史，请用 .tscpkgs 新建项目"
+                )
+                return
+            label, ok = QInputDialog.getText(self, "保存为新版本", "这一版叫什么？")
+            if not ok or not label.strip():
+                return
+            if not self.studio.save(label=label.strip()):
+                return
+            self.studio.status.setText("已记录版本：%s" % label.strip())
+
+        def restore_version(self) -> None:
+            if not self.studio.require_project():
+                return
+            rows = self.history.selectionModel().selectedRows()
+            if not rows:
+                QMessageBox.information(self, "版本", "请先选择一个版本")
+                return
+            revision_id = self.history.item(rows[0].row(), 0).text()
+            label = self.history.item(rows[0].row(), 2).text()
+            if QMessageBox.question(
+                self,
+                "回溯版本",
+                "把工程内容回到「%s」（%s）？\n\n"
+                "当前内容不会被删除：先保存一次就又是一个新版本。" % (label, revision_id),
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            outcome = self.studio.run(lambda: self.project.restore(revision_id))
+            if outcome is None:
+                return
+            note = "已回溯到 %s（%s）" % (revision_id, outcome["label"])
+            if outcome["music_missing"]:
+                note += "；这些音乐已经不在包里，没能恢复：" + "、".join(
+                    outcome["music_missing"]
+                )
+            self.studio.status.setText(note)
 
         def open_folder(self) -> None:
             if self.project is None:
@@ -1827,6 +2031,8 @@ if QT_AVAILABLE:
             super().__init__()
             self.project: Optional[StudioProject] = None
             self._player = None
+            self.theme_name = "light"
+            self._theme_actions: Dict[str, QAction] = {}
             self.setWindowTitle("剧情工坊")
             self.resize(1240, 820)
             self._build_ui()
@@ -1845,7 +2051,7 @@ if QT_AVAILABLE:
             open_button.clicked.connect(self.open_project)
             self.save_button = QPushButton("保存")
             self.save_button.setToolTip("Ctrl+S —— 把角色、剧本和计时写进剧情包")
-            self.save_button.clicked.connect(self.save)
+            self.save_button.clicked.connect(lambda: self.save())
             export_button = QPushButton("另存为 .tscpkg")
             export_button.setToolTip("Ctrl+Shift+S —— 导出独立副本，原包继续编辑")
             export_button.clicked.connect(self.export_as)
@@ -1871,7 +2077,10 @@ if QT_AVAILABLE:
             header.addWidget(apply_button)
 
             self.step_list = QListWidget()
-            self.step_list.setMaximumWidth(150)
+            self.step_list.setObjectName("steps")
+            self.step_list.setMaximumWidth(178)
+            self.step_list.setMinimumWidth(168)
+            self.step_list.setSpacing(0)
             self.stack = QStackedWidget()
 
             self.steps = [
@@ -1887,8 +2096,18 @@ if QT_AVAILABLE:
                 self.stack.addWidget(step)
             self.step_list.currentRowChanged.connect(self._step_changed)
 
+            rail_title = QLabel("制作流程")
+            rail_title.setObjectName("railTitle")
+            rail = QWidget()
+            rail_layout = QVBoxLayout(rail)
+            rail_layout.setContentsMargins(0, 0, 0, 0)
+            rail_layout.setSpacing(0)
+            rail_layout.addWidget(rail_title)
+            rail_layout.addWidget(self.step_list, 1)
+
             body = QHBoxLayout()
-            body.addWidget(self.step_list)
+            body.setSpacing(0)
+            body.addWidget(rail)
             body.addWidget(self.stack, 1)
 
             self.status = QLabel()
@@ -1905,6 +2124,7 @@ if QT_AVAILABLE:
             self.setCentralWidget(central)
 
             self._build_menu()
+            self._restore_theme()
             self.step_list.setCurrentRow(0)
 
         def _build_menu(self) -> None:
@@ -1913,7 +2133,7 @@ if QT_AVAILABLE:
             menu = self.menuBar().addMenu("文件(&F)")
             entries = (
                 ("新建剧情包", QKeySequence.StandardKey.New, self.new_project),
-                ("打开 .tscpkg…", QKeySequence.StandardKey.Open, self.open_project),
+                ("打开 .tscpkg / .tscpkgs…", QKeySequence.StandardKey.Open, self.open_project),
                 ("保存", QKeySequence.StandardKey.Save, self.save),
                 ("另存为 .tscpkg…", QKeySequence.StandardKey.SaveAs, self.export_as),
             )
@@ -1928,9 +2148,54 @@ if QT_AVAILABLE:
             quit_action.triggered.connect(lambda _checked=False: self.close())
             menu.addAction(quit_action)
 
+            view = self.menuBar().addMenu("界面(&V)")
+            for key, label in theme.THEMES:
+                action = QAction("%s主题" % label, self)
+                action.setCheckable(True)
+                action.setChecked(key == self.theme_name)
+                action.triggered.connect(
+                    lambda _checked=False, k=key: self.set_theme(k)
+                )
+                view.addAction(action)
+                self._theme_actions[key] = action
+
+        # -- theme -----------------------------------------------------
+        def _restore_theme(self) -> None:
+            settings = self._settings()
+            stored = ""
+            if settings is not None:
+                stored = str(settings.value("theme", "") or "")
+            self.set_theme(stored or "light", remember=False)
+
+        def _settings(self):
+            try:
+                from PySide6.QtCore import QSettings
+
+                return QSettings("TSCP", "Studio")
+            except Exception:  # pragma: no cover - no settings backend
+                return None
+
+        def set_theme(self, name: str, remember: bool = True) -> None:
+            """Swap the studio's own sheet; the player window is unaffected."""
+
+            self.theme_name = name if name in {"light", "dark"} else "light"
+            # Scoped to this window on purpose: the player is created with no Qt
+            # parent, so restyling the application would bleed into it.
+            theme.apply(self, self.theme_name)
+            for key, action in self._theme_actions.items():
+                action.setChecked(key == self.theme_name)
+            if remember:
+                settings = self._settings()
+                if settings is not None:
+                    settings.setValue("theme", self.theme_name)
+            self.status.setText("已切换到%s主题" % ("深色" if self.theme_name == "dark" else "浅色"))
+
         # -- project plumbing ------------------------------------------
         def _step_changed(self, row: int) -> None:
             if 0 <= row < len(self.steps):
+                # Switching the page is the whole point of the left-hand list;
+                # forgetting this leaves every step showing the first one.
+                self.stack.setCurrentIndex(row)
                 self.steps[row].refresh()
 
         def _update_title(self) -> None:
@@ -1938,7 +2203,8 @@ if QT_AVAILABLE:
                 self.setWindowTitle("剧情工坊")
                 return
             mark = "*" if self.project.dirty else ""
-            self.setWindowTitle("剧情工坊 - %s%s" % (self.project.name, mark))
+            kind = "工程" if self.project.has_history else "剧情包"
+            self.setWindowTitle("剧情工坊 - [%s] %s%s" % (kind, self.project.name, mark))
             self.name_edit.setText(self.project.name)
             self.description_edit.setText(self.project.description)
             self.save_button.setEnabled(True)
@@ -1984,15 +2250,17 @@ if QT_AVAILABLE:
                 folder = Path.home()
             filename, _ = QFileDialog.getSaveFileName(
                 self,
-                "选择新剧情包的位置",
-                str(folder / "新剧情.tscpkg"),
-                "TSCP 剧情包 (*.tscpkg)",
+                "选择新工程的位置",
+                str(folder / ("新剧情" + studio.PROJECT_SUFFIX)),
+                "TSCP 工程，含版本历史 (*.tscpkgs);;TSCP 剧情包，可直接播放 (*.tscpkg)",
             )
             if not filename:
                 return
             target = Path(filename)
-            if target.suffix.lower() != ".tscpkg":
-                target = target.with_suffix(".tscpkg")
+            if target.suffix.lower() not in {studio.PROJECT_SUFFIX, studio.PLOT_SUFFIX}:
+                # No recognisable extension: default to the project format, which
+                # is the one that keeps history.
+                target = target.with_suffix(studio.PROJECT_SUFFIX)
             name, ok = QInputDialog.getText(self, "新建剧情包", "剧情名称", text=target.stem)
             if not ok or not name.strip():
                 return
@@ -2016,9 +2284,10 @@ if QT_AVAILABLE:
             folder = Path(__file__).resolve().parent.parent / "source"
             filename, _ = QFileDialog.getOpenFileName(
                 self,
-                "打开剧情包",
+                "打开工程或剧情包",
                 str(folder) if folder.is_dir() else "",
-                "TSCP 剧情包 (*.tscpkg);;所有文件 (*)",
+                "TSCP 工程与剧情包 (*.tscpkgs *.tscpkg);;"
+                "TSCP 工程 (*.tscpkgs);;TSCP 剧情包 (*.tscpkg);;所有文件 (*)",
             )
             if filename:
                 self.open_path(Path(filename))
@@ -2032,16 +2301,18 @@ if QT_AVAILABLE:
             self._refresh_all()
             self.status.setText("已打开 %s" % path.name)
 
-        def save(self) -> bool:
+        def save(self, label: Optional[str] = None) -> bool:
             if not self.require_project():
                 return False
+            text = str(label).strip() if label else None
             try:
-                self.project.save()
+                self.project.save(text)
             except StudioError as exc:
                 QMessageBox.critical(self, "剧情工坊", "保存失败：%s" % exc)
                 return False
             self._refresh_all()
-            self.status.setText("已保存到 %s" % self.project.path.name)
+            note = "（版本：%s）" % text if text else ""
+            self.status.setText("已保存到 %s%s" % (self.project.path.name, note))
             return True
 
         def export_as(self) -> None:
@@ -2075,12 +2346,28 @@ if QT_AVAILABLE:
             self.status.setText("信息已更新，记得保存")
 
         def preview_play(self) -> None:
-            """Save, then open the existing player on this package."""
+            """Save, then open the existing player on this package.
+
+            A project file (``.tscpkgs``) is exported to a temporary ``.tscpkg``
+            first, so the player never has to know about the history member.
+            """
 
             if not self.require_project():
                 return
             if not self.save():
                 return
+            target = self.project.path
+            if target.suffix.lower() == studio.PROJECT_SUFFIX:
+                temporary = Path(tempfile.gettempdir()) / (
+                    target.stem + ".preview" + studio.PLOT_SUFFIX
+                )
+                try:
+                    if temporary.exists():
+                        temporary.unlink()
+                    target = studio.export_playable(self.project.path, temporary)
+                except (StudioError, OSError) as exc:
+                    QMessageBox.critical(self, "剧情工坊", "无法准备试播：%s" % exc)
+                    return
             try:
                 import Main as player_module
             except ImportError as exc:  # pragma: no cover
@@ -2090,11 +2377,11 @@ if QT_AVAILABLE:
                 QMessageBox.critical(self, "剧情工坊", "播放器需要 PySide6")
                 return
             try:
-                core, problems = player_module.load_playlists(self.project.path)
+                core, problems = player_module.load_playlists(target)
             except Exception as exc:  # noqa: BLE001 - surfaced to the user
                 QMessageBox.critical(self, "剧情工坊", "无法试播：%s" % exc)
                 return
-            self._player = player_module.PlayerWindow(core, self.project.path, problems)
+            self._player = player_module.PlayerWindow(core, target, problems)
             self._player.show()
 
         # -- importing -------------------------------------------------

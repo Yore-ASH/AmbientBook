@@ -25,6 +25,7 @@ from Studio.model import (
     script_characters,
     timing_progress,
 )
+from tscp_player import archive
 from tscp_player.format import Dialogue, Directive, Script, visible_text_length
 from tscp_player.plot import load_archive_package
 
@@ -622,3 +623,299 @@ def test_parse_script_text_detects_the_compiled_header():
     assert compiled.lines[0].delays == pytest.approx([0.1, 0.2])
     source = studio_model.parse_script_text("[f]你好\n", ".tscps")
     assert source.lines[0].delays == []
+
+
+# --------------------------------------------------------------------------
+# .tscpc character files
+# --------------------------------------------------------------------------
+
+def test_character_file_round_trip(tmp_path):
+    rows = [("f", "FISH", "\033[1;33m"), ("t", "Teiresias", "")]
+    path = studio_model.write_characters(tmp_path / "cast", rows)
+    assert path.suffix == ".tscpc"
+    assert studio_model.parse_character_json(path.read_text(encoding="utf-8")) == rows
+    # A fresh project can take them straight back.
+    project = _project(tmp_path)
+    project.merge_characters(
+        studio_model.parse_character_json(path.read_text(encoding="utf-8"))
+    )
+    assert project.character_rows() == rows
+
+
+def test_character_file_is_readable_json(tmp_path):
+    path = studio_model.write_characters(tmp_path / "cast.tscpc", [("f", "FISH", "")])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["FORMAT"] == "tscpc 1"
+    assert document["CHARACTERS"]["f"]["NAME"] == "FISH"
+
+
+def test_character_file_refuses_an_empty_cast(tmp_path):
+    with pytest.raises(StudioError):
+        studio_model.write_characters(tmp_path / "cast.tscpc", [])
+    with pytest.raises(StudioError):
+        studio_model.write_characters(tmp_path / "cast.tscpc", [("f", "", "")])
+
+
+# --------------------------------------------------------------------------
+# the paste box understands both spellings
+# --------------------------------------------------------------------------
+
+#: The exact shape the character generator copies to the clipboard.
+PASTED_JSON = """{
+    "f": {
+        "NAME": "FISH",
+        "STYLE": "\\u001b[1;33m"
+    },
+    "b": {
+        "NAME": "Bister",
+        "STYLE": "\\u001b[1;97m"
+    },
+    "v": {
+        "NAME": "Vita",
+        "STYLE": "\\u001b[1;31m"
+    },
+    "s": {
+        "NAME": "Spectrum",
+        "STYLE": "\\u001b[1;36m"
+    },
+    "qr": {
+        "NAME": "???",
+        "STYLE": "\\u001b[1;31m"
+    },
+    "u1": {
+        "NAME": "Unimp.",
+        "STYLE": "\\u001b[1;90m"
+    },
+    "u2": {
+        "NAME": "Unimp.2",
+        "STYLE": "\\u001b[1;90m"
+    },
+    "d": {
+        "NAME": "Death",
+        "STYLE": "\\u001b[1;35m"
+    },
+    "n": {
+        "NAME": "Nale",
+        "STYLE": "\\u001b[1;90m"
+    },
+    "I": {
+        "NAME": "Iris",
+        "STYLE": "\\u001b[1;36m"
+    }
+}"""
+
+
+def test_paste_box_accepts_the_generator_json():
+    rows = studio_model.parse_characters(PASTED_JSON)
+    assert [row[0] for row in rows] == ["f", "b", "v", "s", "qr", "u1", "u2", "d", "n", "I"]
+    lookup = {key: (name, style) for key, name, style in rows}
+    assert lookup["f"] == ("FISH", "\033[1;33m")
+    assert lookup["b"] == ("Bister", "\033[1;97m")
+    assert lookup["I"] == ("Iris", "\033[1;36m")
+    assert lookup["u2"] == ("Unimp.2", "\033[1;90m")
+    assert lookup["d"] == ("Death", "\033[1;35m")
+
+
+def test_paste_box_accepts_tab_separated_rows():
+    rows = studio_model.parse_characters("f\tFISH\t\\033[33m\nt\tTeiresias\n")
+    assert rows == [("f", "FISH", "\033[33m"), ("t", "Teiresias", "")]
+
+
+def test_paste_box_reports_a_bad_blob():
+    with pytest.raises(StudioError):
+        studio_model.parse_characters("{ not json }")
+    with pytest.raises(StudioError):
+        studio_model.parse_characters("just one column")
+
+
+def test_pasted_json_commits_into_the_project(tmp_path):
+    project = _project(tmp_path)
+    project.merge_characters(studio_model.parse_characters(PASTED_JSON))
+    assert len(project.characters) == 10
+    assert project.characters["f"].style == "\033[1;33m"
+    project.save()
+    reloaded = StudioProject.load(project.path)
+    assert reloaded.characters["b"].name == "Bister"
+
+
+# --------------------------------------------------------------------------
+# .tscpkgs project files with an in-file revision history
+# --------------------------------------------------------------------------
+
+def _project_file(tmp_path, name="工程"):
+    return StudioProject.create(tmp_path / "work.tscpkgs", name=name, description="带历史")
+
+
+def test_a_project_file_is_a_container_with_history(tmp_path):
+    project = _project_file(tmp_path)
+    assert project.path.suffix == ".tscpkgs"
+    assert studio_model.is_project(project.path) is True
+    assert studio_model.is_project(_project(tmp_path).path) is False
+    # The playable members are all there, so nothing downstream has to change.
+    assert archive.has_member(project.path, "Scripts/__init__.json")
+    assert archive.has_member(project.path, "Musics/__init__.json")
+    assert archive.has_member(project.path, studio_model.HISTORY_INDEX)
+
+
+def test_saving_records_a_revision(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    project.save(label="第一次")
+    project.set_character("t", "Teiresias", "")
+    project.save()
+
+    history = project.revisions()
+    assert [item["LABEL"] for item in history] == ["自动保存", "第一次"]
+    assert [item["ID"] for item in history] == ["R000002", "R000001"]
+    assert history[0]["CHARACTERS"] == 2
+    assert history[1]["CHARACTERS"] == 1
+
+
+def test_saving_an_unchanged_project_does_not_pile_up_revisions(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    project.save()
+    project.save()
+    project.save()
+    assert len(project.revisions()) == 1
+    # ...but an explicit checkpoint is always recorded.
+    project.save(label="就这里")
+    assert len(project.revisions()) == 2
+
+
+def test_restoring_a_revision_brings_the_work_back(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    first = project.new_script("act")
+    project.add_event(first, Dialogue("f", "第一版", [0.1, 0.2, 0.3]))
+    project.save(label="v1")
+
+    project.set_character("t", "Teiresias", "")
+    project.delete_script(first)
+    second = project.new_script("act2")
+    project.add_event(second, Dialogue("t", "第二版"))
+    project.save(label="v2")
+
+    outcome = project.restore("R000001")
+    assert outcome["id"] == "R000001"
+    assert outcome["label"] == "v1"
+    assert list(project.characters) == ["f"]
+    assert list(project.scripts) == ["act.tscp"]
+    assert project.scripts["act.tscp"].lines[0].text == "第一版"
+    assert project.dirty is True
+
+
+def test_restoring_keeps_music_that_is_still_in_the_file(tmp_path):
+    project = _project_file(tmp_path)
+    project.add_music([model.MusicDraft(
+        abbreviation="iw", source=_song(tmp_path), kind="lyrics",
+        lyrics_text="[00:01.00]第一句\n", color="#ffd166",
+    )])
+    project.new_script()
+    project.save(label="v1")
+
+    project.update_music("iw", kind="instrumental", color="#000000")
+    project.save(label="v2")
+    assert project.tracks["iw"].instrumental is True
+
+    outcome = project.restore("R000001")
+    assert outcome["music_restored"] == 1
+    assert project.tracks["iw"].has_lyrics is True
+    assert project.tracks["iw"].color == "#ffd166"
+
+
+def test_export_is_a_clean_playable_package(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "\033[1;33m")
+    name = project.new_script()
+    project.add_event(name, Dialogue("f", "你好", [0.1, 0.2]))
+    project.add_music([model.MusicDraft(abbreviation="iw", source=_song(tmp_path))])
+    project.save()
+
+    handout = project.export(tmp_path / "handout")
+    assert handout.suffix == ".tscpkg"
+    # No history travels with the playable file...
+    assert not any(
+        member.startswith(studio_model.HISTORY_DIR + "/")
+        for member in archive.members(handout)
+    )
+    # ...the manifest says tscpkg, not tscpkgs...
+    manifest = archive.read_json(handout, archive.MANIFEST, {})
+    assert manifest["FORMAT"] == archive.FORMAT_TEXT
+    # ...and the desktop loader plays it happily.
+    package = load_archive_package(handout, cache_root=tmp_path / "cache")
+    assert package.name == "工程"
+    assert package.characters["f"].name == "FISH"
+    assert package.script_names() == ["plot.tscp"]
+    assert package.music_path("iw").read_bytes() == b"FLAC" * 64
+    # The project keeps its history.
+    assert project.revisions() != []
+
+
+def test_a_plain_container_stays_a_plain_container(tmp_path):
+    """Opening an old .tscpkg must not silently grow a history."""
+
+    project = _project(tmp_path)            # .tscpkg, not .tscpkgs
+    project.set_character("f", "FISH", "")
+    project.save()
+    project.save()
+    assert project.has_history is False
+    assert project.revisions() == []
+
+    plain = project.export(tmp_path / "plain")
+    assert not any(
+        member.startswith(studio_model.HISTORY_DIR + "/")
+        for member in archive.members(plain)
+    )
+
+
+def test_export_refuses_to_overwrite(tmp_path):
+    project = _project_file(tmp_path)
+    project.new_script()
+    project.save()
+    target = project.export(tmp_path / "once")
+    with pytest.raises(StudioError):
+        project.export(target)
+    with pytest.raises(StudioError):
+        project.export(project.path)        # never clobber the project itself
+
+
+def test_history_is_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(studio_model, "MAX_REVISIONS", 3)
+    project = _project_file(tmp_path)
+    for index in range(5):
+        project.set_character("c%d" % index, "名字%d" % index, "")
+        project.save(label="第 %d 次" % index)
+    history = project.revisions()
+    assert len(history) == 3
+    # The newest survive, and their snapshots are still readable.
+    assert history[0]["LABEL"] == "第 4 次"
+    assert project.revision(history[0]["ID"])["LABEL"] == "第 4 次"
+    with pytest.raises(StudioError):
+        project.revision("R000001")
+
+
+def test_a_project_reopens_with_its_history(tmp_path):
+    project = _project_file(tmp_path)
+    project.set_character("f", "FISH", "")
+    project.save(label="起点")
+    project.new_script()
+    project.save(label="加了剧本")
+
+    reopened = StudioProject.load(project.path)
+    assert reopened.path.suffix == ".tscpkgs"
+    assert [item["LABEL"] for item in reopened.revisions()] == ["加了剧本", "起点"]
+    assert reopened.has_history is True
+
+
+def test_import_from_a_project_file(tmp_path):
+    donor = _project_file(tmp_path / "donor", name="Donor")
+    donor.set_character("t", "Teiresias", "\033[36m")
+    donor.new_script("act")
+    donor.save()
+
+    project = _project(tmp_path)
+    result = project.import_from(donor.path)
+    assert result["characters"] == 1
+    assert result["scripts"] == 1
+    assert project.characters["t"].name == "Teiresias"

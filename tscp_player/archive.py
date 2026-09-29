@@ -39,6 +39,9 @@ MUSICS_DIR = "Musics"
 FORMAT_NAME = "tscpkg"
 FORMAT_VERSION = 1
 FORMAT_TEXT = "%s %d" % (FORMAT_NAME, FORMAT_VERSION)
+#: A studio *project* uses the same container with an extra ``History/`` member.
+PROJECT_SUFFIX = ".tscpkgs"
+PROJECT_FORMAT = "tscpkgs 1"
 
 AUDIO_SUFFIXES = frozenset(
     {".flac", ".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac", ".wma"}
@@ -62,6 +65,16 @@ def is_package(path: PathLike) -> bool:
 
     candidate = Path(path)
     return candidate.is_file() and candidate.suffix.lower() == SUFFIX
+
+
+def is_container(path: PathLike) -> bool:
+    """Whether *path* is any container: a plot or a studio project."""
+
+    candidate = Path(path)
+    return candidate.is_file() and candidate.suffix.lower() in {
+        SUFFIX,
+        PROJECT_SUFFIX,
+    }
 
 
 def _compression_for(member: str) -> int:
@@ -148,10 +161,10 @@ def read_json(path: PathLike, member: str, default=None):
 # writing
 # --------------------------------------------------------------------------
 
-def _blank(path: PathLike) -> Path:
+def _blank(path: PathLike, suffix: str = SUFFIX) -> Path:
     target = Path(path)
-    if target.suffix.lower() != SUFFIX:
-        target = target.with_suffix(SUFFIX)
+    if target.suffix.lower() != suffix:
+        target = target.with_suffix(suffix)
     return target
 
 
@@ -164,17 +177,24 @@ def create(
     dependency_version: str = "0.0.1",
     music_version: str = "0.0.1",
     characters: Optional[Mapping[str, object]] = None,
+    suffix: str = SUFFIX,
+    format_text: str = FORMAT_TEXT,
 ) -> Path:
-    """Create an empty, valid ``.tscpkg`` and return its path."""
+    """Create an empty, valid container and return its path.
 
-    target = _blank(path)
+    ``suffix`` and ``format_text`` exist so the studio can lay down a *project*
+    file (``.tscpkgs``) that has exactly this shape plus extra members, without
+    duplicating any of the container handling.
+    """
+
+    target = _blank(path, suffix)
     # A caller may hand us a path inside a folder that does not exist yet: the
     # studio creates a plot before anybody has made the directory.
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise PackageError("refusing to overwrite an existing container: %s" % target)
     manifest = {
-        "FORMAT": FORMAT_TEXT,
+        "FORMAT": format_text,
         "NAME": str(name),
         "VERSION": str(version),
     }
