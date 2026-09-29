@@ -51,7 +51,7 @@ from tscp_player.music import STOP_WORDS
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, Qt, QTimer
-    from PySide6.QtGui import QColor, QTextCursor
+    from PySide6.QtGui import QAction, QColor, QKeySequence, QTextCursor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -161,13 +161,15 @@ if QT_AVAILABLE:
     # dialogs
     # ----------------------------------------------------------------------
 
-    class CharacterDialog(QDialog):
-        """Create or edit one character, with a live style preview."""
+    class CharacterFields(QWidget):
+        """缩写 / 名字 / 颜色 / 粗体 / 下划线 / 自定义 SGR, with a live preview.
 
-        def __init__(self, parent, key: str = "", name: str = "", style: str = "") -> None:
+        Shared by the single-character dialog and the batch dialog, so both offer
+        exactly the same controls and the same preview.
+        """
+
+        def __init__(self, parent=None, key: str = "", name: str = "", style: str = "") -> None:
             super().__init__(parent)
-            self.setWindowTitle("角色")
-            self.resize(460, 380)
 
             self.key_edit = QLineEdit(key)
             self.key_edit.setPlaceholderText("在剧本里写作 [缩写]")
@@ -185,33 +187,24 @@ if QT_AVAILABLE:
             self.preview = QLabel()
             self.preview.setMinimumHeight(46)
             self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.preview.setStyleSheet("background:#111; color:#ddd; border:1px solid #333;")
+            self.preview.setStyleSheet(
+                "background:#111; color:#ddd; border:1px solid #333;"
+            )
 
-            form = QFormLayout()
+            attrs = QHBoxLayout()
+            attrs.addWidget(self.bold)
+            attrs.addWidget(self.underline)
+            attrs.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(attrs)
+
+            form = QFormLayout(self)
             form.addRow("缩写", self.key_edit)
             form.addRow("名字", self.name_edit)
             form.addRow("颜色", self.color_combo)
-            row = QHBoxLayout()
-            row.addWidget(self.bold)
-            row.addWidget(self.underline)
-            row.addStretch(1)
-            holder = QWidget()
-            holder.setLayout(row)
             form.addRow("样式", holder)
             form.addRow("自定义", self.custom_edit)
-
-            buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-            )
-            buttons.accepted.connect(self.accept)
-            buttons.rejected.connect(self.reject)
-
-            layout = QVBoxLayout(self)
-            layout.addLayout(form)
-            layout.addWidget(QLabel("预览"))
-            layout.addWidget(self.preview)
-            layout.addStretch(1)
-            layout.addWidget(buttons)
+            form.addRow("预览", self.preview)
 
             for widget in (self.key_edit, self.name_edit, self.custom_edit):
                 widget.textChanged.connect(self._refresh_preview)
@@ -230,7 +223,7 @@ if QT_AVAILABLE:
             match = re.search(r"\[([0-9;]*)m", str(style).replace("\x1b", r"\033"))
             return r"\033[%sm" % match.group(1) if match else ""
 
-        def _resolved_style(self) -> str:
+        def resolved_style(self) -> str:
             custom = self.custom_edit.text().strip()
             if custom:
                 return characters_model.normalize_ansi(custom)
@@ -243,28 +236,174 @@ if QT_AVAILABLE:
         def _refresh_preview(self) -> None:
             name = self.name_edit.text().strip() or "角色名"
             try:
-                css = _style_css(self._resolved_style())
+                css = _style_css(self.resolved_style())
             except ValueError as exc:
                 self.preview.setText("样式无效：%s" % exc)
                 self.preview.setStyleSheet("background:#111; color:#ff8888;")
                 return
-            self.preview.setStyleSheet("background:#111; color:#ddd; border:1px solid #333;")
+            self.preview.setStyleSheet(
+                "background:#111; color:#ddd; border:1px solid #333;"
+            )
             self.preview.setText("<span style='%s'>%s</span>" % (css, html.escape(name)))
 
         def values(self) -> tuple:
             return (
                 self.key_edit.text().strip(),
                 self.name_edit.text().strip(),
-                self._resolved_style(),
+                self.resolved_style(),
             )
 
+        def reset(self) -> None:
+            """Empty the fields, ready for the next character."""
+
+            self.key_edit.clear()
+            self.name_edit.clear()
+            self.custom_edit.clear()
+            self.bold.setChecked(False)
+            self.underline.setChecked(False)
+            self.key_edit.setFocus()
+
+    class CharacterDialog(QDialog):
+        """Create or edit one character, with a live style preview."""
+
+        def __init__(self, parent, key: str = "", name: str = "", style: str = "") -> None:
+            super().__init__(parent)
+            self.setWindowTitle("角色")
+            self.resize(480, 400)
+
+            self.fields = CharacterFields(self, key, name, style)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(self.fields, 1)
+            layout.addWidget(buttons)
+
+        def values(self) -> tuple:
+            return self.fields.values()
+
         def accept(self) -> None:
-            key, name, style = self.values()
+            key, name, _style = self.values()
             if not key:
                 QMessageBox.warning(self, "角色", "角色缩写不能为空")
                 return
             if not name:
                 QMessageBox.warning(self, "角色", "角色名字不能为空")
+                return
+            super().accept()
+
+    class BatchAddDialog(QDialog):
+        """Add many characters in one sitting.
+
+        This keeps the character generator's batch flow: fill the fields, press
+        「添加到列表」, and the row joins the list; 「全部添加」 commits them all at
+        once.  The fields never close in between, so a whole cast goes in without
+        reopening a dialog for every name.
+        """
+
+        def __init__(self, parent, existing: Optional[Dict[str, object]] = None) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("批量添加角色")
+            self.resize(860, 460)
+            self.rows: List[tuple] = []
+            self.existing = dict(existing or {})
+
+            self.fields = CharacterFields(self)
+
+            add_button = QPushButton("添加到列表")
+            add_button.setDefault(True)
+            add_button.clicked.connect(self.add_row)
+            self.fields.key_edit.returnPressed.connect(self.add_row)
+            self.fields.name_edit.returnPressed.connect(self.add_row)
+
+            remove_button = QPushButton("从列表移除")
+            remove_button.clicked.connect(self.remove_row)
+
+            self.table = QTableWidget(0, 3)
+            self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+
+            left = QWidget()
+            left_layout = QVBoxLayout(left)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.addWidget(self.fields)
+            left_layout.addWidget(add_button)
+            left_layout.addStretch(1)
+
+            right = QWidget()
+            right_layout = QVBoxLayout(right)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.addWidget(QLabel("待添加的角色"))
+            right_layout.addWidget(self.table, 1)
+            right_layout.addWidget(remove_button)
+
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            splitter.addWidget(left)
+            splitter.addWidget(right)
+            splitter.setSizes([430, 430])
+
+            self.hint = QLabel(
+                "已有角色在列表里显示为「更新」。列表可以一次全部提交。"
+            )
+            self.hint.setStyleSheet("color:#777;")
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("全部添加")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(self.hint)
+            layout.addWidget(splitter, 1)
+            layout.addWidget(buttons)
+
+        def add_row(self) -> None:
+            key, name, style = self.fields.values()
+            if not key:
+                QMessageBox.warning(self, "角色", "角色缩写不能为空")
+                return
+            if not name:
+                QMessageBox.warning(self, "角色", "角色名字不能为空")
+                return
+            for index, (existing_key, _n, _s) in enumerate(self.rows):
+                if existing_key == key:
+                    self.rows[index] = (key, name, style)
+                    break
+            else:
+                self.rows.append((key, name, style))
+            self._refresh_table()
+            self.fields.reset()
+
+        def remove_row(self) -> None:
+            selected = self.table.selectionModel().selectedRows()
+            if not selected:
+                QMessageBox.information(self, "角色", "请先在列表里选择一行")
+                return
+            del self.rows[selected[0].row()]
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            self.table.setRowCount(len(self.rows))
+            for row, (key, name, style) in enumerate(self.rows):
+                note = "（更新）" if key in self.existing else ""
+                for column, value in enumerate(
+                    (key, name + note, CharactersStep._style_text(style))
+                ):
+                    self.table.setItem(row, column, QTableWidgetItem(value))
+            self.table.resizeColumnsToContents()
+
+        def accept(self) -> None:
+            if not self.rows:
+                QMessageBox.information(self, "角色", "列表还是空的，先「添加到列表」")
                 return
             super().accept()
 
@@ -351,6 +490,44 @@ if QT_AVAILABLE:
 
         def value(self) -> str:
             return "%g" % self.spin.value()
+
+    class BatchCharactersDialog(QDialog):
+        """Paste many characters at once, one per line.
+
+        This is the batch format the standalone character generator uses, so an
+        existing list can be dropped straight in.
+        """
+
+        def __init__(self, parent) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("批量添加角色")
+            self.resize(620, 440)
+
+            hint = QLabel(
+                "每行一个角色：<b>缩写 &lt;TAB&gt; 全名 &lt;TAB&gt; ANSI 样式</b>"
+                "（样式可以省略）<br>例如："
+                "<code>f&#9;FISH&#9;\\033[33m</code>、<code>t&#9;Teiresias</code>"
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color:#777;")
+
+            self.editor = QPlainTextEdit()
+            self.editor.setPlaceholderText("f\tFISH\t\\033[33m\nt\tTeiresias")
+            self.editor.setMinimumHeight(260)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(hint)
+            layout.addWidget(self.editor, 1)
+            layout.addWidget(buttons)
+
+        def text(self) -> str:
+            return self.editor.toPlainText()
 
     class MusicDialog(QDialog):
         """Choose a track for a ``<p>`` event, or insert a brand new one."""
@@ -529,6 +706,7 @@ if QT_AVAILABLE:
 
             self.hint = QLabel(
                 "角色缩写就是剧本里写的 [f]，样式决定它在播放器里的颜色。"
+                "支持批量粘贴或从已有剧情包／JSON 直接导入。"
             )
             self.hint.setStyleSheet("color:#777;")
 
@@ -538,6 +716,14 @@ if QT_AVAILABLE:
                 ("添加角色", self.add_character, "新增一个角色"),
                 ("编辑", self.edit_character, "修改选中的角色"),
                 ("删除", self.remove_character, "删除选中的角色"),
+                ("批量添加…", self.batch_add,
+                 "一个对话框里连续添加多个角色，最后一次性提交"),
+                ("粘贴导入…", self.paste_add,
+                 "粘贴多行：缩写<TAB>全名<TAB>样式"),
+                ("从 JSON 导入…", self.import_json,
+                 "从 Scripts/__init__.json 或角色 JSON 导入"),
+                ("从剧情包导入…", self.import_from_plot,
+                 "从已有 .tscpkg／剧情文件夹导入角色"),
             ):
                 button = QPushButton(label)
                 button.setToolTip(tip)
@@ -638,6 +824,68 @@ if QT_AVAILABLE:
                 return
             self.studio.run(lambda: self.project.remove_character(key), "已删除角色 %s" % key)
 
+        # -- importing -------------------------------------------------
+        def _merge(self, rows, source: str) -> None:
+            before = set(self.project.characters)
+            keys = self.studio.run(lambda: self.project.merge_characters(rows))
+            if keys is None:
+                return
+            added = len([key for key in keys if key not in before])
+            self.studio.status.setText(
+                "%s：新增 %d 个、更新 %d 个角色" % (source, added, len(keys) - added)
+            )
+
+        def batch_add(self) -> None:
+            """Add a whole cast without reopening a dialog for each name."""
+
+            if not self.studio.require_project():
+                return
+            dialog = BatchAddDialog(self, self.project.characters)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._merge(dialog.rows, "批量添加")
+
+        def paste_add(self) -> None:
+            if not self.studio.require_project():
+                return
+            dialog = BatchCharactersDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            try:
+                rows = studio.parse_character_text(dialog.text())
+            except StudioError as exc:
+                QMessageBox.warning(self, "角色", str(exc))
+                return
+            self._merge(rows, "粘贴导入")
+
+        def import_json(self) -> None:
+            if not self.studio.require_project():
+                return
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "导入角色 JSON", "",
+                "角色配置 (*.json);;所有文件 (*)",
+            )
+            if not filename:
+                return
+            try:
+                rows = studio.parse_character_json(
+                    Path(filename).read_text(encoding="utf-8")
+                )
+            except (StudioError, OSError, UnicodeError) as exc:
+                QMessageBox.warning(self, "角色", str(exc))
+                return
+            self._merge(rows, Path(filename).name)
+
+        def import_from_plot(self) -> None:
+            if not self.studio.require_project():
+                return
+            source = self.studio.pick_import_source()
+            if source is None:
+                return
+            self._merge(
+                studio.collect_source(source)["characters"], Path(source).name
+            )
+
     class StoryStep(Step):
         title = "② 剧情"
 
@@ -651,6 +899,9 @@ if QT_AVAILABLE:
             rename_script.clicked.connect(self.rename_script)
             delete_script = QPushButton("删除剧本")
             delete_script.clicked.connect(self.delete_script)
+            import_script = QPushButton("导入剧本…")
+            import_script.setToolTip("从已有的 .tscp（含时间）或 .tscps（原稿）导入")
+            import_script.clicked.connect(self.import_script)
 
             top = QHBoxLayout()
             top.addWidget(QLabel("剧本"))
@@ -658,6 +909,7 @@ if QT_AVAILABLE:
             top.addWidget(new_script)
             top.addWidget(rename_script)
             top.addWidget(delete_script)
+            top.addWidget(import_script)
 
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "内容"])
@@ -787,6 +1039,23 @@ if QT_AVAILABLE:
             self.studio.run(lambda: self.project.delete_script(name), "已删除 %s" % name)
             self.refresh()
 
+        def import_script(self) -> None:
+            if not self.studio.require_project():
+                return
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "导入剧本", "",
+                "TSCP 剧本 (*.tscp *.tscps);;编译稿 (*.tscp);;原稿 (*.tscps);;所有文件 (*)",
+            )
+            if not filename:
+                return
+            created = self.studio.run(
+                lambda: self.project.import_script(Path(filename)),
+                "已导入 %s" % Path(filename).name,
+            )
+            if created:
+                self.refresh()
+                self.script_combo.setCurrentText(created)
+
         # -- event actions ---------------------------------------------
         def _add(self, event) -> None:
             if not self.studio.require_project():
@@ -911,6 +1180,11 @@ if QT_AVAILABLE:
             self.start_button.clicked.connect(self.start_timing)
             self.selected_button = QPushButton("只录选中句")
             self.selected_button.clicked.connect(self.start_selected)
+            self.import_button = QPushButton("导入时间…")
+            self.import_button.setToolTip(
+                "从已经录好的 .tscp 里把逐字时间搬过来；逐行按位置和文字匹配"
+            )
+            self.import_button.clicked.connect(self.import_timing)
 
             top = QHBoxLayout()
             top.addWidget(QLabel("剧本"))
@@ -920,6 +1194,7 @@ if QT_AVAILABLE:
             top.addWidget(self.key_edit)
             top.addWidget(self.start_button)
             top.addWidget(self.selected_button)
+            top.addWidget(self.import_button)
 
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "进度"])
@@ -1105,6 +1380,40 @@ if QT_AVAILABLE:
                 return
             self._start([row], "单句录制第 %d 行：其余句保留已有时间" % (row + 1))
 
+        def import_timing(self) -> None:
+            """Copy timings out of an already recorded ``.tscp``."""
+
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            if name is None:
+                QMessageBox.information(self, "计时", "请先新建或选择一个剧本")
+                return
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "导入时间", "", "TSCP 编译稿 (*.tscp);;所有文件 (*)"
+            )
+            if not filename:
+                return
+            try:
+                text = Path(filename).read_text(encoding="utf-8")
+                incoming = studio.parse_script_text(text, ".tscp")
+            except (StudioError, OSError, UnicodeError) as exc:
+                QMessageBox.warning(self, "计时", str(exc))
+                return
+            outcome = self.studio.run(lambda: self.project.apply_timing(name, incoming))
+            if outcome is None:
+                return
+            applied, skipped = outcome
+            self._reload_events()
+            self.status.setText(
+                "%s：套用了 %d 句的时间%s"
+                % (
+                    Path(filename).name,
+                    applied,
+                    "" if not skipped else "；%d 句因为文字不同被跳过" % skipped,
+                )
+            )
+
         def _show_dialogue(self, event: Dialogue) -> None:
             """Show the line at the moment recording reaches it."""
 
@@ -1238,8 +1547,9 @@ if QT_AVAILABLE:
             self.lyrics_edit.setPlaceholderText("[00:01.00]第一句\n[00:04.50]Second line")
             self.lyrics_edit.setMinimumHeight(240)
 
-            import_button = QPushButton("从 .lrc 导入")
-            import_button.clicked.connect(self.import_lrc)
+            import_button = QPushButton("导入歌词文件…")
+            import_button.setToolTip("读取 .lrc 或纯文本歌词，导入后可再录制时间")
+            import_button.clicked.connect(self.import_lyrics)
             record_button = QPushButton("录制每句时间…")
             record_button.clicked.connect(self.record_from_text)
             colour_button = QPushButton("歌词颜色…")
@@ -1349,22 +1659,30 @@ if QT_AVAILABLE:
             self.studio.run(lambda: self.project.remove_music(key), "已删除 %s" % key)
             self.refresh()
 
-        def import_lrc(self) -> None:
+        def import_lyrics(self) -> None:
+            """Load an ``.lrc`` or a plain lyric text into the editor."""
+
             key = self._selected_abbreviation()
             if key is None:
                 QMessageBox.information(self, "歌词", "请先选择一首音乐")
                 return
             filename, _ = QFileDialog.getOpenFileName(
-                self, "导入 LRC", "", "LRC 歌词 (*.lrc);;所有文件 (*)"
+                self, "导入歌词", "",
+                "歌词 (*.lrc *.txt);;LRC 歌词 (*.lrc);;纯文本 (*.txt);;所有文件 (*)",
             )
             if not filename:
                 return
             try:
-                self.lyrics_edit.setPlainText(Path(filename).read_text(encoding="utf-8"))
+                text = Path(filename).read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 QMessageBox.critical(self, "歌词", "无法读取：%s" % exc)
                 return
+            self.lyrics_edit.setPlainText(text)
             self.kind_lyrics.setChecked(True)
+            if Path(filename).suffix.lower() == ".txt":
+                self.studio.status.setText(
+                    "已载入纯文本歌词；点「录制每句时间…」播放音乐逐句打点"
+                )
 
         def record_from_text(self) -> None:
             """Turn the plain lines in the box into LRC by playing the track."""
@@ -1433,9 +1751,12 @@ if QT_AVAILABLE:
             play_button.clicked.connect(self.studio.preview_play)
             folder_button = QPushButton("打开所在文件夹")
             folder_button.clicked.connect(self.open_folder)
+            import_button = QPushButton("从已有剧情导入…")
+            import_button.setToolTip("把一个 .tscpkg 或旧式 Musics/Scripts 文件夹合并进来")
+            import_button.clicked.connect(self.import_from_source)
 
             buttons = QHBoxLayout()
-            for button in (save_button, export_button, play_button, folder_button):
+            for button in (save_button, export_button, play_button, folder_button, import_button):
                 buttons.addWidget(button)
             buttons.addStretch(1)
 
@@ -1487,6 +1808,14 @@ if QT_AVAILABLE:
 
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.path.parent)))
 
+        def import_from_source(self) -> None:
+            if not self.studio.require_project():
+                return
+            source = self.studio.pick_import_source()
+            if source is None:
+                return
+            self.studio.import_everything(source)
+
     # ----------------------------------------------------------------------
     # the window
     # ----------------------------------------------------------------------
@@ -1509,12 +1838,16 @@ if QT_AVAILABLE:
 
         def _build_ui(self) -> None:
             new_button = QPushButton("新建剧情包")
+            new_button.setToolTip("Ctrl+N")
             new_button.clicked.connect(self.new_project)
             open_button = QPushButton("打开 .tscpkg")
+            open_button.setToolTip("Ctrl+O")
             open_button.clicked.connect(self.open_project)
             self.save_button = QPushButton("保存")
+            self.save_button.setToolTip("Ctrl+S —— 把角色、剧本和计时写进剧情包")
             self.save_button.clicked.connect(self.save)
             export_button = QPushButton("另存为 .tscpkg")
+            export_button.setToolTip("Ctrl+Shift+S —— 导出独立副本，原包继续编辑")
             export_button.clicked.connect(self.export_as)
             play_button = QPushButton("试播")
             play_button.clicked.connect(self.preview_play)
@@ -1571,7 +1904,29 @@ if QT_AVAILABLE:
             central.setLayout(layout)
             self.setCentralWidget(central)
 
+            self._build_menu()
             self.step_list.setCurrentRow(0)
+
+        def _build_menu(self) -> None:
+            """A file menu, so Ctrl+S and friends are discoverable."""
+
+            menu = self.menuBar().addMenu("文件(&F)")
+            entries = (
+                ("新建剧情包", QKeySequence.StandardKey.New, self.new_project),
+                ("打开 .tscpkg…", QKeySequence.StandardKey.Open, self.open_project),
+                ("保存", QKeySequence.StandardKey.Save, self.save),
+                ("另存为 .tscpkg…", QKeySequence.StandardKey.SaveAs, self.export_as),
+            )
+            for label, shortcut, slot in entries:
+                action = QAction(label, self)
+                action.setShortcut(shortcut)
+                action.triggered.connect(lambda _checked=False, s=slot: s())
+                menu.addAction(action)
+            menu.addSeparator()
+            quit_action = QAction("退出", self)
+            quit_action.setShortcut(QKeySequence.StandardKey.Quit)
+            quit_action.triggered.connect(lambda _checked=False: self.close())
+            menu.addAction(quit_action)
 
         # -- project plumbing ------------------------------------------
         def _step_changed(self, row: int) -> None:
@@ -1622,8 +1977,16 @@ if QT_AVAILABLE:
         def new_project(self) -> None:
             if not self._confirm_discard():
                 return
+            # Default into ``source/`` — that is the folder the player scans — so
+            # a new plot does not land in whatever the process cwd happens to be.
+            folder = Path(__file__).resolve().parent.parent / "source"
+            if not folder.is_dir():
+                folder = Path.home()
             filename, _ = QFileDialog.getSaveFileName(
-                self, "选择新剧情包的位置", "新剧情.tscpkg", "TSCP 剧情包 (*.tscpkg)"
+                self,
+                "选择新剧情包的位置",
+                str(folder / "新剧情.tscpkg"),
+                "TSCP 剧情包 (*.tscpkg)",
             )
             if not filename:
                 return
@@ -1650,8 +2013,12 @@ if QT_AVAILABLE:
         def open_project(self) -> None:
             if not self._confirm_discard():
                 return
+            folder = Path(__file__).resolve().parent.parent / "source"
             filename, _ = QFileDialog.getOpenFileName(
-                self, "打开剧情包", "", "TSCP 剧情包 (*.tscpkg);;所有文件 (*)"
+                self,
+                "打开剧情包",
+                str(folder) if folder.is_dir() else "",
+                "TSCP 剧情包 (*.tscpkg);;所有文件 (*)",
             )
             if filename:
                 self.open_path(Path(filename))
@@ -1729,6 +2096,53 @@ if QT_AVAILABLE:
                 return
             self._player = player_module.PlayerWindow(core, self.project.path, problems)
             self._player.show()
+
+        # -- importing -------------------------------------------------
+        def pick_import_source(self) -> Optional[Path]:
+            """Ask for a ``.tscpkg`` or a plot folder; ``None`` when cancelled."""
+
+            box = QMessageBox(self)
+            box.setWindowTitle("导入来源")
+            box.setText("要从哪种来源导入？")
+            file_button = box.addButton(
+                "选择 .tscpkg 文件", QMessageBox.ButtonRole.AcceptRole
+            )
+            folder_button = box.addButton(
+                "选择剧情文件夹", QMessageBox.ButtonRole.AcceptRole
+            )
+            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is file_button:
+                filename, _ = QFileDialog.getOpenFileName(
+                    self, "选择剧情包", "", "TSCP 剧情包 (*.tscpkg);;所有文件 (*)"
+                )
+                return Path(filename) if filename else None
+            if clicked is folder_button:
+                folder = QFileDialog.getExistingDirectory(
+                    self, "选择剧情文件夹（含 Musics 和 Scripts）"
+                )
+                return Path(folder) if folder else None
+            return None
+
+        def import_everything(self, source) -> None:
+            """Merge characters, scripts and music from another plot or folder."""
+
+            if not self.require_project():
+                return
+            result = self.run(lambda: self.project.import_from(source))
+            if result is None:
+                return
+            message = "%s：导入 %d 个角色、%d 个剧本、%d 首音乐" % (
+                Path(source).name,
+                result["characters"],
+                result["scripts"],
+                result["music"],
+            )
+            notes = result.get("notes") or []
+            if notes:
+                message += "；" + "；".join(notes)
+            self.status.setText(message)
 
         # -- lifecycle -------------------------------------------------
         def _confirm_discard(self) -> bool:

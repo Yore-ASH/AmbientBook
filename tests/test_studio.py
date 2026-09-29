@@ -1,6 +1,7 @@
 """Tests for the unified studio project layer (no Qt needed)."""
 
 import io
+import json
 
 import pytest
 
@@ -387,3 +388,237 @@ def test_empty_script_is_not_reported_as_untimed(tmp_path):
     project = _project(tmp_path)
     project.new_script()
     assert project.summary()["untimed_scripts"] == []
+
+
+# --------------------------------------------------------------------------
+# importing from existing sources
+# --------------------------------------------------------------------------
+
+def test_parse_character_text_uses_the_batch_format():
+    rows = studio_model.parse_character_text(
+        "f\tFISH\t\\033[33m\n"
+        "t\tTeiresias\n"
+    )
+    assert rows == [("f", "FISH", "\033[33m"), ("t", "Teiresias", "")]
+
+
+def test_parse_character_text_rejects_a_bad_style():
+    with pytest.raises(StudioError):
+        studio_model.parse_character_text("f\tFISH\t\\033[3m")     # italic is refused
+
+
+def test_parse_character_json_accepts_both_shapes():
+    bare = '{"f": {"NAME": "FISH", "STYLE": "\\u001b[33m"}}'
+    assert studio_model.parse_character_json(bare) == [("f", "FISH", "\033[33m")]
+
+    whole = json.dumps({
+        "NAME": "Demo", "VERSION": "0.0.1",
+        "CHARACTERS": {"t": {"NAME": "Teiresias"}},
+    })
+    assert studio_model.parse_character_json(whole) == [("t", "Teiresias", "")]
+
+
+def test_parse_character_json_reports_unusable_files():
+    with pytest.raises(StudioError):
+        studio_model.parse_character_json("not json")
+    with pytest.raises(StudioError):
+        studio_model.parse_character_json("[1, 2]")
+    with pytest.raises(StudioError):
+        studio_model.parse_character_json('{"NAME": "x", "VERSION": "0.0.1"}')
+    with pytest.raises(StudioError):
+        studio_model.parse_character_json('{"CHARACTERS": {}}')
+
+
+def test_merge_characters_overwrites_by_abbreviation(tmp_path):
+    project = _project(tmp_path)
+    project.merge_characters([("f", "FISH", ""), ("t", "Teiresias", "")])
+    project.set_character("f", "FISH 改", "\033[31m")
+    keys = project.merge_characters([("f", "FISH", "\033[33m")])
+    assert keys == ["f"]
+    assert project.character_rows() == [("f", "FISH", "\033[33m"), ("t", "Teiresias", "")]
+
+
+def test_import_script_reads_both_source_and_compiled_files(tmp_path):
+    compiled = tmp_path / "act.tscp"
+    compiled.write_text("TSCP 1\nD|f|SGk=|0.1,0.2\n", encoding="utf-8")
+    source = tmp_path / "draft.tscps"
+    source.write_text("[f]你好\n旁白\n", encoding="utf-8")
+
+    project = _project(tmp_path)
+    assert project.import_script(compiled) == "act.tscp"
+    assert project.import_script(source) == "draft.tscp"
+    assert set(project.scripts) == {"act.tscp", "draft.tscp"}
+    assert project.scripts["draft.tscp"].lines[0].text == "你好"
+
+    with pytest.raises(StudioError):
+        project.import_script(compiled)
+    with pytest.raises(StudioError):
+        project.import_script(tmp_path / "missing.tscp")
+
+
+def test_apply_timing_matches_by_position_and_text(tmp_path):
+    project = _project(tmp_path)
+    name = project.new_script()
+    project.add_event(name, Dialogue("f", "甲乙"))
+    project.add_event(name, Dialogue("f", "改过了"))
+    project.add_event(name, Directive("s", "1"))
+
+    incoming = Script([
+        Dialogue("f", "甲乙", [0.5, 0.6]),
+        Dialogue("f", "丙丁", [0.7, 0.8]),      # different text: skipped
+        Directive("s", "1"),
+    ])
+    applied, skipped = project.apply_timing(name, incoming)
+    assert (applied, skipped) == (1, 1)
+    lines = project.script(name).lines
+    assert lines[0].delays == pytest.approx([0.5, 0.6])
+    assert lines[1].delays == []
+
+
+class _LegacyPlot:
+    """A ``Musics`` + ``Scripts`` folder, the pre-``.tscpkg`` layout."""
+
+    def __init__(self, root, *, with_lyrics=True):
+        (root / "Scripts").mkdir(parents=True, exist_ok=True)
+        (root / "Musics").mkdir(parents=True, exist_ok=True)
+        (root / "__init__.json").write_text(
+            json.dumps({"NAME": "Legacy"}), encoding="utf-8"
+        )
+        (root / "Scripts" / "__init__.json").write_text(
+            json.dumps({
+                "NAME": "Legacy", "VERSION": "0.0.1",
+                "CHARACTERS": {"f": {"NAME": "FISH", "STYLE": "\033[33m"}},
+                "DEPENDECE": {"MAIN": {"VERSION": "0.0.1"}},
+            }),
+            encoding="utf-8",
+        )
+        (root / "Scripts" / "old.tscp").write_text(
+            "TSCP 1\nD|f|SGk=|0.3,0.4\n", encoding="utf-8"
+        )
+        (root / "Scripts" / "draft.tscps").write_text("[f]草稿\n", encoding="utf-8")
+        (root / "Musics" / "song.flac").write_bytes(b"FLAC" * 32)
+        tracks = {"KIND": "lyrics", "LYRICS": "song.lrc", "COLOR": "#abcdef"} \
+            if with_lyrics else {"KIND": "instrumental"}
+        if with_lyrics:
+            (root / "Musics" / "song.lrc").write_text(
+                "[00:01.00]第一句\n", encoding="utf-8"
+            )
+        (root / "Musics" / "__init__.json").write_text(
+            json.dumps({
+                "VERSION": "0.0.1",
+                "CONFIG": {"iw": "song.flac"},
+                "TRACKS": {"iw": tracks},
+            }),
+            encoding="utf-8",
+        )
+
+
+def test_collect_source_reads_a_legacy_folder(tmp_path):
+    root = tmp_path / "legacy"
+    _LegacyPlot(root)
+    collected = studio_model.collect_source(root)
+    assert collected["characters"] == [("f", "FISH", "\033[33m")]
+    assert set(collected["scripts"]) == {"old.tscp", "draft.tscp"}
+    assert collected["scripts"]["old.tscp"].lines[0].delays == pytest.approx([0.3, 0.4])
+    assert collected["music"][0]["abbreviation"] == "iw"
+    assert collected["music"][0]["kind"] == "lyrics"
+    assert collected["music"][0]["lyrics_file"].name == "song.lrc"
+
+
+def test_import_from_a_legacy_folder(tmp_path):
+    root = tmp_path / "legacy"
+    _LegacyPlot(root)
+    project = _project(tmp_path)
+
+    result = project.import_from(root)
+    assert result["characters"] == 1
+    assert result["scripts"] == 2
+    assert result["music"] == 1
+    assert result["notes"] == []
+    assert project.characters["f"].name == "FISH"
+    assert project.scripts["old.tscp"].lines[0].delays == pytest.approx([0.3, 0.4])
+    assert project.tracks["iw"].has_lyrics is True
+    assert project.tracks["iw"].color == "#abcdef"
+    assert "第一句" in project.lyrics_text("iw")
+
+    project.save()
+    package = load_archive_package(project.path, cache_root=tmp_path / "cache")
+    assert package.characters["f"].name == "FISH"
+    assert package.music_path("iw").read_bytes() == b"FLAC" * 32
+
+
+def test_import_suffixes_colliding_script_names(tmp_path):
+    root = tmp_path / "legacy"
+    _LegacyPlot(root)
+    project = _project(tmp_path)
+    project.new_script("old")
+
+    result = project.import_from(root)
+    assert result["scripts"] == 2
+    assert set(project.scripts) == {"old.tscp", "old2.tscp", "draft.tscp"}
+
+
+def test_import_notes_when_declared_lyrics_are_missing(tmp_path):
+    root = tmp_path / "legacy"
+    _LegacyPlot(root, with_lyrics=False)
+    # Point at a .lrc that does not exist.
+    (root / "Musics" / "__init__.json").write_text(
+        json.dumps({
+            "VERSION": "0.0.1",
+            "CONFIG": {"iw": "song.flac"},
+            "TRACKS": {"iw": {"KIND": "lyrics", "LYRICS": "gone.lrc"}},
+        }),
+        encoding="utf-8",
+    )
+    project = _project(tmp_path)
+    result = project.import_from(root)
+    assert result["music"] == 1
+    assert project.tracks["iw"].instrumental is True
+    assert any("纯音乐" in note for note in result["notes"])
+
+
+def test_import_from_another_container(tmp_path):
+    donor = _project(tmp_path / "donor", name="Donor")
+    donor.set_character("t", "Teiresias", "\033[36m")
+    donor_name = donor.new_script("act")
+    delays = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    donor.add_event(donor_name, Dialogue("t", "来自另一个包", delays))
+    donor.add_music([model.MusicDraft(
+        abbreviation="bgm", source=_song(tmp_path / "donor"), kind="instrumental"
+    )])
+    donor.save()
+
+    project = _project(tmp_path)
+    result = project.import_from(donor.path)
+    assert result["characters"] == 1
+    assert result["scripts"] == 1
+    assert result["music"] == 1
+    assert project.characters["t"].name == "Teiresias"
+    assert project.scripts["act.tscp"].lines[0].delays == pytest.approx(delays)
+    assert project.tracks["bgm"].instrumental is True
+
+
+def test_import_from_rejects_unknown_sources(tmp_path):
+    project = _project(tmp_path)
+    junk = tmp_path / "notes.txt"
+    junk.write_text("hello", encoding="utf-8")
+    with pytest.raises(StudioError):
+        project.import_from(junk)
+    assert studio_model.is_importable(junk) is False
+
+
+def test_import_can_be_limited_to_one_kind(tmp_path):
+    root = tmp_path / "legacy"
+    _LegacyPlot(root)
+    project = _project(tmp_path)
+    result = project.import_from(root, scripts_wanted=False, music_wanted=False)
+    assert result == {"characters": 1, "scripts": 0, "music": 0, "notes": []}
+    assert project.scripts == {}
+    assert project.tracks == {}
+
+
+def test_parse_script_text_detects_the_compiled_header():
+    compiled = studio_model.parse_script_text("TSCP 1\nD|f|SGk=|0.1,0.2\n")
+    assert compiled.lines[0].delays == pytest.approx([0.1, 0.2])
+    source = studio_model.parse_script_text("[f]你好\n", ".tscps")
+    assert source.lines[0].delays == []

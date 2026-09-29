@@ -168,6 +168,9 @@ def create(
     """Create an empty, valid ``.tscpkg`` and return its path."""
 
     target = _blank(path)
+    # A caller may hand us a path inside a folder that does not exist yet: the
+    # studio creates a plot before anybody has made the directory.
+    target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise PackageError("refusing to overwrite an existing container: %s" % target)
     manifest = {

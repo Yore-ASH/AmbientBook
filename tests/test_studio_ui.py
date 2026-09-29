@@ -4,10 +4,13 @@ These drive the real widgets, because the wiring between the steps is exactly
 what the dependency-free project tests cannot cover.
 """
 
+import json
+
 import pytest
 
 from PlotManager.model import MusicDraft
 from Studio import model as studio_model
+from Studio.model import StudioProject
 from tscp_player.format import Dialogue, Directive
 from tscp_player.plot import load_archive_package
 
@@ -266,3 +269,285 @@ def test_export_step_flags_missing_characters(studio, tmp_path):
     step = window.steps[4]
     step.refresh()
     assert "ghost" in step.issues.text()
+
+
+# --------------------------------------------------------------------------
+# Ctrl+S and the other shortcuts
+# --------------------------------------------------------------------------
+
+def test_save_has_a_keyboard_shortcut(studio):
+    from PySide6.QtGui import QAction
+
+    shortcuts = {
+        action.shortcut().toString()
+        for action in studio.findChildren(QAction)
+        if not action.shortcut().isEmpty()
+    }
+    assert any(value.endswith("+S") for value in shortcuts), shortcuts
+    assert any(value.endswith("+O") for value in shortcuts), shortcuts
+    assert any(value.endswith("+N") for value in shortcuts), shortcuts
+
+
+def test_the_save_action_actually_saves(studio, tmp_path):
+    from PySide6.QtGui import QAction
+
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    window.project.dirty = True
+    save_action = next(
+        action
+        for action in window.findChildren(QAction)
+        if action.shortcut().toString().endswith("+S")
+    )
+    save_action.trigger()
+    assert window.project.dirty is False
+    assert StudioProject.load(window.project.path).characters["f"].name == "FISH"
+
+
+def test_the_save_button_explains_the_shortcut(studio):
+    assert "Ctrl+S" in studio.save_button.toolTip()
+
+
+# --------------------------------------------------------------------------
+# importing from source files, step by step
+# --------------------------------------------------------------------------
+
+def _patch_open_file(monkeypatch, path):
+    from PySide6.QtWidgets import QFileDialog
+
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(path), ""))
+    )
+
+
+def _b64(text: str) -> str:
+    """Compiled scripts store dialogue text as base64."""
+
+    import base64
+
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def test_characters_step_offers_batch_and_import(studio):
+    step = studio.steps[0]
+    assert {
+        "添加角色", "编辑", "删除",
+        "批量添加…", "粘贴导入…", "从 JSON 导入…", "从剧情包导入…",
+    } == set(step.buttons)
+
+
+def test_batch_add_dialog_accumulates_before_committing(studio):
+    """The old generator's batch flow: keep filling fields, commit once."""
+
+    from Studio.Main import BatchAddDialog
+
+    window = studio
+    window.project.set_character("t", "旧名字", "")
+    dialog = BatchAddDialog(window, window.project.characters)
+
+    for key, name in (("f", "FISH"), ("t", "Teiresias"), ("g", "Guide")):
+        dialog.fields.key_edit.setText(key)
+        dialog.fields.name_edit.setText(name)
+        dialog.add_row()
+
+    # Adding a second time updates in place rather than duplicating.
+    dialog.fields.key_edit.setText("f")
+    dialog.fields.name_edit.setText("FISH 改")
+    dialog.add_row()
+
+    assert [row[0] for row in dialog.rows] == ["f", "t", "g"]
+    assert dialog.rows[0][1] == "FISH 改"
+    assert dialog.table.rowCount() == 3
+    assert "（更新）" in dialog.table.item(1, 1).text()
+    # The fields are emptied, ready for the next name.
+    assert dialog.fields.key_edit.text() == ""
+
+    window.project.merge_characters(dialog.rows)
+    assert window.project.characters["g"].name == "Guide"
+    assert window.project.characters["t"].name == "Teiresias"
+    assert window.project.characters["f"].name == "FISH 改"
+
+
+def test_batch_add_dialog_can_remove_a_row(studio):
+    from Studio.Main import BatchAddDialog
+
+    dialog = BatchAddDialog(studio)
+    for key, name in (("f", "FISH"), ("t", "Teiresias")):
+        dialog.fields.key_edit.setText(key)
+        dialog.fields.name_edit.setText(name)
+        dialog.add_row()
+    dialog.table.selectRow(0)
+    dialog.remove_row()
+    assert [row[0] for row in dialog.rows] == ["t"]
+
+
+def test_batch_add_dialog_derives_a_style_from_the_colour(studio):
+    from Studio.Main import BatchAddDialog
+
+    dialog = BatchAddDialog(studio)
+    dialog.fields.key_edit.setText("f")
+    dialog.fields.name_edit.setText("FISH")
+    dialog.fields.custom_edit.setText(r"\033[33m")
+    dialog.add_row()
+    assert dialog.rows[0][2] == "\033[33m"
+
+
+def test_characters_step_imports_a_json_file(studio, tmp_path, monkeypatch):
+    import json as json_module
+
+    window = studio
+    payload = tmp_path / "characters.json"
+    payload.write_text(
+        json_module.dumps({"f": {"NAME": "FISH", "STYLE": "\u001b[33m"}}),
+        encoding="utf-8",
+    )
+    _patch_open_file(monkeypatch, payload)
+
+    window.steps[0].import_json()
+    assert window.project.characters["f"].name == "FISH"
+    assert window.project.characters["f"].style == "\033[33m"
+    assert "新增 1 个" in window.status.text()
+
+
+def test_characters_batch_dialog_parses_pasted_rows(studio):
+    from Studio.Main import BatchCharactersDialog
+
+    window = studio
+    dialog = BatchCharactersDialog(window)
+    dialog.editor.setPlainText("f\tFISH\t\\033[33m\nt\tTeiresias\n")
+    rows = studio_model.parse_character_text(dialog.text())
+    window.project.merge_characters(rows)
+    assert window.project.character_rows() == [
+        ("f", "FISH", "\033[33m"),
+        ("t", "Teiresias", ""),
+    ]
+
+
+def test_story_step_imports_a_script_file(studio, tmp_path, monkeypatch):
+    window = studio
+    draft = tmp_path / "chapter.tscps"
+    draft.write_text("[f]第一章\n旁白\n", encoding="utf-8")
+    _patch_open_file(monkeypatch, draft)
+
+    window.steps[1].import_script()
+    assert "chapter.tscp" in window.project.scripts
+    assert window.steps[1].script_combo.currentText() == "chapter.tscp"
+    assert window.project.scripts["chapter.tscp"].lines[0].text == "第一章"
+
+
+def test_timing_step_imports_timing_from_a_tscp(studio, tmp_path, monkeypatch):
+    window = studio
+    name = _story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step._reload_events()
+
+    recorded = tmp_path / "recorded.tscp"
+    recorded.write_text(
+        "TSCP 1\nP|iw\nD|f|%s|%s\nS|0\nN|%s|%s\n"
+        % (
+            _b64("Hold"), ",".join(["0.1"] * 4),
+            _b64("Aside"), ",".join(["0.2"] * 5),
+        ),
+        encoding="utf-8",
+    )
+    # The project's line differs, so nothing should be copied over silently.
+    _patch_open_file(monkeypatch, recorded)
+    step.import_timing()
+    # The timing step reports into its own status label, next to the table.
+    assert "被跳过" in step.status.text()
+
+    # Now make a script whose text matches the file, and import again.
+    matching = window.project.new_script("matching")
+    window.project.add_event(matching, Directive("p", "iw"))
+    window.project.add_event(matching, Dialogue("f", "Hold", []))
+    window.project.add_event(matching, Directive("s", "0"))
+    window.project.add_event(matching, Dialogue(None, "Aside", []))
+    step.refresh()
+    step.script_combo.setCurrentText(matching)
+    step._reload_events()
+    step.import_timing()
+
+    lines = window.project.script(matching).lines
+    assert lines[1].delays == pytest.approx([0.1] * 4)
+    assert lines[3].delays == pytest.approx([0.2] * 5)
+    assert "套用了 2 句" in step.status.text()
+
+
+def test_lyrics_step_imports_a_plain_text_file(studio, tmp_path, monkeypatch):
+    window = studio
+    _story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    lyrics = tmp_path / "lyrics.txt"
+    lyrics.write_text("第一句\n# 注释\n第二句\n", encoding="utf-8")
+    _patch_open_file(monkeypatch, lyrics)
+
+    step.import_lyrics()
+    assert step.kind_lyrics.isChecked() is True
+    assert "第一句" in step.lyrics_edit.toPlainText()
+    assert "录制" in window.status.text()
+
+
+def test_lyrics_step_imports_an_lrc(studio, tmp_path, monkeypatch):
+    window = studio
+    _story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    lrc = tmp_path / "song.lrc"
+    lrc.write_text("[00:01.00]第一句\n[00:03.50]Second line\n", encoding="utf-8")
+    _patch_open_file(monkeypatch, lrc)
+
+    step.import_lyrics()
+    step.apply_lyrics()
+    assert "第一句" in window.project.lyrics_text("iw")
+
+
+def test_export_step_imports_a_whole_plot(studio, tmp_path, monkeypatch):
+    window = studio
+    _story(window, tmp_path)
+
+    donor = studio_model.StudioProject.create(
+        tmp_path / "donor.tscpkg", name="Donor", description=""
+    )
+    donor.set_character("t", "Teiresias", "\033[36m")
+    donor_script = donor.new_script("act")
+    donor.add_event(donor_script, Dialogue("t", "外来台词", [0.1, 0.2, 0.3, 0.4]))
+    donor.save()
+
+    monkeypatch.setattr(window, "pick_import_source", lambda: donor.path)
+    window.steps[4].import_from_source()
+
+    assert "t" in window.project.characters
+    assert "act.tscp" in window.project.scripts
+    assert "导入 1 个角色" in window.status.text()
+
+
+def test_import_helper_reports_notes(studio, tmp_path, monkeypatch):
+    """A track declared as lyrics without a .lrc must not fail the import."""
+
+    window = studio
+    root = tmp_path / "legacy"
+    (root / "Scripts").mkdir(parents=True)
+    (root / "Musics").mkdir(parents=True)
+    (root / "Scripts" / "__init__.json").write_text(
+        json.dumps({"CHARACTERS": {"f": {"NAME": "FISH"}}}), encoding="utf-8"
+    )
+    (root / "Musics" / "song.flac").write_bytes(b"FLAC" * 16)
+    (root / "Musics" / "__init__.json").write_text(
+        json.dumps({
+            "VERSION": "0.0.1",
+            "CONFIG": {"iw": "song.flac"},
+            "TRACKS": {"iw": {"KIND": "lyrics", "LYRICS": "gone.lrc"}},
+        }),
+        encoding="utf-8",
+    )
+
+    window.import_everything(root)
+    assert "纯音乐" in window.status.text()
+    assert window.project.tracks["iw"].instrumental is True

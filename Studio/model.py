@@ -7,10 +7,12 @@ Nothing here imports Qt, so the flow can be tested without a display.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+from CharacterCreator import model as characters
 from PlotManager import model
 from PlotManager.model import MusicDraft, PackError
 from tscp_player import archive
@@ -18,10 +20,18 @@ from tscp_player.format import (
     Dialogue,
     Directive,
     Script,
+    parse_tscp,
+    parse_tscps,
     serialize_tscp,
     visible_text_length,
 )
-from tscp_player.plot import Character, MusicTrack, parse_tracks
+from tscp_player.plot import (
+    Character,
+    MusicTrack,
+    PlotPackageError,
+    load_archive_package,
+    parse_tracks,
+)
 
 PathLike = Union[str, Path]
 
@@ -177,6 +187,189 @@ def safe_script_name(value: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# importing from existing sources
+# --------------------------------------------------------------------------
+
+COMPILED_HEADER = "TSCP "
+
+
+def parse_script_text(text: str, suffix: str = "") -> Script:
+    """Parse a compiled ``.tscp`` or a source ``.tscps`` from text."""
+
+    try:
+        if suffix.lower() == ".tscp" or text.lstrip().startswith(COMPILED_HEADER):
+            return parse_tscp(text)
+        return parse_tscps(text)
+    except ValueError as exc:
+        raise StudioError(str(exc)) from exc
+
+
+def _normalise_style(key: str, style: str) -> str:
+    if not style or not str(style).strip():
+        return ""
+    try:
+        return characters.normalize_ansi(style)
+    except ValueError as exc:
+        raise StudioError("角色 %s 的样式无效：%s" % (key, exc)) from exc
+
+
+def parse_character_text(text: str) -> List[Tuple[str, str, str]]:
+    """Parse the batch format ``缩写<TAB>全名<TAB>ANSI样式``.
+
+    This is the same parser the standalone character generator uses, so anything
+    pasted there keeps working here.
+    """
+
+    try:
+        rows = characters.parse_batch_text(text)
+    except ValueError as exc:
+        raise StudioError(str(exc)) from exc
+    return [
+        (key.strip(), name.strip(), _normalise_style(key.strip(), style))
+        for key, name, style in rows
+    ]
+
+
+def parse_character_json(text: str) -> List[Tuple[str, str, str]]:
+    """Read character rows from JSON.
+
+    Accepts either a whole ``Scripts/__init__.json`` (with a ``CHARACTERS``
+    object) or a bare ``{"f": {"NAME": ..., "STYLE": ...}}`` mapping, which is
+    what the character generator outputs.
+    """
+
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise StudioError("不是有效的 JSON：%s" % exc) from exc
+    if not isinstance(document, dict):
+        raise StudioError("角色文件必须是一个 JSON 对象")
+
+    table = document.get("CHARACTERS")
+    if table is None:
+        # A bare mapping is fine, but a plot manifest is not.
+        table = document
+        if any(not isinstance(value, dict) for value in table.values()):
+            raise StudioError("这个 JSON 里没有 CHARACTERS 对象")
+    if not isinstance(table, dict):
+        raise StudioError("CHARACTERS 必须是对象")
+
+    rows: List[Tuple[str, str, str]] = []
+    for key, value in table.items():
+        if not isinstance(value, dict) or "NAME" not in value:
+            raise StudioError("角色 %s 缺少 NAME" % key)
+        rows.append((str(key), str(value["NAME"]), _normalise_style(str(key), value.get("STYLE", ""))))
+    if not rows:
+        raise StudioError("这个文件里没有任何角色")
+    return rows
+
+
+def is_importable(source: PathLike) -> bool:
+    """Whether :func:`collect_source` knows how to read *source*."""
+
+    path = Path(source)
+    return archive.is_package(path) or path.is_dir()
+
+
+def collect_source(source: PathLike) -> Dict[str, Any]:
+    """Gather characters, scripts and music from a ``.tscpkg`` or a folder."""
+
+    path = Path(source)
+    if archive.is_package(path):
+        return _collect_from_package(path)
+    if path.is_dir():
+        return _collect_from_directory(path)
+    raise StudioError(
+        "只能从 .tscpkg 文件或包含 Musics/Scripts 的文件夹导入：%s" % path
+    )
+
+
+def _collect_from_package(path: Path) -> Dict[str, Any]:
+    try:
+        package = load_archive_package(path)
+    except (PlotPackageError, archive.PackageError, OSError, ValueError) as exc:
+        raise StudioError(str(exc)) from exc
+
+    music: List[Dict[str, Any]] = []
+    for key, track in package.tracks.items():
+        try:
+            audio = package.music_path(key)
+        except (PlotPackageError, archive.PackageError, OSError, ValueError):
+            continue
+        music.append(
+            {
+                "abbreviation": key,
+                "audio": audio,
+                "kind": track.kind,
+                "lyrics_file": package.lyrics_path(key),
+                "color": track.color,
+            }
+        )
+
+    return {
+        "characters": [
+            (key, value.name, value.style) for key, value in package.characters.items()
+        ],
+        "scripts": {
+            filename: model.read_script(path, filename)
+            for filename in package.script_names()
+        },
+        "music": music,
+    }
+
+
+def _collect_from_directory(root: Path) -> Dict[str, Any]:
+    meta = root / "Scripts" / "__init__.json"
+    rows: List[Tuple[str, str, str]] = []
+    if meta.is_file():
+        try:
+            rows = parse_character_json(meta.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            rows = []
+
+    scripts: Dict[str, Script] = {}
+    scripts_dir = root / "Scripts"
+    if scripts_dir.is_dir():
+        for path in sorted(scripts_dir.iterdir()):
+            if path.suffix.lower() not in {".tscp", ".tscps"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            try:
+                scripts[path.with_suffix(".tscp").name] = parse_script_text(text, path.suffix)
+            except StudioError:
+                continue
+
+    music: List[Dict[str, Any]] = []
+    music_meta = root / "Musics" / "__init__.json"
+    if music_meta.is_file():
+        try:
+            document = json.loads(music_meta.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            document = {}
+        config = document.get("CONFIG") or {}
+        table = document.get("TRACKS") or {}
+        for key, filename in config.items():
+            entry = table.get(key) or {}
+            lyrics_name = entry.get("LYRICS")
+            music.append(
+                {
+                    "abbreviation": str(key),
+                    "audio": root / "Musics" / str(filename),
+                    "kind": str(entry.get("KIND", "instrumental")).strip().lower(),
+                    "lyrics_file": (
+                        root / "Musics" / str(lyrics_name) if lyrics_name else None
+                    ),
+                    "color": str(entry.get("COLOR") or ""),
+                }
+            )
+
+    return {"characters": rows, "scripts": scripts, "music": music}
+
+
+# --------------------------------------------------------------------------
 # the project
 # --------------------------------------------------------------------------
 
@@ -294,6 +487,18 @@ class StudioProject:
         del self.characters[key]
         self.dirty = True
 
+    def merge_characters(self, rows: Iterable[Tuple[str, str, str]]) -> List[str]:
+        """Add or overwrite characters from ``(缩写, 名字, 样式)`` rows.
+
+        Existing abbreviations are updated rather than rejected, so re-importing
+        a character list is idempotent.
+        """
+
+        keys: List[str] = []
+        for key, name, style in rows:
+            keys.append(self.set_character(key, name, style))
+        return keys
+
     # -- scripts -------------------------------------------------------
     def script(self, filename: str) -> Script:
         if filename not in self.scripts:
@@ -363,6 +568,122 @@ class StudioProject:
     def set_script(self, filename: str, script: Script) -> None:
         self.scripts[filename] = script
         self.dirty = True
+
+    # -- importing -----------------------------------------------------
+    def import_script(self, source: PathLike, name: Optional[str] = None) -> str:
+        """Add a ``.tscp`` or ``.tscps`` file as a new script in this project."""
+
+        path = Path(source)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise StudioError("无法读取 %s：%s" % (path, exc)) from exc
+        script = parse_script_text(text, path.suffix)
+        filename = safe_script_name(name or path.with_suffix(".tscp").name)
+        if filename in self.scripts:
+            raise StudioError("剧本已存在：%s" % filename)
+        self.scripts[filename] = script
+        self.dirty = True
+        return filename
+
+    def apply_timing(self, filename: str, source: Script) -> Tuple[int, int]:
+        """Copy delays from *source* onto the matching lines of *filename*.
+
+        Lines are matched by position **and** text.  A line that does not match
+        is left untouched rather than shifting every later timing, and the
+        counts of applied and skipped lines are returned so the caller can say
+        what actually happened.
+        """
+
+        target = self.script(filename)
+        applied = skipped = 0
+        lines = []
+        for index, item in enumerate(target.lines):
+            other = source.lines[index] if index < len(source.lines) else None
+            if (
+                isinstance(item, Dialogue)
+                and isinstance(other, Dialogue)
+                and item.text == other.text
+                and len(other.delays) == visible_text_length(other.text)
+            ):
+                lines.append(Dialogue(item.character, item.text, list(other.delays)))
+                applied += 1
+            else:
+                if isinstance(item, Dialogue):
+                    skipped += 1
+                lines.append(item)
+        self.set_script(filename, Script(lines))
+        return applied, skipped
+
+    def import_from(
+        self,
+        source: PathLike,
+        *,
+        characters_wanted: bool = True,
+        scripts_wanted: bool = True,
+        music_wanted: bool = True,
+    ) -> Dict[str, Any]:
+        """Merge a ``.tscpkg`` or a legacy folder into this project.
+
+        Characters are overwritten by abbreviation, scripts that would collide
+        get a numeric suffix instead of clobbering what is already here, and a
+        music track that cannot be embedded is reported in ``notes`` rather than
+        failing the whole import.
+        """
+
+        collected = collect_source(source)
+
+        result: Dict[str, Any] = {
+            "characters": 0,
+            "scripts": 0,
+            "music": 0,
+            "notes": [],
+        }
+        if characters_wanted and collected["characters"]:
+            result["characters"] = len(self.merge_characters(collected["characters"]))
+
+        if scripts_wanted and collected["scripts"]:
+            for filename, script in collected["scripts"].items():
+                target = filename
+                index = 2
+                while target in self.scripts:
+                    target = "%s%d.tscp" % (Path(filename).stem, index)
+                    index += 1
+                self.scripts[target] = script
+                result["scripts"] += 1
+            self.dirty = True
+
+        if music_wanted and collected["music"]:
+            drafts: List[MusicDraft] = []
+            for item in collected["music"]:
+                audio = Path(item["audio"])
+                if not audio.is_file():
+                    result["notes"].append("跳过缺失的音频：%s" % audio.name)
+                    continue
+                kind = item.get("kind") or "instrumental"
+                lyrics_file = item.get("lyrics_file")
+                if kind == "lyrics" and not (lyrics_file and Path(lyrics_file).is_file()):
+                    # Declared as lyrics but the .lrc is missing: bring the audio
+                    # in as instrumental and say so, rather than failing.
+                    result["notes"].append(
+                        "%s 原本标为带歌词，但没有歌词文件，已按纯音乐导入"
+                        % item["abbreviation"]
+                    )
+                    kind, lyrics_file = "instrumental", None
+                drafts.append(
+                    MusicDraft(
+                        abbreviation=item["abbreviation"],
+                        source=audio,
+                        kind=kind,
+                        lyrics_file=lyrics_file,
+                        color=item.get("color", ""),
+                    )
+                )
+            if drafts:
+                self.add_music(drafts)
+                result["music"] = len(drafts)
+
+        return result
 
     # -- music ---------------------------------------------------------
     def add_music(self, drafts: Iterable[MusicDraft]) -> List[str]:

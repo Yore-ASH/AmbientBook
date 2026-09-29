@@ -1,0 +1,61 @@
+"""One window for the whole authoring flow.
+
+:mod:`Studio.model` is dependency-free and covers characters, scripts, timings
+and music; :mod:`Studio.Main` adds the PySide6 wizard that drives it.
+"""
+
+from .model import (
+    CLEAR,
+    DIALOGUE,
+    EVENT_LABELS,
+    MUSIC,
+    NARRATION,
+    SLEEP,
+    StudioError,
+    StudioProject,
+    collect_source,
+    describe_event,
+    dialogue_count,
+    event_kind,
+    event_label,
+    is_importable,
+    is_script_timed,
+    missing_characters,
+    next_script_name,
+    normalise_script,
+    parse_character_json,
+    parse_character_text,
+    parse_script_text,
+    safe_script_name,
+    script_characters,
+    timed_slots,
+    timing_progress,
+)
+
+__all__ = [
+    "CLEAR",
+    "DIALOGUE",
+    "EVENT_LABELS",
+    "MUSIC",
+    "NARRATION",
+    "SLEEP",
+    "StudioError",
+    "StudioProject",
+    "collect_source",
+    "describe_event",
+    "dialogue_count",
+    "event_kind",
+    "event_label",
+    "is_importable",
+    "is_script_timed",
+    "missing_characters",
+    "next_script_name",
+    "normalise_script",
+    "parse_character_json",
+    "parse_character_text",
+    "parse_script_text",
+    "safe_script_name",
+    "script_characters",
+    "timed_slots",
+    "timing_progress",
+]
