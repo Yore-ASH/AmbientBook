@@ -114,6 +114,44 @@ def script_document(path: PathLike) -> dict:
     return _document(path, SCRIPT_META, {"NAME": "", "VERSION": "0.0.1", "CHARACTERS": {}})
 
 
+def character_table(path: PathLike) -> Dict[str, Dict[str, str]]:
+    """The ``CHARACTERS`` table stored in ``Scripts/__init__.json``."""
+
+    document = script_document(path)
+    characters = document.get("CHARACTERS") or {}
+    if not isinstance(characters, dict):
+        raise PackError("CHARACTERS 必须是对象")
+    table: Dict[str, Dict[str, str]] = {}
+    for key, value in characters.items():
+        if not isinstance(value, dict) or "NAME" not in value:
+            raise PackError("角色 %s 缺少 NAME" % key)
+        table[str(key)] = {
+            "NAME": str(value["NAME"]),
+            "STYLE": str(value.get("STYLE", "")),
+        }
+    return table
+
+
+def update_characters(
+    path: PathLike, characters: Mapping[str, Mapping[str, str]]
+) -> None:
+    """Replace the whole ``CHARACTERS`` table in one rewrite.
+
+    The studio edits characters in memory and writes them here, so a plot can be
+    built end to end without anybody hand-editing ``__init__.json``.
+    """
+
+    table: Dict[str, Dict[str, str]] = {}
+    for key, value in characters.items():
+        name = str(value.get("NAME", "")).strip()
+        if not name:
+            raise PackError("角色 %s 的名字不能为空" % key)
+        table[str(key)] = {"NAME": name, "STYLE": str(value.get("STYLE", ""))}
+    document = script_document(path)
+    document["CHARACTERS"] = table
+    archive.update(path, text={SCRIPT_META: _write_json(document)})
+
+
 def music_config(path: PathLike) -> Dict[str, str]:
     document = music_document(path)
     config = document.get("CONFIG", {})
@@ -640,6 +678,25 @@ def read_script(path: PathLike, member: str) -> Script:
     """The parsed events of one script inside the container."""
 
     return parse_tscp(script_text(path, member))
+
+
+def write_script(path: PathLike, member: str, text: str) -> str:
+    """Create or replace one compiled script from text.
+
+    The studio keeps scripts in memory and flushes them here, so a brand new
+    script never has to touch the filesystem first.
+    """
+
+    name = Path(member).name
+    if Path(name).suffix.lower() != ".tscp":
+        raise PackError("只能写入 .tscp 剧本")
+    try:
+        parse_tscp(text)
+    except ValueError as exc:
+        raise PackError("不是有效的 .tscp：%s" % exc) from exc
+    target = "%s/%s" % (archive.SCRIPTS_DIR, name)
+    archive.update(path, text={target: text})
+    return target
 
 
 def replace_script(path: PathLike, member: str, text: str) -> str:

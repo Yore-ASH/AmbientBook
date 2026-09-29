@@ -15,6 +15,7 @@ web = ["Flask>=3.0"]
 
 [project.scripts]
 tscp-player = "tscp_player.cli:main"
+tscp-studio = "Studio.Main:main"
 tscp-editor = "TSCPEditor.Main:main"
 ts2tp = "Ts2Tp.Main:main"
 tscp-pack = "PlotManager.Main:main"

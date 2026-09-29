@@ -1,0 +1,1795 @@
+"""The unified desktop studio: one window for the whole authoring flow.
+
+Steps, left to right: create characters, write the story (and drop music in),
+time every character, write or record the lyrics, then export the ``.tscpkg``.
+Nothing is edited as raw text: lines go in through dialogs, and the timing step
+records keystrokes against the real music.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import CharacterCreator.model as characters_model
+from PlotManager.model import MusicDraft, PackError, suggest_abbreviation
+from PlotManager.recorder import LyricsRecorderDialog
+from Studio import model as studio
+from Studio.model import (
+    CLEAR,
+    DIALOGUE,
+    MUSIC,
+    NARRATION,
+    SLEEP,
+    EVENT_LABELS,
+    StudioError,
+    StudioProject,
+    describe_event,
+    event_kind,
+    event_label,
+    next_script_name,
+)
+from Ts2Tp.model import KeyboardTimingModel, TimingMode
+from tscp_player.audio import MusicPlayer
+from tscp_player.format import (
+    ANSI_SEQUENCE_RE,
+    Dialogue,
+    Directive,
+    Script,
+    visible_text_length,
+)
+from tscp_player.lyrics import lyric_source_lines, serialize_lrc, timed_from_marks
+from tscp_player.music import STOP_WORDS
+
+try:  # pragma: no cover - depends on the optional GUI package
+    from PySide6.QtCore import QEvent, Qt, QTimer
+    from PySide6.QtGui import QColor, QTextCursor
+    from PySide6.QtWidgets import (
+        QAbstractItemView,
+        QApplication,
+        QCheckBox,
+        QColorDialog,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QDoubleSpinBox,
+        QFileDialog,
+        QFormLayout,
+        QHBoxLayout,
+        QInputDialog,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QMainWindow,
+        QMessageBox,
+        QPlainTextEdit,
+        QPushButton,
+        QRadioButton,
+        QSplitter,
+        QStackedWidget,
+        QTableWidget,
+        QTableWidgetItem,
+        QTextEdit,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    QT_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    QT_AVAILABLE = False
+
+
+AUDIO_FILTER = (
+    "音频 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac);;所有文件 (*)"
+)
+LYRIC_COLOR_DEFAULT = "#ffffff"
+
+
+# --------------------------------------------------------------------------
+# small shared helpers
+# --------------------------------------------------------------------------
+
+def _ansi_css(sequence: str) -> str:
+    """Translate a common SGR escape into an inline CSS fragment."""
+
+    normalised = str(sequence).replace(r"\033", "\x1b").replace(r"\x1b", "\x1b")
+    match = re.search(r"\x1b\[([0-9;]*)m", normalised)
+    if not match:
+        return ""
+    colors = {
+        30: "#000000", 31: "#cc3333", 32: "#33cc66", 33: "#cccc33",
+        34: "#4488ff", 35: "#cc66cc", 36: "#33cccc", 37: "#eeeeee",
+        90: "#777777", 91: "#ff6666", 92: "#66ee88", 93: "#ffff66",
+        94: "#66aaff", 95: "#ee88ee", 96: "#66eeee", 97: "#ffffff",
+    }
+    css: List[str] = []
+    for raw in match.group(1).split(";"):
+        code = int(raw or 0)
+        if code == 0:
+            css = []
+        elif code in colors:
+            css.append("color:%s" % colors[code])
+        elif code == 1:
+            css.append("font-weight:bold")
+        elif code == 4:
+            css.append("text-decoration:underline")
+    return ";".join(css)
+
+
+def _styled_html(text: str, current_index: Optional[int] = None) -> str:
+    """Render dialogue text with ANSI styling and an optional current-character mark."""
+
+    parts = re.split("(" + ANSI_SEQUENCE_RE.pattern + ")", text)
+    visible_index = 0
+    style = ""
+    output: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if ANSI_SEQUENCE_RE.fullmatch(part):
+            style = _ansi_css(part)
+            continue
+        for character in part:
+            css = style
+            if current_index == visible_index:
+                css = (css + ";" if css else "") + (
+                    "background:#f6d365;color:#111;font-weight:bold;padding:1px 3px"
+                )
+            safe = html.escape(character).replace(" ", "&nbsp;")
+            output.append("<span style='%s'>%s</span>" % (css, safe) if css else safe)
+            visible_index += 1
+    return "".join(output)
+
+
+def _style_css(style: str) -> str:
+    """CSS for a character style, usable on a ``QLabel`` or table cell."""
+
+    return _ansi_css(style)
+
+
+if QT_AVAILABLE:
+
+    # ----------------------------------------------------------------------
+    # dialogs
+    # ----------------------------------------------------------------------
+
+    class CharacterDialog(QDialog):
+        """Create or edit one character, with a live style preview."""
+
+        def __init__(self, parent, key: str = "", name: str = "", style: str = "") -> None:
+            super().__init__(parent)
+            self.setWindowTitle("角色")
+            self.resize(460, 380)
+
+            self.key_edit = QLineEdit(key)
+            self.key_edit.setPlaceholderText("在剧本里写作 [缩写]")
+            self.name_edit = QLineEdit(name)
+            self.name_edit.setPlaceholderText("显示在屏幕上的名字")
+
+            self.color_combo = QComboBox()
+            for label, code in characters_model.ANSI_COLORS:
+                self.color_combo.addItem(label, code)
+            self.bold = QCheckBox("粗体")
+            self.underline = QCheckBox("下划线")
+            self.custom_edit = QLineEdit()
+            self.custom_edit.setPlaceholderText(r"也可以直接填 \033[33;1m 这类 SGR")
+
+            self.preview = QLabel()
+            self.preview.setMinimumHeight(46)
+            self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview.setStyleSheet("background:#111; color:#ddd; border:1px solid #333;")
+
+            form = QFormLayout()
+            form.addRow("缩写", self.key_edit)
+            form.addRow("名字", self.name_edit)
+            form.addRow("颜色", self.color_combo)
+            row = QHBoxLayout()
+            row.addWidget(self.bold)
+            row.addWidget(self.underline)
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            form.addRow("样式", holder)
+            form.addRow("自定义", self.custom_edit)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(QLabel("预览"))
+            layout.addWidget(self.preview)
+            layout.addStretch(1)
+            layout.addWidget(buttons)
+
+            for widget in (self.key_edit, self.name_edit, self.custom_edit):
+                widget.textChanged.connect(self._refresh_preview)
+            self.color_combo.currentIndexChanged.connect(self._refresh_preview)
+            self.bold.toggled.connect(self._refresh_preview)
+            self.underline.toggled.connect(self._refresh_preview)
+
+            if style:
+                self.custom_edit.setText(self._as_spelling(style))
+            self._refresh_preview()
+
+        @staticmethod
+        def _as_spelling(style: str) -> str:
+            """Show an existing style back in the ``\\033[...m`` spelling."""
+
+            match = re.search(r"\[([0-9;]*)m", str(style).replace("\x1b", r"\033"))
+            return r"\033[%sm" % match.group(1) if match else ""
+
+        def _resolved_style(self) -> str:
+            custom = self.custom_edit.text().strip()
+            if custom:
+                return characters_model.normalize_ansi(custom)
+            return characters_model.build_ansi_style(
+                self.color_combo.currentData(),
+                bold=self.bold.isChecked(),
+                underline=self.underline.isChecked(),
+            )
+
+        def _refresh_preview(self) -> None:
+            name = self.name_edit.text().strip() or "角色名"
+            try:
+                css = _style_css(self._resolved_style())
+            except ValueError as exc:
+                self.preview.setText("样式无效：%s" % exc)
+                self.preview.setStyleSheet("background:#111; color:#ff8888;")
+                return
+            self.preview.setStyleSheet("background:#111; color:#ddd; border:1px solid #333;")
+            self.preview.setText("<span style='%s'>%s</span>" % (css, html.escape(name)))
+
+        def values(self) -> tuple:
+            return (
+                self.key_edit.text().strip(),
+                self.name_edit.text().strip(),
+                self._resolved_style(),
+            )
+
+        def accept(self) -> None:
+            key, name, style = self.values()
+            if not key:
+                QMessageBox.warning(self, "角色", "角色缩写不能为空")
+                return
+            if not name:
+                QMessageBox.warning(self, "角色", "角色名字不能为空")
+                return
+            super().accept()
+
+    class DialogueDialog(QDialog):
+        """Write one line of dialogue or narration."""
+
+        def __init__(self, parent, studio_window, event: Optional[Dialogue], narrator: bool) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("旁白" if narrator else "角色对白")
+            self.resize(620, 420)
+            self.narrator = narrator
+
+            self.character_combo = QComboBox()
+            for key in studio_window.project.characters:
+                self.character_combo.addItem(key)
+            self.text_edit = QPlainTextEdit()
+            self.text_edit.setPlaceholderText("这一句要说的话")
+            self.text_edit.setMinimumHeight(200)
+
+            form = QFormLayout()
+            if not narrator:
+                form.addRow("角色", self.character_combo)
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(QLabel("内容"))
+            layout.addWidget(self.text_edit, 1)
+
+            hint = QLabel("标点和符号也会参与计时，只有空格自动显示。")
+            hint.setStyleSheet("color:#777;")
+            layout.addWidget(hint)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+            if event is not None:
+                self.text_edit.setPlainText(event.text)
+                if event.character:
+                    index = self.character_combo.findText(event.character)
+                    if index >= 0:
+                        self.character_combo.setCurrentIndex(index)
+
+        def values(self) -> Optional[Dialogue]:
+            text = self.text_edit.toPlainText().strip()
+            if not text:
+                return None
+            character = None if self.narrator else self.character_combo.currentText()
+            return Dialogue(character, text)
+
+        def accept(self) -> None:
+            if self.values() is None:
+                QMessageBox.warning(self, "对白", "内容不能为空")
+                return
+            super().accept()
+
+    class SleepDialog(QDialog):
+        """How long the player should hold before the next event."""
+
+        def __init__(self, parent, seconds: str = "1.0") -> None:
+            super().__init__(parent)
+            self.setWindowTitle("暂停")
+            self.spin = QDoubleSpinBox()
+            self.spin.setRange(0.0, 600.0)
+            self.spin.setDecimals(2)
+            self.spin.setSingleStep(0.1)
+            try:
+                self.spin.setValue(float(seconds))
+            except (TypeError, ValueError):
+                self.spin.setValue(1.0)
+
+            form = QFormLayout()
+            form.addRow("暂停秒数", self.spin)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(buttons)
+
+        def value(self) -> str:
+            return "%g" % self.spin.value()
+
+    class MusicDialog(QDialog):
+        """Choose a track for a ``<p>`` event, or insert a brand new one."""
+
+        def __init__(self, parent, studio_window, current: str = "") -> None:
+            super().__init__(parent)
+            self.setWindowTitle("播放音乐")
+            self.studio = studio_window
+            self.resize(520, 260)
+            self.new_track: Optional[MusicDraft] = None
+
+            self.combo = QComboBox()
+            self.combo.addItem("（停止音乐）", "")
+            for key in self.studio.project.tracks:
+                self.combo.addItem(key, key)
+            index = self.combo.findData(current)
+            if index >= 0:
+                self.combo.setCurrentIndex(index)
+
+            insert = QPushButton("插入新音乐…")
+            insert.clicked.connect(self._insert_new)
+
+            row = QHBoxLayout()
+            row.addWidget(self.combo, 1)
+            row.addWidget(insert)
+
+            form = QFormLayout()
+            form.addRow("曲目", row)
+
+            hint = QLabel("还没有的音乐可以先「插入新音乐」，它会直接存进剧情包。")
+            hint.setStyleSheet("color:#777;")
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(hint)
+            layout.addStretch(1)
+            layout.addWidget(buttons)
+
+        def _insert_new(self) -> None:
+            draft = collect_new_track(self, self.studio)
+            if draft is None:
+                return
+            self.new_track = draft
+            self.combo.addItem(draft.abbreviation, draft.abbreviation)
+            self.combo.setCurrentIndex(self.combo.count() - 1)
+
+        def value(self) -> str:
+            return self.combo.currentData() or ""
+
+
+    def collect_new_track(parent, studio_window) -> Optional[MusicDraft]:
+        """Ask for audio, an abbreviation, its kind, lyrics and colour.
+
+        Shared by the story step and the lyrics step so both offer the exact same
+        questions the web app does.
+        """
+
+        filename, _ = QFileDialog.getOpenFileName(parent, "选择音乐文件", "", AUDIO_FILTER)
+        if not filename:
+            return None
+        source = Path(filename)
+        key, ok = QInputDialog.getText(
+            parent,
+            "音乐简称",
+            "为 %s 指定 <p> 使用的简称：" % source.name,
+            text=suggest_abbreviation(source),
+        )
+        if not ok or not key.strip():
+            return None
+
+        answer = QMessageBox.question(
+            parent,
+            "音乐类型",
+            "《%s》是纯音乐吗？\n\n是 —— 纯音乐\n否 —— 带歌词（接下来选歌词和颜色）"
+            % source.name,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return None
+
+        draft = MusicDraft(abbreviation=key.strip(), source=source)
+        if answer == QMessageBox.StandardButton.Yes:
+            draft.kind = "instrumental"
+            return draft
+
+        draft.kind = "lyrics"
+        choice = QMessageBox.question(
+            parent,
+            "歌词来源",
+            "歌词从哪来？\n\n是 —— 选择现成的 .lrc 文件\n"
+            "否 —— 选择 lyrics.txt，现在播放音乐并逐句录制出现时间",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if choice == QMessageBox.StandardButton.Cancel:
+            return None
+
+        if choice == QMessageBox.StandardButton.Yes:
+            lrc, _ = QFileDialog.getOpenFileName(
+                parent, "选择 LRC 歌词", "", "LRC 歌词 (*.lrc);;所有文件 (*)"
+            )
+            if not lrc:
+                return None
+            draft.lyrics_file = Path(lrc)
+        else:
+            text_file, _ = QFileDialog.getOpenFileName(
+                parent, "选择歌词文本", "", "歌词文本 (*.txt);;所有文件 (*)"
+            )
+            if not text_file:
+                return None
+            try:
+                lines = lyric_source_lines(Path(text_file).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError) as exc:
+                QMessageBox.critical(parent, "音乐", "无法读取歌词：%s" % exc)
+                return None
+            if not lines:
+                QMessageBox.warning(parent, "音乐", "这个文件里没有歌词行")
+                return None
+            recorded = LyricsRecorderDialog.record(parent, source, lines)
+            if recorded is None:
+                return None
+            draft.lyrics_text = serialize_lrc(recorded)
+            draft.lyrics_name = Path(text_file).with_suffix(".lrc").name
+
+        colour = QColorDialog.getColor(
+            QColor(LYRIC_COLOR_DEFAULT), parent, "选择歌词显示颜色"
+        )
+        if colour.isValid():
+            draft.color = colour.name()
+        return draft
+
+    # ----------------------------------------------------------------------
+    # steps
+    # ----------------------------------------------------------------------
+
+    class Step(QWidget):
+        """Base class: a page that refreshes from the open project."""
+
+        title = ""
+
+        def __init__(self, studio_window) -> None:
+            super().__init__()
+            self.studio = studio_window
+            self._build()
+
+        def _build(self) -> None:  # pragma: no cover - overridden
+            pass
+
+        @property
+        def project(self) -> Optional[StudioProject]:
+            return self.studio.project
+
+        def refresh(self) -> None:  # pragma: no cover - overridden
+            pass
+
+    class CharactersStep(Step):
+        title = "① 角色"
+
+        def _build(self) -> None:
+            self.table = QTableWidget(0, 3)
+            self.table.setHorizontalHeaderLabels(["缩写", "名字", "样式"])
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.itemDoubleClicked.connect(lambda _item: self.edit_character())
+
+            self.hint = QLabel(
+                "角色缩写就是剧本里写的 [f]，样式决定它在播放器里的颜色。"
+            )
+            self.hint.setStyleSheet("color:#777;")
+
+            self.buttons: Dict[str, QPushButton] = {}
+            buttons = QHBoxLayout()
+            for label, slot, tip in (
+                ("添加角色", self.add_character, "新增一个角色"),
+                ("编辑", self.edit_character, "修改选中的角色"),
+                ("删除", self.remove_character, "删除选中的角色"),
+            ):
+                button = QPushButton(label)
+                button.setToolTip(tip)
+                button.clicked.connect(slot)
+                self.buttons[label] = button
+                buttons.addWidget(button)
+            buttons.addStretch(1)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(self.hint)
+            layout.addWidget(self.table, 1)
+            layout.addLayout(buttons)
+
+        def refresh(self) -> None:
+            self.table.setRowCount(0 if self.project is None else len(self.project.characters))
+            if self.project is None:
+                return
+            for row, (key, name, style) in enumerate(self.project.character_rows()):
+                self.table.setItem(row, 0, QTableWidgetItem(key))
+                self.table.setItem(row, 1, QTableWidgetItem(name))
+                item = QTableWidgetItem(self._style_text(style))
+                css = _style_css(style)
+                if css:
+                    colour = re.search(r"color:(#[0-9a-fA-F]{6})", css)
+                    if colour:
+                        item.setForeground(QColor(colour.group(1)))
+                self.table.setItem(row, 2, item)
+            self.table.resizeColumnsToContents()
+
+        @staticmethod
+        def _style_text(style: str) -> str:
+            if not style:
+                return "（默认）"
+            match = re.search(r"\[([0-9;]*)m", str(style).replace("\x1b", r"\033"))
+            return r"\033[%sm" % match.group(1) if match else str(style)
+
+        def _selected_key(self) -> Optional[str]:
+            rows = self.table.selectionModel().selectedRows()
+            return self.table.item(rows[0].row(), 0).text() if rows else None
+
+        def add_character(self) -> None:
+            if not self.studio.require_project():
+                return
+            dialog = CharacterDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            key, name, style = dialog.values()
+            self.studio.run(lambda: self.project.set_character(key, name, style), "已添加角色 %s" % key)
+
+        def edit_character(self) -> None:
+            if not self.studio.require_project():
+                return
+            key = self._selected_key()
+            if key is None:
+                QMessageBox.information(self, "角色", "请先选择一个角色")
+                return
+            current = self.project.characters[key]
+            dialog = CharacterDialog(self, key, current.name, current.style)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_key, name, style = dialog.values()
+            def apply():
+                if new_key != key:
+                    self.project.remove_character(key)
+                    self._rename_in_scripts(key, new_key)
+                self.project.set_character(new_key, name, style)
+            self.studio.run(apply, "已更新角色 %s" % new_key)
+
+        def _rename_in_scripts(self, old: str, new: str) -> None:
+            for filename, script in self.project.scripts.items():
+                lines = []
+                changed = False
+                for item in script.lines:
+                    if isinstance(item, Dialogue) and item.character == old:
+                        lines.append(Dialogue(new, item.text, list(item.delays)))
+                        changed = True
+                    else:
+                        lines.append(item)
+                if changed:
+                    self.project.set_script(filename, Script(lines))
+
+        def remove_character(self) -> None:
+            if not self.studio.require_project():
+                return
+            key = self._selected_key()
+            if key is None:
+                QMessageBox.information(self, "角色", "请先选择一个角色")
+                return
+            used = [
+                filename
+                for filename, script in self.project.scripts.items()
+                if key in studio.script_characters(script)
+            ]
+            if used:
+                QMessageBox.warning(
+                    self, "角色", "还有剧本在用这个角色：%s" % "、".join(used)
+                )
+                return
+            self.studio.run(lambda: self.project.remove_character(key), "已删除角色 %s" % key)
+
+    class StoryStep(Step):
+        title = "② 剧情"
+
+        def _build(self) -> None:
+            self.script_combo = QComboBox()
+            self.script_combo.currentIndexChanged.connect(lambda _i: self._reload_events())
+
+            new_script = QPushButton("新建剧本")
+            new_script.clicked.connect(self.new_script)
+            rename_script = QPushButton("重命名")
+            rename_script.clicked.connect(self.rename_script)
+            delete_script = QPushButton("删除剧本")
+            delete_script.clicked.connect(self.delete_script)
+
+            top = QHBoxLayout()
+            top.addWidget(QLabel("剧本"))
+            top.addWidget(self.script_combo, 1)
+            top.addWidget(new_script)
+            top.addWidget(rename_script)
+            top.addWidget(delete_script)
+
+            self.table = QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "内容"])
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.itemDoubleClicked.connect(lambda _item: self.edit_event())
+            self.table.itemSelectionChanged.connect(self._update_buttons)
+
+            self.actions = [
+                ("添加对白", self.add_dialogue),
+                ("添加旁白", self.add_narration),
+                ("添加暂停", self.add_sleep),
+                ("清空屏幕", self.add_clear),
+                ("插入音乐", self.add_music),
+                ("编辑", self.edit_event),
+                ("上移", lambda: self.move(-1)),
+                ("下移", lambda: self.move(1)),
+                ("删除", self.delete_event),
+            ]
+            self.action_buttons: Dict[str, QPushButton] = {}
+            buttons = QHBoxLayout()
+            for label, slot in self.actions:
+                button = QPushButton(label)
+                button.clicked.connect(lambda _checked=False, s=slot: s())
+                self.action_buttons[label] = button
+                buttons.addWidget(button)
+            buttons.addStretch(1)
+
+            self.hint = QLabel("双击一行即可编辑；所有内容都用对话框填写，不用手写脚本格式。")
+            self.hint.setStyleSheet("color:#777;")
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(top)
+            layout.addWidget(self.hint)
+            layout.addWidget(self.table, 1)
+            layout.addLayout(buttons)
+
+        # -- script selection ------------------------------------------
+        def refresh(self) -> None:
+            names = [] if self.project is None else list(self.project.scripts)
+            current = self.script_combo.currentText()
+            self.script_combo.blockSignals(True)
+            self.script_combo.clear()
+            self.script_combo.addItems(names)
+            if current in names:
+                self.script_combo.setCurrentText(current)
+            self.script_combo.blockSignals(False)
+            self._reload_events()
+
+        def current_script_name(self) -> Optional[str]:
+            return self.script_combo.currentText() or None
+
+        def _reload_events(self) -> None:
+            name = self.current_script_name()
+            if self.project is None or not name:
+                self.table.setRowCount(0)
+                self._update_buttons()
+                return
+            script = self.project.script(name)
+            self.table.setRowCount(len(script.lines))
+            for row, event in enumerate(script.lines):
+                values = [
+                    str(row + 1),
+                    event_label(event),
+                    getattr(event, "character", "") or "",
+                    describe_event(event),
+                ]
+                for column, value in enumerate(values):
+                    self.table.setItem(row, column, QTableWidgetItem(value))
+            self.table.resizeColumnsToContents()
+            self._update_buttons()
+
+        def _selected_row(self) -> Optional[int]:
+            rows = self.table.selectionModel().selectedRows()
+            return rows[0].row() if rows else None
+
+        def _update_buttons(self) -> None:
+            has_script = self.project is not None and self.current_script_name() is not None
+            has_row = has_script and self._selected_row() is not None
+            for label in ("编辑", "上移", "下移", "删除"):
+                self.action_buttons[label].setEnabled(bool(has_row))
+            for label in ("添加对白", "添加旁白", "添加暂停", "清空屏幕", "插入音乐"):
+                self.action_buttons[label].setEnabled(bool(has_script))
+
+        def _selected_event(self):
+            name = self.current_script_name()
+            row = self._selected_row()
+            if name is None or row is None:
+                return None, None
+            return name, self.project.script(name).lines[row]
+
+        # -- script actions --------------------------------------------
+        def new_script(self) -> None:
+            if not self.studio.require_project():
+                return
+            suggestion = next_script_name(self.project.scripts)
+            name, ok = QInputDialog.getText(self, "新建剧本", "剧本名", text=suggestion)
+            if not ok:
+                return
+            created = self.studio.run(lambda: self.project.new_script(name), "已新建 %s")
+            if created:
+                self.refresh()
+                self.script_combo.setCurrentText(created)
+
+        def rename_script(self) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            if name is None:
+                return
+            new_name, ok = QInputDialog.getText(self, "重命名剧本", "新名字", text=name)
+            if not ok:
+                return
+            self.studio.run(lambda: self.project.rename_script(name, new_name), "已重命名")
+            self.refresh()
+
+        def delete_script(self) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            if name is None:
+                return
+            if QMessageBox.question(self, "删除剧本", "删除 %s？" % name) != QMessageBox.StandardButton.Yes:
+                return
+            self.studio.run(lambda: self.project.delete_script(name), "已删除 %s" % name)
+            self.refresh()
+
+        # -- event actions ---------------------------------------------
+        def _add(self, event) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            if name is None:
+                QMessageBox.information(self, "剧情", "请先新建或选择一个剧本")
+                return
+            row = self._selected_row()
+            index = None if row is None else row + 1
+            self.studio.run(lambda: self.project.add_event(name, event, index))
+            self._reload_events()
+
+        def add_dialogue(self) -> None:
+            if not self.studio.require_project():
+                return
+            if not self.project.characters:
+                QMessageBox.information(self, "剧情", "先到「① 角色」添加至少一个角色")
+                return
+            dialog = DialogueDialog(self, self.studio, None, narrator=False)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._add(dialog.values())
+
+        def add_narration(self) -> None:
+            dialog = DialogueDialog(self, self.studio, None, narrator=True)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._add(dialog.values())
+
+        def add_sleep(self) -> None:
+            dialog = SleepDialog(self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._add(Directive("s", dialog.value()))
+
+        def add_clear(self) -> None:
+            self._add(Directive("c"))
+
+        def add_music(self) -> None:
+            if not self.studio.require_project():
+                return
+            dialog = MusicDialog(self, self.studio)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if dialog.new_track is not None:
+                self.studio.run(
+                    lambda: self.project.add_music([dialog.new_track]),
+                    "已插入音乐 %s" % dialog.new_track.abbreviation,
+                )
+            self._add(Directive("p", dialog.value()))
+
+        def edit_event(self) -> None:
+            if not self.studio.require_project():
+                return
+            name, event = self._selected_event()
+            if name is None or event is None:
+                QMessageBox.information(self, "剧情", "请先选择一行")
+                return
+            row = self._selected_row()
+            kind = event_kind(event)
+            if kind in {DIALOGUE, NARRATION}:
+                dialog = DialogueDialog(self, self.studio, event, narrator=kind == NARRATION)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                replacement = dialog.values()
+            elif kind == SLEEP:
+                dialog = SleepDialog(self, event.value)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                replacement = Directive("s", dialog.value())
+            elif kind == MUSIC:
+                dialog = MusicDialog(self, self.studio, event.value)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                if dialog.new_track is not None:
+                    self.studio.run(
+                        lambda: self.project.add_music([dialog.new_track]),
+                        "已插入音乐 %s" % dialog.new_track.abbreviation,
+                    )
+                replacement = Directive("p", dialog.value())
+            else:
+                QMessageBox.information(self, "剧情", "清空屏幕没有可编辑的参数")
+                return
+            self.studio.run(lambda: self.project.replace_event(name, row, replacement))
+            self._reload_events()
+
+        def move(self, delta: int) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            row = self._selected_row()
+            if name is None or row is None:
+                return
+            target = self.studio.run(lambda: self.project.move_event(name, row, delta))
+            self._reload_events()
+            if isinstance(target, int):
+                self.table.selectRow(target)
+
+        def delete_event(self) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            row = self._selected_row()
+            if name is None or row is None:
+                return
+            self.studio.run(lambda: self.project.delete_event(name, row))
+            self._reload_events()
+
+    class TimingStep(Step):
+        title = "③ 计时"
+
+        def _build(self) -> None:
+            self.script_combo = QComboBox()
+            self.script_combo.currentIndexChanged.connect(lambda _i: self._reload_events())
+
+            self.mode = QComboBox()
+            self.mode.addItem("逐句模式（句间停顿不计入）", TimingMode.PER_SENTENCE)
+            self.mode.addItem("连续模式（句间停顿计入下一句）", TimingMode.CONTINUOUS)
+
+            self.key_edit = QLineEdit("Enter")
+            self.key_edit.setMaximumWidth(110)
+
+            self.start_button = QPushButton("开始 / 重新计时")
+            self.start_button.clicked.connect(self.start_timing)
+            self.selected_button = QPushButton("只录选中句")
+            self.selected_button.clicked.connect(self.start_selected)
+
+            top = QHBoxLayout()
+            top.addWidget(QLabel("剧本"))
+            top.addWidget(self.script_combo, 1)
+            top.addWidget(self.mode)
+            top.addWidget(QLabel("计时键"))
+            top.addWidget(self.key_edit)
+            top.addWidget(self.start_button)
+            top.addWidget(self.selected_button)
+
+            self.table = QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "进度"])
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+
+            self.panel = QTextEdit()
+            self.panel.setReadOnly(True)
+            self.panel.setStyleSheet(
+                "QTextEdit { background:#111; color:#eee; padding:14px; font-size:17px; }"
+            )
+            self.panel.setPlaceholderText("按计时键时这一句会逐字出现，当前字会被高亮")
+
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            left = QWidget()
+            left_layout = QVBoxLayout(left)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.addWidget(self.table)
+            splitter.addWidget(left)
+            splitter.addWidget(self.panel)
+            splitter.setSizes([520, 560])
+
+            self.status = QLabel(
+                "选择一个剧本后点「开始 / 重新计时」；第一次按键才是计时起点。"
+            )
+            self.status.setStyleSheet("color:#777;")
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(top)
+            layout.addWidget(splitter, 1)
+            layout.addWidget(self.status)
+
+            self.model: Optional[KeyboardTimingModel] = None
+            self._wait_until = 0.0
+            self._music: Optional[MusicPlayer] = None
+            self._music_broken = False
+
+        # -- helpers ---------------------------------------------------
+        def current_script_name(self) -> Optional[str]:
+            return self.script_combo.currentText() or None
+
+        def refresh(self) -> None:
+            names = [] if self.project is None else list(self.project.scripts)
+            current = self.script_combo.currentText()
+            self.script_combo.blockSignals(True)
+            self.script_combo.clear()
+            self.script_combo.addItems(names)
+            if current in names:
+                self.script_combo.setCurrentText(current)
+            self.script_combo.blockSignals(False)
+            self.model = None
+            self._reload_events()
+
+        def _reload_events(self) -> None:
+            name = self.current_script_name()
+            if self.project is None or not name:
+                self.table.setRowCount(0)
+                return
+            script = self.project.script(name)
+            self.table.setRowCount(len(script.lines))
+            for row, event in enumerate(script.lines):
+                if isinstance(event, Dialogue):
+                    needed = studio.timed_slots(event)
+                    done = needed if len(event.delays) == visible_text_length(event.text) else 0
+                    values = [
+                        str(row + 1), event_label(event), event.character or "旁白",
+                        "%d/%d" % (done, needed),
+                    ]
+                else:
+                    values = [str(row + 1), event_label(event), "", "—"]
+                for column, value in enumerate(values):
+                    self.table.setItem(row, column, QTableWidgetItem(value))
+            self.table.resizeColumnsToContents()
+
+        def _selected_row(self) -> Optional[int]:
+            rows = self.table.selectionModel().selectedRows()
+            return rows[0].row() if rows else None
+
+        def _configured_keys(self):
+            value = self.key_edit.text().strip()
+            if not value:
+                return {"Enter", "Return", "\r", "\n", "Space", " "}
+            lowered = value.lower()
+            if lowered in {"enter", "return"}:
+                return {"Enter", "Return", "\r", "\n"}
+            if lowered in {"space", "空格"}:
+                return {"Space", " "}
+            return {value, value.lower()}
+
+        def _player(self) -> Optional[MusicPlayer]:
+            if self._music is None and not self._music_broken:
+                try:
+                    self._music = MusicPlayer()
+                except RuntimeError as exc:
+                    self._music_broken = True
+                    self.status.setText("音乐不可用：%s" % exc)
+            return self._music
+
+        def _apply_music(self, value: str) -> str:
+            key = value.strip()
+            player = self._player()
+            if key.lower() in STOP_WORDS:
+                if player is not None:
+                    player.stop()
+                return "音乐已停止"
+            if player is None:
+                return "音乐不可用"
+            try:
+                path = self.project.audio_path(key)
+                reloaded = player.ensure(str(path))
+            except (OSError, RuntimeError, StudioError) as exc:
+                return "无法播放 %s：%s" % (key, exc)
+            return "播放 %s（从头）" % key if reloaded else "续播 %s" % key
+
+        def _begin_wait(self, value: str) -> str:
+            try:
+                seconds = max(0.0, float(str(value).strip()))
+            except ValueError:
+                seconds = 0.0
+            self._wait_until = time.monotonic() + seconds
+            delay = int(seconds * 1000)
+            if delay > 0:
+                QTimer.singleShot(delay, self._wait_finished)
+            return "暂停 %.2f 秒（暂停期间按键不计时）" % seconds
+
+        def _wait_finished(self) -> None:
+            self._wait_until = 0.0
+
+        # -- recording -------------------------------------------------
+        def _start(self, targets, message: str) -> None:
+            if not self.studio.require_project():
+                return
+            name = self.current_script_name()
+            if name is None:
+                QMessageBox.information(self, "计时", "请先新建或选择一个剧本")
+                return
+            script = self.project.script(name)
+            last: List[object] = []
+
+            def reached(index, event):
+                if isinstance(event, Directive):
+                    if event.command == "p":
+                        note = self._apply_music(event.value)
+                    elif event.command == "s":
+                        note = self._begin_wait(event.value)
+                    else:
+                        note = "已清空屏幕"
+                    self.status.setText("事件 %d：%s" % (index + 1, note))
+                else:
+                    last.append(event)
+                    self._show_dialogue(event)
+                self._reload_events()
+
+            self.model = KeyboardTimingModel(
+                script,
+                self.mode.currentData(),
+                accepted_keys=self._configured_keys(),
+                event_callback=reached,
+                targets=targets,
+            )
+            self.model.arm()
+            self._reload_events()
+            self.status.setText(message)
+
+        def start_timing(self) -> None:
+            self._start(
+                None,
+                "全程计时：按 %s 记录当前字；第一次按键即计时起点" % self.key_edit.text(),
+            )
+
+        def start_selected(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                QMessageBox.information(self, "计时", "请先在右边选择一行动白")
+                return
+            name = self.current_script_name()
+            if name is None:
+                return
+            if not isinstance(self.project.script(name).lines[row], Dialogue):
+                QMessageBox.information(self, "计时", "只能重新录制对白或旁白")
+                return
+            self._start([row], "单句录制第 %d 行：其余句保留已有时间" % (row + 1))
+
+        def _show_dialogue(self, event: Dialogue) -> None:
+            """Show the line at the moment recording reaches it."""
+
+            self._render_progress(event, None)
+
+        def _dialogue_at(self, index: Optional[int]) -> Optional[Dialogue]:
+            """The dialogue at a script line index, when there is one."""
+
+            name = self.current_script_name()
+            if self.project is None or name is None or index is None:
+                return None
+            lines = self.project.script(name).lines
+            if not 0 <= index < len(lines):
+                return None
+            event = lines[index]
+            return event if isinstance(event, Dialogue) else None
+
+        def handle_key(self, key_name: str) -> bool:
+            if self.model is None:
+                return False
+            if time.monotonic() < self._wait_until:
+                self.status.setText("暂停中…")
+                return True
+            if not self.model.handle_key(key_name):
+                return False
+            index = self.model.current_event_index
+            event = self._dialogue_at(index)
+            if event is not None:
+                self._render_progress(event, self.model.current_character_index)
+            self._reload_events()
+            if self.model.complete:
+                self._commit()
+            return True
+
+        def _render_progress(self, event: Dialogue, cursor: Optional[int]) -> None:
+            width = max(
+                (len(value.name) for value in self.project.characters.values()), default=0
+            )
+            if event.character is None:
+                prefix = "&nbsp;" * (width + 4)
+            else:
+                character = self.project.characters.get(event.character)
+                name = character.name if character else event.character
+                css = _style_css(character.style if character else "")
+                shown = (
+                    "<span style='%s'>%s</span>" % (css, html.escape(name))
+                    if css
+                    else html.escape(name)
+                )
+                prefix = "%s%s : " % ("&nbsp;" * max(0, width - len(name)), shown)
+            self.panel.setHtml(
+                "<div style='line-height:1.9'>%s%s</div>"
+                % (prefix, _styled_html(event.text, cursor))
+            )
+
+        def _commit(self) -> None:
+            name = self.current_script_name()
+            if name is None or self.model is None:
+                return
+            previous = self.project.script(name)
+            targets = set(self.model.targets)
+            result = self.model.result()
+
+            # The timing model fills untouched sentences with zeros so the result
+            # is serialisable.  Put back the "no timing yet" state for sentences
+            # this run did not record, otherwise the export check would report
+            # them as done.
+            lines = []
+            for index, item in enumerate(result.lines):
+                original = previous.lines[index] if index < len(previous.lines) else None
+                if (
+                    isinstance(item, Dialogue)
+                    and isinstance(original, Dialogue)
+                    and index not in targets
+                    and not original.delays
+                ):
+                    lines.append(Dialogue(item.character, item.text, []))
+                else:
+                    lines.append(item)
+
+            self.project.set_script(name, Script(lines))
+            self.studio.mark_dirty()
+            self._reload_events()
+            summary = self.project.summary()
+            self.status.setText(
+                "本句已记录：全剧 %d/%d 个字有计时%s"
+                % (
+                    summary["timed"],
+                    summary["timed_total"],
+                    "" if not summary["untimed_scripts"]
+                    else "；还没录完：" + "、".join(summary["untimed_scripts"]),
+                )
+            )
+
+    class LyricsStep(Step):
+        title = "④ 歌词"
+
+        def _build(self) -> None:
+            self.table = QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["简称", "类型", "文件", "颜色"])
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.itemSelectionChanged.connect(self._load_selected)
+
+            add_button = QPushButton("插入音乐…")
+            add_button.clicked.connect(self.add_music)
+            remove_button = QPushButton("删除曲目")
+            remove_button.clicked.connect(self.remove_music)
+
+            left_buttons = QHBoxLayout()
+            left_buttons.addWidget(add_button)
+            left_buttons.addWidget(remove_button)
+            left_buttons.addStretch(1)
+
+            left = QWidget()
+            left_layout = QVBoxLayout(left)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.addWidget(self.table)
+            left_layout.addLayout(left_buttons)
+
+            self.kind_instrumental = QRadioButton("纯音乐")
+            self.kind_lyrics = QRadioButton("带歌词")
+            kind_row = QHBoxLayout()
+            kind_row.addWidget(self.kind_instrumental)
+            kind_row.addWidget(self.kind_lyrics)
+            kind_row.addStretch(1)
+
+            self.lyrics_edit = QPlainTextEdit()
+            self.lyrics_edit.setPlaceholderText("[00:01.00]第一句\n[00:04.50]Second line")
+            self.lyrics_edit.setMinimumHeight(240)
+
+            import_button = QPushButton("从 .lrc 导入")
+            import_button.clicked.connect(self.import_lrc)
+            record_button = QPushButton("录制每句时间…")
+            record_button.clicked.connect(self.record_from_text)
+            colour_button = QPushButton("歌词颜色…")
+            colour_button.clicked.connect(self.pick_colour)
+            self.colour_swatch = QLabel("　")
+            self.colour_swatch.setFixedWidth(28)
+            self.colour_swatch.setStyleSheet("border:1px solid #555;")
+
+            tools = QHBoxLayout()
+            tools.addWidget(import_button)
+            tools.addWidget(record_button)
+            tools.addWidget(QLabel("颜色"))
+            tools.addWidget(self.colour_swatch)
+            tools.addWidget(colour_button)
+            tools.addStretch(1)
+
+            apply_button = QPushButton("保存到剧情包")
+            apply_button.clicked.connect(self.apply_lyrics)
+
+            right = QWidget()
+            right_layout = QVBoxLayout(right)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.addLayout(kind_row)
+            right_layout.addWidget(QLabel("歌词（LRC，一行一句）"))
+            right_layout.addWidget(self.lyrics_edit, 1)
+            right_layout.addLayout(tools)
+            right_layout.addWidget(apply_button)
+
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            splitter.addWidget(left)
+            splitter.addWidget(right)
+            splitter.setSizes([430, 650])
+
+            self.hint = QLabel(
+                "带歌词的曲目在播放时会弹出歌词窗；汉字用宋体，英文用 Times New Roman 斜体。"
+            )
+            self.hint.setStyleSheet("color:#777;")
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(self.hint)
+            layout.addWidget(splitter, 1)
+
+            self._colour = LYRIC_COLOR_DEFAULT
+
+        def refresh(self) -> None:
+            tracks = [] if self.project is None else sorted(self.project.tracks)
+            current = self._selected_abbreviation()
+            self.table.setRowCount(len(tracks))
+            for row, key in enumerate(tracks):
+                track = self.project.tracks[key]
+                values = [
+                    key,
+                    "带歌词" if track.has_lyrics else "纯音乐",
+                    track.lyrics or track.filename,
+                    track.color or "—",
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 3 and track.color:
+                        item.setForeground(QColor(track.color))
+                    self.table.setItem(row, column, item)
+            self.table.resizeColumnsToContents()
+            if current in tracks:
+                self.table.selectRow(tracks.index(current))
+
+        def _selected_abbreviation(self) -> Optional[str]:
+            rows = self.table.selectionModel().selectedRows()
+            if not rows:
+                return None
+            item = self.table.item(rows[0].row(), 0)
+            return item.text() if item else None
+
+        def _load_selected(self) -> None:
+            key = self._selected_abbreviation()
+            if self.project is None or key is None or key not in self.project.tracks:
+                return
+            track = self.project.tracks[key]
+            self.kind_lyrics.setChecked(track.has_lyrics)
+            self.kind_instrumental.setChecked(not track.has_lyrics)
+            self.lyrics_edit.setPlainText(self.project.lyrics_text(key))
+            self._colour = track.color or LYRIC_COLOR_DEFAULT
+            self._paint_swatch()
+
+        def _paint_swatch(self) -> None:
+            self.colour_swatch.setStyleSheet(
+                "background:%s; border:1px solid #555;" % self._colour
+            )
+
+        def add_music(self) -> None:
+            if not self.studio.require_project():
+                return
+            draft = collect_new_track(self, self.studio)
+            if draft is None:
+                return
+            self.studio.run(
+                lambda: self.project.add_music([draft]), "已插入 %s" % draft.abbreviation
+            )
+            self.refresh()
+
+        def remove_music(self) -> None:
+            key = self._selected_abbreviation()
+            if key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            if QMessageBox.question(self, "删除曲目", "删除 %s？" % key) != QMessageBox.StandardButton.Yes:
+                return
+            self.studio.run(lambda: self.project.remove_music(key), "已删除 %s" % key)
+            self.refresh()
+
+        def import_lrc(self) -> None:
+            key = self._selected_abbreviation()
+            if key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "导入 LRC", "", "LRC 歌词 (*.lrc);;所有文件 (*)"
+            )
+            if not filename:
+                return
+            try:
+                self.lyrics_edit.setPlainText(Path(filename).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError) as exc:
+                QMessageBox.critical(self, "歌词", "无法读取：%s" % exc)
+                return
+            self.kind_lyrics.setChecked(True)
+
+        def record_from_text(self) -> None:
+            """Turn the plain lines in the box into LRC by playing the track."""
+
+            key = self._selected_abbreviation()
+            if self.project is None or key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            lines = lyric_source_lines(self.lyrics_edit.toPlainText())
+            if not lines:
+                QMessageBox.information(self, "歌词", "先在下面写好歌词句子")
+                return
+            try:
+                audio = self.project.audio_path(key)
+            except StudioError as exc:
+                QMessageBox.critical(self, "歌词", str(exc))
+                return
+            recorded = LyricsRecorderDialog.record(self, audio, lines)
+            if recorded is None:
+                return
+            if not recorded.lines:
+                recorded = timed_from_marks(lines, [0.0] * len(lines))
+            self.lyrics_edit.setPlainText(serialize_lrc(recorded))
+            self.kind_lyrics.setChecked(True)
+
+        def pick_colour(self) -> None:
+            colour = QColorDialog.getColor(QColor(self._colour), self, "歌词颜色")
+            if colour.isValid():
+                self._colour = colour.name()
+                self._paint_swatch()
+
+        def apply_lyrics(self) -> None:
+            key = self._selected_abbreviation()
+            if key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            kind = "lyrics" if self.kind_lyrics.isChecked() else "instrumental"
+            text = self.lyrics_edit.toPlainText().strip()
+            if kind == "lyrics" and not text:
+                QMessageBox.warning(self, "歌词", "选择「带歌词」时要填歌词内容")
+                return
+            self.studio.run(
+                lambda: self.project.update_music(
+                    key,
+                    kind=kind,
+                    lyrics_text=text if kind == "lyrics" else None,
+                    lyrics_name="%s.lrc" % key,
+                    color=self._colour,
+                ),
+                "已更新 %s" % key,
+            )
+            self.refresh()
+
+    class ExportStep(Step):
+        title = "⑤ 导出"
+
+        def _build(self) -> None:
+            self.summary = QLabel()
+            self.summary.setWordWrap(True)
+
+            save_button = QPushButton("保存到剧情包")
+            save_button.clicked.connect(self.studio.save)
+            export_button = QPushButton("另存为 .tscpkg…")
+            export_button.clicked.connect(self.studio.export_as)
+            play_button = QPushButton("试播")
+            play_button.clicked.connect(self.studio.preview_play)
+            folder_button = QPushButton("打开所在文件夹")
+            folder_button.clicked.connect(self.open_folder)
+
+            buttons = QHBoxLayout()
+            for button in (save_button, export_button, play_button, folder_button):
+                buttons.addWidget(button)
+            buttons.addStretch(1)
+
+            self.issues = QLabel()
+            self.issues.setWordWrap(True)
+            self.issues.setStyleSheet("color:#cc9;")
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(QLabel("检查"))
+            layout.addWidget(self.summary)
+            layout.addWidget(self.issues)
+            layout.addStretch(1)
+            layout.addLayout(buttons)
+
+        def refresh(self) -> None:
+            if self.project is None:
+                self.summary.setText("还没有打开剧情包。")
+                self.issues.setText("")
+                return
+            data = self.project.summary()
+            lines = [
+                "剧情包：%s" % self.project.path,
+                "名称：%s        %s" % (self.project.name, self.project.description or "（没有简介）"),
+                "角色：%d 个" % data["characters"],
+                "剧本：%d 个" % data["scripts"],
+                "音乐：%d 首（其中带歌词 %d 首）" % (data["tracks"], len(data["lyrics_tracks"])),
+                "逐字计时：%d / %d" % (data["timed"], data["timed_total"]),
+            ]
+            self.summary.setText("\n".join(lines))
+
+            problems: List[str] = []
+            if data["missing_characters"]:
+                problems.append(
+                    "剧本用到了还没定义的角色：" + "、".join(data["missing_characters"])
+                )
+            if data["untimed_scripts"]:
+                problems.append("还没录完逐字时间的剧本：" + "、".join(data["untimed_scripts"]))
+            if not data["scripts"]:
+                problems.append("还没有任何剧本")
+            if not data["dirty"] and self.project.path.is_file():
+                problems.append("所有改动都已经写进剧情包了")
+            self.issues.setText("\n".join(problems))
+
+        def open_folder(self) -> None:
+            if self.project is None:
+                return
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.path.parent)))
+
+    # ----------------------------------------------------------------------
+    # the window
+    # ----------------------------------------------------------------------
+
+    class StudioWindow(QMainWindow):
+        """One window, five steps, no hand-edited files."""
+
+        def __init__(self, path: Optional[Path] = None) -> None:
+            super().__init__()
+            self.project: Optional[StudioProject] = None
+            self._player = None
+            self.setWindowTitle("剧情工坊")
+            self.resize(1240, 820)
+            self._build_ui()
+            QApplication.instance().installEventFilter(self)
+            if path:
+                self.open_path(path)
+            else:
+                self._update_title()
+
+        def _build_ui(self) -> None:
+            new_button = QPushButton("新建剧情包")
+            new_button.clicked.connect(self.new_project)
+            open_button = QPushButton("打开 .tscpkg")
+            open_button.clicked.connect(self.open_project)
+            self.save_button = QPushButton("保存")
+            self.save_button.clicked.connect(self.save)
+            export_button = QPushButton("另存为 .tscpkg")
+            export_button.clicked.connect(self.export_as)
+            play_button = QPushButton("试播")
+            play_button.clicked.connect(self.preview_play)
+
+            toolbar = QHBoxLayout()
+            for button in (new_button, open_button, self.save_button, export_button, play_button):
+                toolbar.addWidget(button)
+            toolbar.addStretch(1)
+
+            self.name_edit = QLineEdit()
+            self.name_edit.setPlaceholderText("剧情名称")
+            self.description_edit = QLineEdit()
+            self.description_edit.setPlaceholderText("简介（会显示在播放器的介绍页）")
+            apply_button = QPushButton("应用信息")
+            apply_button.clicked.connect(self.apply_metadata)
+            header = QHBoxLayout()
+            header.addWidget(QLabel("名称"))
+            header.addWidget(self.name_edit, 1)
+            header.addWidget(QLabel("简介"))
+            header.addWidget(self.description_edit, 2)
+            header.addWidget(apply_button)
+
+            self.step_list = QListWidget()
+            self.step_list.setMaximumWidth(150)
+            self.stack = QStackedWidget()
+
+            self.steps = [
+                CharactersStep(self),
+                StoryStep(self),
+                TimingStep(self),
+                LyricsStep(self),
+                ExportStep(self),
+            ]
+            self.timing: TimingStep = self.steps[2]
+            for step in self.steps:
+                self.step_list.addItem(step.title)
+                self.stack.addWidget(step)
+            self.step_list.currentRowChanged.connect(self._step_changed)
+
+            body = QHBoxLayout()
+            body.addWidget(self.step_list)
+            body.addWidget(self.stack, 1)
+
+            self.status = QLabel()
+            self.status.setStyleSheet("color:#888;")
+
+            layout = QVBoxLayout()
+            layout.addLayout(toolbar)
+            layout.addLayout(header)
+            layout.addLayout(body, 1)
+            layout.addWidget(self.status)
+
+            central = QWidget()
+            central.setLayout(layout)
+            self.setCentralWidget(central)
+
+            self.step_list.setCurrentRow(0)
+
+        # -- project plumbing ------------------------------------------
+        def _step_changed(self, row: int) -> None:
+            if 0 <= row < len(self.steps):
+                self.steps[row].refresh()
+
+        def _update_title(self) -> None:
+            if self.project is None:
+                self.setWindowTitle("剧情工坊")
+                return
+            mark = "*" if self.project.dirty else ""
+            self.setWindowTitle("剧情工坊 - %s%s" % (self.project.name, mark))
+            self.name_edit.setText(self.project.name)
+            self.description_edit.setText(self.project.description)
+            self.save_button.setEnabled(True)
+
+        def _refresh_all(self) -> None:
+            self._update_title()
+            for step in self.steps:
+                step.refresh()
+
+        def require_project(self) -> bool:
+            if self.project is None:
+                QMessageBox.information(self, "剧情工坊", "请先新建或打开一个剧情包")
+                return False
+            return True
+
+        def run(self, action, success: str = ""):
+            """Run one project operation, reporting failures instead of crashing."""
+
+            try:
+                result = action()
+            except (StudioError, PackError, OSError, ValueError) as exc:
+                QMessageBox.warning(self, "剧情工坊", str(exc))
+                self.status.setText("失败：%s" % exc)
+                return None
+            if success:
+                self.status.setText(success)
+            self._refresh_all()
+            return result
+
+        def mark_dirty(self) -> None:
+            if self.project is not None:
+                self.project.dirty = True
+                self._update_title()
+
+        # -- file actions ----------------------------------------------
+        def new_project(self) -> None:
+            if not self._confirm_discard():
+                return
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "选择新剧情包的位置", "新剧情.tscpkg", "TSCP 剧情包 (*.tscpkg)"
+            )
+            if not filename:
+                return
+            target = Path(filename)
+            if target.suffix.lower() != ".tscpkg":
+                target = target.with_suffix(".tscpkg")
+            name, ok = QInputDialog.getText(self, "新建剧情包", "剧情名称", text=target.stem)
+            if not ok or not name.strip():
+                return
+            description, ok = QInputDialog.getText(self, "新建剧情包", "简介（可留空）")
+            if not ok:
+                return
+            try:
+                self.project = StudioProject.create(
+                    target, name=name.strip(), description=description.strip()
+                )
+            except StudioError as exc:
+                QMessageBox.critical(self, "剧情工坊", str(exc))
+                return
+            self.step_list.setCurrentRow(0)
+            self._refresh_all()
+            self.status.setText("已创建 %s，从「① 角色」开始" % target.name)
+
+        def open_project(self) -> None:
+            if not self._confirm_discard():
+                return
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "打开剧情包", "", "TSCP 剧情包 (*.tscpkg);;所有文件 (*)"
+            )
+            if filename:
+                self.open_path(Path(filename))
+
+        def open_path(self, path: Path) -> None:
+            try:
+                self.project = StudioProject.load(path)
+            except StudioError as exc:
+                QMessageBox.critical(self, "剧情工坊", "无法打开：%s" % exc)
+                return
+            self._refresh_all()
+            self.status.setText("已打开 %s" % path.name)
+
+        def save(self) -> bool:
+            if not self.require_project():
+                return False
+            try:
+                self.project.save()
+            except StudioError as exc:
+                QMessageBox.critical(self, "剧情工坊", "保存失败：%s" % exc)
+                return False
+            self._refresh_all()
+            self.status.setText("已保存到 %s" % self.project.path.name)
+            return True
+
+        def export_as(self) -> None:
+            if not self.require_project():
+                return
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "另存为剧情包", self.project.path.name, "TSCP 剧情包 (*.tscpkg)"
+            )
+            if not filename:
+                return
+            if not self.save():
+                return
+            try:
+                target = self.project.export(filename)
+            except StudioError as exc:
+                QMessageBox.critical(self, "剧情工坊", "导出失败：%s" % exc)
+                return
+            self.status.setText("已导出 %s（原包继续编辑）" % target)
+
+        def apply_metadata(self) -> None:
+            if not self.require_project():
+                return
+            name = self.name_edit.text().strip()
+            if not name:
+                QMessageBox.warning(self, "剧情工坊", "剧情名称不能为空")
+                return
+            self.project.name = name
+            self.project.description = self.description_edit.text().strip()
+            self.project.dirty = True
+            self._update_title()
+            self.status.setText("信息已更新，记得保存")
+
+        def preview_play(self) -> None:
+            """Save, then open the existing player on this package."""
+
+            if not self.require_project():
+                return
+            if not self.save():
+                return
+            try:
+                import Main as player_module
+            except ImportError as exc:  # pragma: no cover
+                QMessageBox.critical(self, "剧情工坊", "无法加载播放器：%s" % exc)
+                return
+            if not getattr(player_module, "QT_AVAILABLE", False):  # pragma: no cover
+                QMessageBox.critical(self, "剧情工坊", "播放器需要 PySide6")
+                return
+            try:
+                core, problems = player_module.load_playlists(self.project.path)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                QMessageBox.critical(self, "剧情工坊", "无法试播：%s" % exc)
+                return
+            self._player = player_module.PlayerWindow(core, self.project.path, problems)
+            self._player.show()
+
+        # -- lifecycle -------------------------------------------------
+        def _confirm_discard(self) -> bool:
+            if self.project is None or not self.project.dirty:
+                return True
+            answer = QMessageBox.question(
+                self,
+                "剧情工坊",
+                "「%s」还有没保存的改动，先保存吗？" % self.project.name,
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return False
+            if answer == QMessageBox.StandardButton.Save:
+                return self.save()
+            return True
+
+        def eventFilter(self, watched, event) -> bool:
+            """Route key presses to the timing step while it is recording."""
+
+            timing = self.timing
+            if (
+                timing.model is not None
+                and event.type() == QEvent.Type.KeyPress
+                and watched is not timing.key_edit
+                and self.stack.currentWidget() is timing
+            ):
+                key_event = event
+                name = key_event.text() or ""
+                if key_event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    name = "Enter"
+                elif key_event.key() == Qt.Key.Key_Space:
+                    name = "Space"
+                if timing.handle_key(name):
+                    return True
+            return super().eventFilter(watched, event)
+
+        def closeEvent(self, event) -> None:
+            if not self._confirm_discard():
+                event.ignore()
+                return
+            QApplication.instance().removeEventFilter(self)
+            event.accept()
+
+else:  # pragma: no cover
+    StudioWindow = None  # type: ignore[assignment,misc]
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="剧情工坊：一个窗口走完全流程")
+    parser.add_argument("path", nargs="?", help="要打开的 .tscpkg")
+    args = parser.parse_args(argv)
+    if not QT_AVAILABLE:
+        raise RuntimeError("剧情工坊需要安装可选依赖 PySide6")
+    app = QApplication(sys.argv)
+    window = StudioWindow(Path(args.path) if args.path else None)
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,12 +6,19 @@
 既有 **桌面版**（PySide6 / pygame），也有 **网页版**（Flask，浏览器里编写、录音、
 打包、下载、播放）。两边产出和读取的 `.tscpkg` 完全一致，可以互相交换。
 
+桌面版现在有一个**整合入口**：`Studio`（剧情工坊）在一个窗口里走完
+**① 创建角色 → ② 编写剧情并插入音乐 → ③ 逐字计时 → ④ 歌词 → ⑤ 导出 .tscpkg**，
+全程用对话框填写，不用打开裸文本编辑器，也不用在几个工具之间倒文件。
+
 ```powershell
 python -m pip install ".[gui,web]"
+python Studio/Main.py     # 桌面整合版：一个窗口走完全流程
 python Main.py            # 桌面播放器
-python Editor/Main.py     # 桌面制作工具箱
+python Editor/Main.py     # 桌面制作工具箱（也含旧的分体工具）
 python -m webapp          # 网页版：http://0.0.0.0:8888
 ```
+
+剧情工坊的用法见 [Studio/README.md](Studio/README.md)。
 
 部署到 Ubuntu 服务器（8888 端口、gunicorn + systemd、可选 nginx 反代）：
 

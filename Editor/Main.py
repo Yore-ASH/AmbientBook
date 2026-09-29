@@ -26,11 +26,12 @@ except ImportError:  # pragma: no cover
 
 
 TOOLS = (
-    ("角色生成器", "CharacterCreator/Main.py", "创建角色缩写、名称和 ANSI 样式"),
-    ("TSCPS 剧情编写器", "TSGenerator/Main.py", "编写无逐字时间的 .tscps 文件"),
-    ("TSCP 转换器", "Ts2Tp/Main.py", "为对白逐字设计播放时间并生成 .tscp"),
-    ("TSCP 文件编辑器", "TSCPEditor/Main.py", "修改已经生成的 .tscp 文件"),
-    ("剧情素材管理器", "PlotManager/Main.py", "把音乐与 .tscp 装进单文件剧情包"),
+    ("剧情工坊（推荐）", "Studio/Main.py", "一个窗口走完：角色 → 剧情+音乐 → 计时 → 歌词 → 导出"),
+    ("角色生成器", "CharacterCreator/Main.py", "只生成角色 JSON 片段，供手工粘贴"),
+    ("TSCPS 剧情编写器", "TSGenerator/Main.py", "直接编辑 .tscps 原稿文本"),
+    ("TSCP 转换器", "Ts2Tp/Main.py", "单独做逐字计时"),
+    ("TSCP 文件编辑器", "TSCPEditor/Main.py", "直接改已编译的 .tscp"),
+    ("剧情素材管理器", "PlotManager/Main.py", "管理已有 .tscpkg 里的音乐与剧本"),
     ("剧情播放器", "Main.py", "选择并播放 source 中的剧情"),
 )
 
