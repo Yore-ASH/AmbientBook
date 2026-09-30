@@ -19,6 +19,9 @@ from tscp_player.format import (
     Dialogue,
     Directive,
     Script,
+    is_note,
+    note_parts,
+    format_note_source,
     parse_tscp,
     parse_tscps,
     serialize_tscp,
@@ -80,6 +83,9 @@ def _display_line(line: object) -> str:
 
     if isinstance(line, Dialogue):
         return ("[%s]" % line.character if line.character else "[旁白] ") + line.text
+    if is_note(line):
+        # Show the friendly spelling, not the packed colour|seconds|text form.
+        return format_note_source(line)
     return "<%s>%s" % (line.command, line.value)
 
 
@@ -521,6 +527,11 @@ if QT_AVAILABLE:
                 )
 
         def _execute_directive(self, event: Directive) -> str:
+            # A supplement is a control line too, but it neither plays music nor
+            # waits, so it must not be reported as a screen clear.
+            if is_note(event):
+                _colour, seconds, text = note_parts(event)
+                return "补充内容会显示 %g 秒：%s" % (seconds, text)
             if event.command == "p":
                 return self._apply_music(event.value)
             if event.command == "s":

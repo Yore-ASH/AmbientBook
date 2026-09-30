@@ -1380,6 +1380,62 @@ def test_a_broken_lrc_does_not_break_the_timeline(studio, tmp_path):
     assert step.timeline.lyrics.get("iw", []) == []
 
 
+def test_recording_announces_a_supplement_as_a_supplement(studio):
+    """A supplement is a Directive, but reporting it as a screen clear is a lie."""
+
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    name = window.project.new_script()
+    window.project.add_event(name, Dialogue("f", "甲"))
+    window.project.add_event(name, make_note("一句旁注", color="#ffd166", seconds=4.0))
+    window.project.add_event(name, Dialogue("f", "乙"))
+    window._refresh_all()
+
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.start_timing()
+
+    seen = []
+    guard = 0
+    while step.model is not None and not step.model.complete and guard < 40:
+        guard += 1
+        step._wait_until = 0.0          # do not really sit through anything
+        step.handle_key("Enter")
+        seen.append(step.status.text())
+
+    assert any("补充内容" in text for text in seen), seen
+    assert not any("已清空屏幕" in text for text in seen), seen
+    # The supplement came through the recording untouched.
+    assert window.project.script(name).lines[1] == make_note(
+        "一句旁注", color="#ffd166", seconds=4.0
+    )
+
+
+def test_a_real_clear_is_still_reported_as_a_clear(studio):
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    name = window.project.new_script()
+    window.project.add_event(name, Dialogue("f", "甲"))
+    window.project.add_event(name, Directive("c"))
+    window.project.add_event(name, Dialogue("f", "乙"))
+    window._refresh_all()
+
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.start_timing()
+
+    seen = []
+    guard = 0
+    while step.model is not None and not step.model.complete and guard < 40:
+        guard += 1
+        step._wait_until = 0.0
+        step.handle_key("Enter")
+        seen.append(step.status.text())
+    assert any("已清空屏幕" in text for text in seen), seen
+
+
 # --------------------------------------------------------------------------
 # script names never expose the extension
 # --------------------------------------------------------------------------

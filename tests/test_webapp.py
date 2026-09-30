@@ -769,3 +769,129 @@ def test_the_player_page_keeps_the_supplement_outside_the_stage():
 
     css = (root / "static" / "style.css").read_text(encoding="utf-8")
     assert ".supplement" in css
+
+
+#: Runs the real player.js against a fake DOM, so the aside's behaviour is
+#: exercised rather than merely grepped for.
+NODE_PLAYER_HARNESS = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+function fakeElement() {
+  const node = {
+    hidden: false, textContent: '', innerHTML: '', value: '', className: '',
+    style: {}, firstChild: null, children: [],
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    addEventListener() {}, removeEventListener() {},
+    appendChild() {}, removeChild() {}, insertBefore() {},
+    setAttribute() {}, getAttribute() { return null; },
+    pause() {}, play() { return Promise.resolve(); },
+    requestFullscreen() {},
+  };
+  return node;
+}
+
+const nodes = new Map();
+const document = {
+  addEventListener() {},
+  fullscreenElement: null,
+  exitFullscreen() {},
+  createElement() { return fakeElement(); },
+  querySelector(selector) {
+    if (!nodes.has(selector)) nodes.set(selector, fakeElement());
+    return nodes.get(selector);
+  },
+  querySelectorAll() { return []; },
+};
+
+const sandbox = {
+  console, document, window: { PLOT_ID: '' },
+  fetch: async () => { throw new Error('the harness has no network'); },
+  FormData: class {},
+  setTimeout, clearTimeout, Date, JSON, Math, Number, String, Boolean,
+  Array, Object, Error, RegExp, Map, Set, Promise, isNaN, parseInt, parseFloat,
+  atob, btoa, TextDecoder, TextEncoder, Uint8Array,
+  decodeURIComponent, encodeURIComponent,
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+
+const files = process.argv.slice(2);
+files.forEach((file, index) => {
+  let source = fs.readFileSync(file, 'utf8');
+  // The handles only exist in the last file; exposing them anywhere else would
+  // just be a ReferenceError.
+  if (index === files.length - 1) {
+    source += '\n;globalThis.__showSupplement = showSupplement;'
+      + '\n;globalThis.__paintSupplement = paintSupplement;'
+      + '\n;globalThis.__play = play;\n';
+  }
+  vm.runInContext(source, sandbox);
+});
+
+const box = sandbox.document.querySelector('#supplement');
+const report = {};
+
+sandbox.__showSupplement({ text: '一句补充', color: '#ffd166', seconds: 30 });
+report.afterShow = {
+  hidden: box.hidden, text: box.textContent, color: box.style.color,
+  tracked: !!sandbox.__play.note,
+};
+
+const deadline = sandbox.__play.note.until;
+// This is what a clear-screen does: repaint, without touching the clock.
+sandbox.__paintSupplement();
+report.afterClear = {
+  hidden: box.hidden, text: box.textContent, sameDeadline: sandbox.__play.note.until === deadline,
+};
+
+// Expire it and repaint.
+sandbox.__play.note.until = Date.now() - 1;
+sandbox.__paintSupplement();
+report.afterExpiry = {
+  hidden: box.hidden, text: box.textContent, tracked: !!sandbox.__play.note,
+};
+
+// A default colour is used when the track gives none.
+sandbox.__showSupplement({ text: '没颜色', color: '', seconds: 30 });
+report.defaultColour = box.style.color;
+
+process.stdout.write(JSON.stringify(report));
+"""
+
+
+def test_the_browser_player_keeps_the_aside_through_a_clear(tmp_path):
+    """The same rule as the desktop player, checked by running the real code."""
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+
+    harness = tmp_path / "player_harness.js"
+    harness.write_text(NODE_PLAYER_HARNESS, encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent / "webapp" / "static"
+    result = subprocess.run(
+        [node, str(harness), str(root / "app.js"), str(root / "player.js")],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+
+    shown = report["afterShow"]
+    assert shown["hidden"] is False
+    assert shown["text"] == "一句补充"
+    assert shown["color"] == "#ffd166"
+    assert shown["tracked"] is True
+
+    # The story was cleared; the aside came back with the time it had left.
+    cleared = report["afterClear"]
+    assert cleared["hidden"] is False
+    assert cleared["text"] == "一句补充"
+    assert cleared["sameDeadline"] is True
+
+    expired = report["afterExpiry"]
+    assert expired["hidden"] is True
+    assert expired["text"] == ""
+    assert expired["tracked"] is False
+
+    assert report["defaultColour"] == "#8a93a0"

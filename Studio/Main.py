@@ -52,6 +52,8 @@ from tscp_player.format import (
     Dialogue,
     Directive,
     Script,
+    is_note,
+    note_parts,
     visible_text_length,
 )
 from tscp_player.lyrics import lyric_source_lines, parse_lrc, serialize_lrc, timed_from_marks
@@ -2174,7 +2176,12 @@ if QT_AVAILABLE:
 
             def reached(index, event):
                 if isinstance(event, Directive):
-                    if event.command == "p":
+                    # A supplement is a control line, but it does not clear the
+                    # screen; saying so would be actively misleading.
+                    if is_note(event):
+                        _colour, seconds, text = note_parts(event)
+                        note = "补充内容，显示 %g 秒：%s" % (seconds, text)
+                    elif event.command == "p":
                         note = self._apply_music(event.value)
                     elif event.command == "s":
                         note = self._begin_wait(event.value)

@@ -176,3 +176,87 @@ def test_parse_script_file_detects_compiled_scripts():
     assert parse_script_file(compiled, ".tscp").lines[0].delays == pytest.approx([0.1, 0.2])
     # 原稿仍然按原稿解析，没有逐字时间。
     assert parse_script_file("[f]Hi\n", ".tscps").lines[0].delays == []
+
+
+# --------------------------------------------------------------------------
+# supplements in the timing tool
+# --------------------------------------------------------------------------
+
+def test_a_supplement_is_shown_friendly_not_packed():
+    """The panel must not leak the internal colour|seconds|text packing."""
+
+    from Ts2Tp.Main import _display_line
+    from tscp_player.format import make_note, parse_tscps
+
+    assert _display_line(make_note("只是一句补充", color="#ffd166", seconds=4.5)) == (
+        "<a>#ffd166,4.5 只是一句补充"
+    )
+    assert _display_line(make_note("没颜色", seconds=3)) == "<a>没颜色"
+    # The other controls are unchanged.
+    assert _display_line(parse_tscps("<s>1.5").lines[0]) == "<s>1.5"
+    assert _display_line(parse_tscps("<c>").lines[0]) == "<c>"
+    assert _display_line(parse_tscps("<p>night").lines[0]) == "<p>night"
+
+
+def test_a_supplement_is_reported_as_a_supplement_not_a_clear():
+    """It is a Directive, but it does not clear anything."""
+
+    from Ts2Tp.Main import ConverterWindow
+    from tscp_player.format import make_note
+
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+
+    # _execute_directive only reads state it does not have to build, so call it
+    # unbound against a stand-in rather than spinning up the whole window.
+    class StandIn:
+        _execute_directive = ConverterWindow._execute_directive
+
+        def _apply_music(self, value):        # pragma: no cover - not reached
+            return "music"
+
+        def _begin_wait(self, value):         # pragma: no cover - not reached
+            return "wait"
+
+    stand_in = StandIn()
+    assert stand_in._execute_directive(make_note("旁注", color="#ffd166", seconds=4.0)) == (
+        "补充内容会显示 4 秒：旁注"
+    )
+    assert stand_in._execute_directive(Directive("p", "iw")) == "music"
+    assert stand_in._execute_directive(Directive("s", "1")) == "wait"
+    assert stand_in._execute_directive(Directive("c")) == "已清空屏幕"
+
+
+def test_timing_keeps_supplements_and_walks_past_them():
+    """A supplement costs no time, so recording must not stop on it."""
+
+    from tscp_player.format import make_note
+
+    script = Script([
+        Dialogue("f", "甲"),
+        make_note("一句旁注", color="#ffd166", seconds=4.0),
+        Dialogue("f", "乙"),
+    ])
+    reached = []
+    model = KeyboardTimingModel(
+        script,
+        TimingMode.PER_SENTENCE,
+        clock=iter([1.0, 2.0, 3.0, 4.0]).__next__,
+        event_callback=lambda index, event: reached.append((index, type(event).__name__)),
+    )
+    model.arm()
+    while not model.complete:
+        if not model.handle_key("Enter"):
+            break
+
+    # The supplement was announced on the way past...
+    assert (1, "Directive") in reached
+    # ...and it survived into the result, unchanged.
+    result = model.result()
+    assert result.lines[1] == script.lines[1]
+    assert len(result.lines) == 3
+    # Only the two dialogues carry timing.
+    assert result.lines[0].delays and result.lines[2].delays
+    assert result.lines[1].value == script.lines[1].value
