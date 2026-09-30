@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -665,3 +666,106 @@ def test_importing_the_webapp_does_not_pull_in_qt_or_audio():
     )
     assert result.returncode == 0, result.stderr
     assert "HEAVY:\n" in result.stdout, result.stdout
+
+
+# --------------------------------------------------------------------------
+# the browser has its own parser, and it has to keep up with the format
+# --------------------------------------------------------------------------
+
+#: Loads the real ``static/app.js`` with just enough of a DOM to survive, then
+#: runs its own ``parseScript`` over a compiled file. The browser parser is the
+#: one thing in this repo that Python tests cannot reach any other way.
+NODE_HARNESS = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+const source = fs.readFileSync(process.argv[2], 'utf8')
+  + '\n;globalThis.__parseScript = parseScript;\n';
+
+const sandbox = {
+  console,
+  document: { addEventListener() {}, querySelector() { return null; } },
+  window: {},
+  fetch: async () => { throw new Error('the harness has no network'); },
+  FormData: class {},
+  setTimeout, clearTimeout, Date, JSON, Math, Number, String, Boolean,
+  Array, Object, Error, RegExp, Map, Set, Promise, isNaN, parseInt, parseFloat,
+  // Browser globals the parser leans on; a vm context does not inherit them.
+  atob, btoa, TextDecoder, TextEncoder, Uint8Array,
+  decodeURIComponent, encodeURIComponent,
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+
+const text = fs.readFileSync(process.argv[3], 'utf8');
+process.stdout.write(JSON.stringify(sandbox.__parseScript(text)));
+"""
+
+
+def _run_browser_parser(tmp_path, compiled: str):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.js"
+    harness.write_text(NODE_HARNESS, encoding="utf-8")
+    app_js = Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js"
+    script = tmp_path / "plot.tscp"
+    script.write_text(compiled, encoding="utf-8")
+    return subprocess.run(
+        [node, str(harness), str(app_js), str(script)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+
+
+def test_the_browser_parser_understands_supplements(tmp_path):
+    """The website must not choke on a plot that uses the newest event type."""
+
+    result = _run_browser_parser(
+        tmp_path,
+        "TSCP 1\n"
+        "P|night\n"
+        "D|f|5L2g5aW9|0.100000,0.200000\n"
+        "A|#ffd166|4.500000|6L+Z5piv5LiA5Y+l6KGl5YWF\n"
+        "A||3.000000|5Y+q5piv6KGl5YWF\n"
+        "C\n",
+    )
+    assert result.returncode == 0, result.stderr
+    events = json.loads(result.stdout)
+
+    assert [event["type"] for event in events] == ["p", "dialogue", "note", "note", "c"]
+    first = events[2]
+    assert first["color"] == "#ffd166"
+    assert first["seconds"] == pytest.approx(4.5)
+    assert first["text"] == "这是一句补充"
+    second = events[3]
+    assert second["color"] == ""
+    assert second["seconds"] == pytest.approx(3.0)
+    assert second["text"] == "只是补充"
+    # The dialogue came through untouched, delays and all.
+    assert events[1]["text"] == "你好"
+    assert events[1]["delays"] == [pytest.approx(0.1), pytest.approx(0.2)]
+
+
+def test_the_browser_parser_still_rejects_junk(tmp_path):
+    result = _run_browser_parser(tmp_path, "TSCP 1\nZ|whatever\n")
+    assert result.returncode != 0
+    assert "格式不对" in (result.stderr + result.stdout)
+
+
+def test_the_player_page_keeps_the_supplement_outside_the_stage():
+    root = Path(__file__).resolve().parent.parent / "webapp"
+    template = (root / "templates" / "player.html").read_text(encoding="utf-8")
+    assert 'id="supplement"' in template
+    # Outside the stage, so clearing the stage cannot take it with it.
+    assert template.index('id="stage"') < template.index('id="supplement"')
+
+    script = (root / "static" / "player.js").read_text(encoding="utf-8")
+    assert "paintSupplement" in script
+    assert "event.type === 'note'" in script
+    # A clear repaints the aside instead of dropping it.
+    after_clear = script.split("event.type === 'c'")[1][:220]
+    assert "paintSupplement();" in after_clear
+
+    css = (root / "static" / "style.css").read_text(encoding="utf-8")
+    assert ".supplement" in css

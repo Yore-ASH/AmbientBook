@@ -327,6 +327,13 @@ function parseScript(text) {
       events.push({ type: 's', seconds: Number(parts[1]) || 0 });
     } else if (kind === 'P' && parts.length === 2) {
       events.push({ type: 'p', track: parts[1] });
+    } else if (kind === 'A' && parts.length === 4) {
+      events.push({
+        type: 'note',
+        color: parts[1],
+        seconds: Number(parts[2]) || 0,
+        text: decodeBase64(parts[3]),
+      });
     } else if (kind === 'D' || kind === 'N') {
       const expected = kind === 'D' ? 4 : 3;
       if (parts.length !== expected) throw new Error('第 ' + (index + 1) + ' 行事件格式不对');

@@ -17,6 +17,8 @@ const play = {
   color: '#ffffff',
   timer: null,
   raf: null,
+  /* The aside currently on screen, and when it goes away. */
+  note: null,
 };
 
 /* ---- intro ----------------------------------------------------------- */
@@ -181,6 +183,34 @@ async function startTrack(track) {
   followLyrics();
 }
 
+function showSupplement(event) {
+  play.note = {
+    text: event.text,
+    color: event.color,
+    until: Date.now() + Math.max(0, event.seconds) * 1000,
+  };
+  paintSupplement();
+  setTimeout(() => {
+    if (play.note && Date.now() >= play.note.until) paintSupplement();
+  }, Math.max(1, event.seconds * 1000));
+}
+
+/* Draw whichever aside is current. Its clock is never restarted, so a clear in
+   the middle of one puts it back with the time it had left. */
+function paintSupplement() {
+  const box = $('#supplement');
+  const note = play.note;
+  if (!note || Date.now() >= note.until) {
+    box.hidden = true;
+    box.textContent = '';
+    play.note = null;
+    return;
+  }
+  box.textContent = note.text;
+  box.style.color = note.color || '#8a93a0';
+  box.hidden = false;
+}
+
 async function run() {
   play.events = parseScript(await (async () => {
     const name = $('#script-select').value;
@@ -190,9 +220,11 @@ async function run() {
   })());
   play.index = 0;
   play.running = true;
+  play.note = null;
   $('#intro').hidden = true;
   $('#stage-wrap').hidden = false;
   clear(stage);
+  paintSupplement();
   $('#status').textContent = '播放中';
 
   while (play.running && play.index < play.events.length) {
@@ -202,8 +234,12 @@ async function run() {
       await typeDialogue(event);
     } else if (event.type === 'c') {
       clear(stage);
+      // The aside is not story text: put it back rather than wiping it.
+      paintSupplement();
     } else if (event.type === 's') {
       await wait(event.seconds);
+    } else if (event.type === 'note') {
+      showSupplement(event);
     } else if (event.type === 'p') {
       $('#status').textContent = '播放中 · 音乐 ' + (event.track || '停止');
       await startTrack(event.track);
@@ -220,6 +256,8 @@ function stop() {
   clearTimeout(play.timer);
   audio.pause();
   hideLyrics();
+  play.note = null;
+  paintSupplement();
   $('#stage-wrap').hidden = true;
   $('#intro').hidden = false;
   $('#status').textContent = '';

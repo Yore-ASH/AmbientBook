@@ -23,6 +23,9 @@ from tscp_player.format import (
     Dialogue,
     Directive,
     Script,
+    is_note,
+    make_note,
+    note_parts,
     parse_tscp,
     parse_tscps,
     serialize_tscp,
@@ -44,6 +47,7 @@ NARRATION = "narration"
 SLEEP = "sleep"
 CLEAR = "clear"
 MUSIC = "music"
+NOTE = "note"
 
 EVENT_LABELS = {
     DIALOGUE: "角色对白",
@@ -51,6 +55,7 @@ EVENT_LABELS = {
     SLEEP: "暂停",
     CLEAR: "清空屏幕",
     MUSIC: "播放音乐",
+    NOTE: "补充内容",
 }
 
 
@@ -83,10 +88,12 @@ def normalise_script(script: Script) -> Script:
 
 
 def event_kind(event) -> str:
-    """Which of the five row kinds this event is."""
+    """Which of the six row kinds this event is."""
 
     if isinstance(event, Dialogue):
         return DIALOGUE if event.character else NARRATION
+    if is_note(event):
+        return NOTE
     return {
         "s": SLEEP,
         "c": CLEAR,
@@ -107,6 +114,9 @@ def describe_event(
 
     if isinstance(event, Dialogue):
         return event.text
+    if is_note(event):
+        _color, seconds, text = note_parts(event)
+        return "%s（%g 秒）" % (text, seconds)
     if event.command == "s":
         return "%s 秒" % event.value
     if event.command == "p":

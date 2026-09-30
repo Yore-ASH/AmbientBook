@@ -185,6 +185,21 @@ dialog.modal h3 { margin: 0 0 14px; }
 }
 .stage .speaker { font-weight: 700; }
 
+/* Supplements sit under the story and outlive a clear. */
+.supplement {
+  margin-top: -1px;
+  background: #000;
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  padding: 10px 32px;
+  min-height: 40px;
+  color: #8a93a0;
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
 .lyric-overlay {
   position: fixed;
   left: 0; right: 0;

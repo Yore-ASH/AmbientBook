@@ -8,7 +8,14 @@ import time
 from pathlib import Path
 
 from tscp_player.audio import MusicPlayer
-from tscp_player.format import ANSI_SEQUENCE_RE, Dialogue, Directive, Script
+from tscp_player.format import (
+    ANSI_SEQUENCE_RE,
+    Dialogue,
+    Directive,
+    Script,
+    is_note,
+    note_parts,
+)
 from tscp_player.lyrics import to_html
 from tscp_player.music import STOP_WORDS
 from tscp_player.plot import (
@@ -183,6 +190,14 @@ if QT_AVAILABLE:
             self._lyrics_timer.setInterval(80)
             self._lyrics_timer.timeout.connect(self._tick_lyrics)
 
+            # The current supplement and when it stops being shown.
+            self._note_text = ""
+            self._note_colour = ""
+            self._note_until = 0.0
+            self._note_timer = QTimer(self)
+            self._note_timer.setSingleShot(True)
+            self._note_timer.timeout.connect(self._expire_note)
+
             self.setWindowTitle("剧情播放器")
             self.resize(1000, 700)
             self.setStyleSheet("QMainWindow, QWidget { background: #000; color: #ddd; }")
@@ -271,11 +286,53 @@ if QT_AVAILABLE:
             self.output.setStyleSheet(
                 "QTextEdit { background: #000; color: #ddd; border: none; padding: 24px; }"
             )
+            # Supplements live under the main area, so clearing the story does not
+            # take them with it.
+            self.supplement = QLabel()
+            self.supplement.setWordWrap(True)
+            self.supplement.setTextFormat(Qt.TextFormat.PlainText)
+            self.supplement.setAlignment(
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.supplement.setVisible(False)
             self.status = QLabel("播放中")
             self.status.setStyleSheet("color: #888; padding: 6px 12px;")
             layout.addWidget(self.output, 1)
+            layout.addWidget(self.supplement)
             layout.addWidget(self.status)
             return page
+
+        # -- supplements ---------------------------------------------------
+        def _show_note(self, item: Directive) -> None:
+            """Present an aside for its own duration, alongside the story."""
+
+            colour, seconds, text = note_parts(item)
+            self._note_text = text
+            self._note_colour = colour
+            self._note_until = time.monotonic() + seconds
+            self._paint_note()
+            self._note_timer.start(max(1, int(seconds * 1000)))
+
+        def _paint_note(self) -> None:
+            """Draw whatever aside is current, without disturbing its clock."""
+
+            if not self._note_text or time.monotonic() >= self._note_until:
+                self._expire_note()
+                return
+            colour = self._note_colour or "#8a93a0"
+            self.supplement.setText(self._note_text)
+            self.supplement.setStyleSheet(
+                "QLabel { color: %s; background: #000; border-top: 1px solid #222;"
+                " padding: 12px 24px; font-size: 15px; }" % colour
+            )
+            self.supplement.setVisible(True)
+
+        def _expire_note(self) -> None:
+            self._note_text = ""
+            self._note_colour = ""
+            self._note_until = 0.0
+            self.supplement.clear()
+            self.supplement.setVisible(False)
 
         def _begin_selected(self) -> None:
             plot_row = self.plot_list.currentRow()
@@ -323,6 +380,13 @@ if QT_AVAILABLE:
         def _handle_directive(self, item: Directive) -> None:
             if item.command == "c":
                 self.output.clear()
+                # A supplement is not part of the story text, so clearing must
+                # put it back rather than wipe it -- and its remaining time keeps
+                # running instead of starting over.
+                self._paint_note()
+                QTimer.singleShot(0, self._next_event)
+            elif is_note(item):
+                self._show_note(item)
                 QTimer.singleShot(0, self._next_event)
             elif item.command == "p":
                 try:

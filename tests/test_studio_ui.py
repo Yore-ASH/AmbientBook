@@ -8,15 +8,16 @@ import json
 
 import pytest
 
-from PlotManager.model import MusicDraft
+from PlotManager.model import MusicDraft, read_script
 from Studio import model as studio_model
 from Studio.model import StudioProject
 from tscp_player import archive
-from tscp_player.format import Dialogue, Directive, Script
+from tscp_player.format import Dialogue, Directive, Script, make_note
 from tscp_player.plot import load_archive_package
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from Studio.Main import StudioWindow  # noqa: E402
@@ -183,7 +184,7 @@ def test_story_step_labels_every_row_kind(studio, tmp_path):
 def test_story_step_offers_every_editing_action(studio):
     step = studio.steps[1]
     assert set(step.action_buttons) == {
-        "添加对白", "添加旁白", "添加暂停", "清空屏幕", "插入音乐",
+        "添加对白", "添加旁白", "补充内容", "添加暂停", "清空屏幕", "插入音乐",
         "停止音乐", "编辑", "上移", "下移", "删除",
     }
 
@@ -195,6 +196,7 @@ def test_story_step_offers_every_editing_action(studio):
 EXPECTED_SHORTCUTS = {
     "Ctrl+A": "添加旁白",
     "Ctrl+D": "添加对白",
+    "Ctrl+B": "补充内容",
     "Ctrl+M": "插入音乐",
     "Ctrl+P": "停止音乐",
     "Ctrl+E": "清空屏幕",
@@ -986,6 +988,396 @@ def test_export_strips_history_and_the_player_still_reads_it(tmp_path, qapp, no_
 def test_window_title_shows_whether_history_is_on(studio):
     assert "[剧情包]" in studio.windowTitle()
     assert studio.project.has_history is False
+
+
+# --------------------------------------------------------------------------
+# supplements in the studio
+# --------------------------------------------------------------------------
+
+def test_note_button_adds_a_supplement(studio, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+
+    from tscp_player.format import note_parts
+
+    window = studio
+    name = _story(window, tmp_path)
+    step = window.steps[1]
+
+    class FakeNote:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def value(self):
+            return make_note("一句补充说明", color="#ffd166", seconds=4.0)
+
+    monkeypatch.setattr("Studio.Main.NoteDialog", FakeNote)
+    step.add_note()
+
+    inserted = window.project.script(name).lines[-1]
+    assert note_parts(inserted) == ("#ffd166", 4.0, "一句补充说明")
+    assert step.table.item(step.table.rowCount() - 1, 1).text() == "补充内容"
+    assert step.table.item(step.table.rowCount() - 1, 3).text() == "一句补充说明（4 秒）"
+
+
+def test_note_dialog_round_trips_an_existing_note(studio):
+    from Studio.Main import NoteDialog
+    from tscp_player.format import note_parts
+
+    event = make_note("改之前", color="#33cccc", seconds=2.5)
+    dialog = NoteDialog(studio, event)
+    assert dialog.text_edit.text() == "改之前"
+    assert dialog.seconds.value() == pytest.approx(2.5)
+    assert dialog._colour == "#33cccc"
+    assert note_parts(dialog.value()) == ("#33cccc", 2.5, "改之前")
+
+    dialog.text_edit.setText("改之后")
+    dialog.use_default_colour()
+    assert note_parts(dialog.value()) == ("", 2.5, "改之后")
+
+
+def test_note_dialog_needs_some_text(studio, messages):
+    from Studio.Main import NoteDialog
+
+    dialog = NoteDialog(studio)
+    dialog.accept()
+    assert any("不能为空" in text for _kind, text in messages)
+    assert dialog.result() != dialog.DialogCode.Accepted
+
+
+def test_supplements_do_not_count_as_untimed(studio, tmp_path):
+    """An aside carries no per-character timing, so it must not skew the check."""
+
+    window = studio
+    name = _story(window, tmp_path)
+    window.project.add_event(name, make_note("旁注", seconds=3.0))
+    summary = window.project.summary()
+    assert summary["timed"] == 0
+    assert summary["timed_total"] == 12          # 6 + 6 from the two lines
+    assert summary["untimed_scripts"] == ["序章.tscp"]
+
+
+def test_a_timed_script_with_a_supplement_is_still_complete(studio):
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    name = window.project.new_script()
+    window.project.add_event(name, Dialogue("f", "甲乙", [0.1, 0.2]))
+    window.project.add_event(name, make_note("旁注", seconds=3.0))
+    summary = window.project.summary()
+    assert summary["timed"] == summary["timed_total"] == 2
+    assert summary["untimed_scripts"] == []
+
+
+def test_supplements_survive_save_and_export(studio, tmp_path):
+    from tscp_player.format import note_parts
+
+    window = studio
+    name = _story(window, tmp_path)
+    window.project.add_event(name, make_note("存得住", color="#ffd166", seconds=3.5))
+    window.save()
+
+    reloaded = StudioProject.load(window.project.path)
+    assert note_parts(reloaded.scripts[name].lines[-1]) == ("#ffd166", 3.5, "存得住")
+
+    handout = window.project.export(tmp_path / "handout")
+    package = load_archive_package(handout, cache_root=tmp_path / "cache")
+    assert package.script_names() == [name]
+    exported = read_script(handout, name)
+    assert note_parts(exported.lines[-1]) == ("#ffd166", 3.5, "存得住")
+
+
+# --------------------------------------------------------------------------
+# the timing step: record / timeline / numbers
+# --------------------------------------------------------------------------
+
+def _timed_story(window, tmp_path):
+    """A script with real timings, a music track and lyrics."""
+
+    project = window.project
+    project.set_character("f", "FISH", "\033[1;33m")
+    project.add_music([MusicDraft(
+        abbreviation="iw",
+        source=_song(tmp_path),
+        kind="lyrics",
+        lyrics_text="[00:00.50]第一句\n[00:01.50]Second line\n[00:02.50]第三句\n",
+        color="#ffd166",
+    )])
+    name = project.new_script("序章")
+    project.add_event(name, Directive("p", "iw"))
+    project.add_event(name, Dialogue("f", "你好世界", [0.5] * 4))
+    project.add_event(name, Directive("s", "1"))
+    project.add_event(name, Dialogue(None, "旁白一句", [0.25] * 4))
+    project.add_event(name, make_note("旁注", color="#ffd166", seconds=3.0))
+    window._refresh_all()
+    return name
+
+
+def test_the_timing_step_offers_three_ways_to_edit(studio):
+    from Studio.Main import VIEW_NUMBERS, VIEW_RECORD, VIEW_TIMELINE
+
+    step = studio.steps[2]
+    modes = [step.view_combo.itemData(i) for i in range(step.view_combo.count())]
+    assert modes == [VIEW_RECORD, VIEW_TIMELINE, VIEW_NUMBERS]
+    assert step.pages.count() == 3
+    # Selecting a mode shows its page.
+    for index in range(3):
+        step.view_combo.setCurrentIndex(index)
+        assert step.pages.currentIndex() == index
+
+
+def test_the_timeline_loads_the_script_and_its_lyrics(studio, tmp_path):
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.view_combo.setCurrentIndex(1)
+
+    view = step.timeline
+    assert view.script is not None and len(view.script.lines) == 5
+    assert view.characters["f"].name == "FISH"
+    assert "iw" in view.tracks
+    # Every lyric line is loaded, so the music lane can mark them.
+    assert [line.text for line in view.lyrics["iw"]] == ["第一句", "Second line", "第三句"]
+    # 4 * 0.5 + 1 + 4 * 0.25 = 4.0 seconds of story.
+    assert view.total_seconds == pytest.approx(4.0)
+    assert view._starts == pytest.approx([0.0, 0.0, 2.0, 3.0, 4.0])
+
+
+def test_the_timeline_paints_without_complaining(studio, tmp_path):
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.view_combo.setCurrentIndex(1)
+    step.timeline.resize(900, 260)
+    step.timeline.show()
+    QApplication.instance().processEvents()
+    image = step.timeline.grab().toImage()
+    assert image.width() > 100
+    # Something was actually drawn, not just the backdrop.
+    from Studio.timeline import BACKDROP
+
+    colours = {
+        image.pixelColor(x, y).name()
+        for x in range(0, image.width(), 17)
+        for y in range(0, image.height(), 11)
+    }
+    assert len(colours) > 1
+    assert colours != {BACKDROP}
+
+
+def test_set_duration_scales_the_existing_timing(studio, tmp_path):
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+
+    assert step._duration_of(1) == pytest.approx(2.0)
+    assert step.set_duration(1, 4.0) is True
+
+    line = window.project.script(name).lines[1]
+    # Doubling the total doubles every character's share.
+    assert sum(line.delays) == pytest.approx(4.0)
+    assert line.delays == pytest.approx([1.0] * 4)
+    assert window.project.dirty is True
+    # Its neighbours are untouched.
+    assert step._duration_of(3) == pytest.approx(1.0)
+
+
+def test_set_duration_on_an_untimed_line_spreads_evenly(studio, tmp_path):
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    name = window.project.new_script()
+    window.project.add_event(name, Dialogue("f", "四个字啊"))
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+
+    assert step._duration_of(0) == 0.0
+    assert step.set_duration(0, 2.0) is True
+    assert window.project.script(name).lines[0].delays == pytest.approx([0.5] * 4)
+
+
+def test_set_duration_ignores_things_that_are_not_dialogue(studio, tmp_path):
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    assert step.set_duration(0, 5.0) is False        # a music directive
+    assert step.set_duration(2, 5.0) is False        # a sleep
+    assert step.set_duration(99, 5.0) is False       # out of range
+    assert window.project.script(name).lines[2] == Directive("s", "1")
+
+
+def test_dragging_a_block_changes_the_speed(studio, tmp_path):
+    """Drive the real drag: press on the edge, move, release."""
+
+    from PySide6.QtCore import QPointF, Qt
+
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.view_combo.setCurrentIndex(1)
+
+    view = step.timeline
+    view.resize(900, 260)
+    view.show()
+    QApplication.instance().processEvents()
+    view.fit()
+
+    # Grab the right edge of line 1, which ends at 2.0 s.
+    rect = view._block_rect(1)
+    assert view._handle_at(rect.right(), rect.center().y()) == 1
+
+    target = view.x_for(3.5)
+    view.set_scale(view.scale)
+    press = _mouse(view, QPointF(rect.right(), rect.center().y()),
+                   Qt.MouseButton.LeftButton, "press")
+    move = _mouse(view, QPointF(target, rect.center().y()),
+                  Qt.MouseButton.LeftButton, "move")
+    release = _mouse(view, QPointF(target, rect.center().y()),
+                     Qt.MouseButton.LeftButton, "release")
+    assert press and move and release
+
+    assert step._duration_of(1) == pytest.approx(3.5, abs=0.05)
+    # Everything after it shifts, so the total grows.
+    assert step.timeline.total_seconds == pytest.approx(5.5, abs=0.05)
+
+
+def _mouse(widget, position, button, kind):
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    types = {
+        "press": QEvent.Type.MouseButtonPress,
+        "move": QEvent.Type.MouseMove,
+        "release": QEvent.Type.MouseButtonRelease,
+    }
+    event = QMouseEvent(
+        types[kind], QPointF(position), widget.mapToGlobal(QPointF(position)),
+        button, button, Qt.KeyboardModifier.NoModifier,
+    )
+    if kind == "press":
+        widget.mousePressEvent(event)
+    elif kind == "move":
+        widget.mouseMoveEvent(event)
+    else:
+        widget.mouseReleaseEvent(event)
+    return True
+
+
+def test_clicking_a_block_selects_the_row(studio, tmp_path):
+    from PySide6.QtCore import QPointF, Qt
+
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.view_combo.setCurrentIndex(1)
+    view = step.timeline
+    view.resize(900, 260)
+    view.show()
+    QApplication.instance().processEvents()
+
+    middle = view._block_rect(1).center()
+    _mouse(view, QPointF(middle), Qt.MouseButton.LeftButton, "press")
+    assert view.selected == 1
+    assert step.table.selectionModel().selectedRows()[0].row() == 1
+    assert step.numbers.selectionModel().selectedRows()[0].row() == 1
+
+
+def test_the_numbers_editor_shows_and_writes_durations(studio, tmp_path):
+    from Studio.Main import VIEW_NUMBERS
+
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.view_combo.setCurrentIndex(2)
+    assert step.view_combo.currentData() == VIEW_NUMBERS
+
+    assert step.numbers.rowCount() == 5
+    assert step.numbers.item(1, 4).text() == "2.00"
+    assert step.numbers.item(3, 4).text() == "1.00"
+    # Non-dialogue rows cannot be edited.
+    assert not (step.numbers.item(0, 4).flags() & Qt.ItemFlag.ItemIsEditable)
+
+    step.numbers.item(1, 4).setText("3.00")
+    assert step._duration_of(1) == pytest.approx(3.0)
+    assert step.numbers.item(1, 4).text() == "3.00"
+
+
+def test_the_numbers_editor_rejects_nonsense(studio, tmp_path):
+    window = studio
+    name = _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.script_combo.setCurrentText(name)
+    step.view_combo.setCurrentIndex(2)
+
+    before = step._duration_of(1)
+    step.numbers.item(1, 4).setText("不是数字")
+    assert step._duration_of(1) == pytest.approx(before)
+    assert "数字" in step.status.text()
+
+    step.numbers.item(1, 4).setText("-4")
+    assert step._duration_of(1) == pytest.approx(before)
+    assert "负数" in step.status.text()
+
+
+def test_zoom_and_fit_keep_the_timeline_usable(studio, tmp_path):
+    from Studio.timeline import MAX_SCALE, MIN_SCALE
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[2]
+    step.refresh()
+    step.view_combo.setCurrentIndex(1)
+    step.timeline.resize(900, 260)
+
+    step.zoom.setValue(200)
+    assert step.timeline.scale == pytest.approx(200.0)
+    step._fit_timeline()
+    assert MIN_SCALE <= step.timeline.scale <= MAX_SCALE
+    # Fitting a four second story into ~900px lands around 220 px/s.
+    assert step.timeline.scale > 100
+
+
+def test_the_timeline_survives_an_empty_project(studio):
+    step = studio.steps[2]
+    step.view_combo.setCurrentIndex(1)
+    assert step.timeline.script is None
+    assert step.timeline.total_seconds == 0.0
+    step.timeline.resize(400, 200)
+    step.timeline.grab()
+    step.view_combo.setCurrentIndex(2)
+    assert step.numbers.rowCount() == 0
+
+
+def test_a_broken_lrc_does_not_break_the_timeline(studio, tmp_path):
+    window = studio
+    project = window.project
+    project.set_character("f", "FISH", "")
+    project.add_music([MusicDraft(
+        abbreviation="iw", source=_song(tmp_path), kind="lyrics",
+        lyrics_text="这一行根本不是 LRC\n", color="#ffd166",
+    )])
+    name = project.new_script()
+    project.add_event(name, Dialogue("f", "你好", [0.1, 0.1]))
+    window._refresh_all()
+    step = window.steps[2]
+    step.refresh()
+    step.view_combo.setCurrentIndex(1)
+    assert step.timeline.script is not None
+    assert step.timeline.lyrics.get("iw", []) == []
 
 
 # --------------------------------------------------------------------------

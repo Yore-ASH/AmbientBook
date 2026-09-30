@@ -25,6 +25,12 @@ from PlotManager.model import MusicDraft, PackError
 from PlotManager.recorder import LyricsRecorderDialog
 from Studio import model as studio
 from Studio import theme
+from Studio.timeline import (
+    DEFAULT_SCALE as DEFAULT_ZOOM,
+    MAX_SCALE as MAX_ZOOM,
+    MIN_SCALE as MIN_ZOOM,
+    TimelineView,
+)
 from Studio.model import (
     CLEAR,
     DIALOGUE,
@@ -48,16 +54,19 @@ from tscp_player.format import (
     Script,
     visible_text_length,
 )
-from tscp_player.lyrics import lyric_source_lines, serialize_lrc, timed_from_marks
+from tscp_player.lyrics import lyric_source_lines, parse_lrc, serialize_lrc, timed_from_marks
 from tscp_player.music import STOP_WORDS
 
 try:  # pragma: no cover - depends on the optional GUI package
-    from PySide6.QtCore import QEvent, Qt, QTimer
+    from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, Signal
     from PySide6.QtGui import (
         QAction,
         QColor,
+        QFontMetrics,
         QIcon,
         QKeySequence,
+        QPainter,
+        QPen,
         QShortcut,
         QTextCursor,
     )
@@ -83,6 +92,8 @@ try:  # pragma: no cover - depends on the optional GUI package
         QPlainTextEdit,
         QPushButton,
         QRadioButton,
+        QScrollBar,
+        QSlider,
         QSplitter,
         QStackedWidget,
         QTableWidget,
@@ -107,6 +118,11 @@ LYRIC_COLOR_DEFAULT = "#ffffff"
 AUTO_SNAPSHOT_SECONDS = 300
 AUTO_SNAPSHOT_MAX_BACKOFF = 12          # 5 min -> ... -> 1 hour
 AUTO_SNAPSHOT_MENU_LABEL = "自动快照（每 5 分钟）"
+
+#: How the timing step lets you edit: press keys, drag blocks, or type numbers.
+VIEW_RECORD = "record"
+VIEW_TIMELINE = "timeline"
+VIEW_NUMBERS = "numbers"
 
 #: Shipped alongside this module; regenerate with ``python Studio/make_icon.py``.
 ICON_PATH = Path(__file__).resolve().with_name("tscp-studio.ico")
@@ -672,6 +688,127 @@ if QT_AVAILABLE:
         def accept(self) -> None:
             if self.values() is None:
                 QMessageBox.warning(self, "旁白" if self.narrator else "对白", "内容不能为空")
+                return
+            super().accept()
+
+    class NoteDialog(QDialog):
+        """Write a supplement: an aside shown below the story, in its own colour."""
+
+        def __init__(self, parent, event=None) -> None:
+            super().__init__(parent)
+            from tscp_player.format import NOTE_DEFAULT_SECONDS, make_note, note_parts
+
+            self.setWindowTitle("补充内容")
+            self.resize(620, 360)
+            self._colour = ""
+
+            self.text_edit = QLineEdit()
+            self.text_edit.setPlaceholderText("显示在剧情下方的一行补充，按 Enter 完成")
+            self.text_edit.returnPressed.connect(self.accept)
+
+            self.seconds = QDoubleSpinBox()
+            self.seconds.setRange(0.1, 600.0)
+            self.seconds.setDecimals(1)
+            self.seconds.setSingleStep(0.5)
+            self.seconds.setValue(NOTE_DEFAULT_SECONDS)
+
+            self.colour_button = QPushButton("选择颜色…")
+            self.colour_button.clicked.connect(self.pick_colour)
+            self.colour_swatch = QLabel("　")
+            self.colour_swatch.setFixedWidth(28)
+            self.default_button = QPushButton("默认颜色")
+            self.default_button.clicked.connect(self.use_default_colour)
+
+            form = QFormLayout()
+            form.addRow("内容", self.text_edit)
+            form.addRow("展示时长", self.seconds)
+            row = QHBoxLayout()
+            row.addWidget(self.colour_swatch)
+            row.addWidget(self.colour_button)
+            row.addWidget(self.default_button)
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            form.addRow("颜色", holder)
+
+            self.preview = QLabel()
+            self.preview.setWordWrap(True)
+            self.preview.setMinimumHeight(38)
+            self.preview.setMaximumHeight(110)
+            self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            hint = QLabel(
+                "补充内容显示在剧情主区域下方，不占用剧情时间；"
+                "清屏也不会抹掉它——它按自己的时长消失。"
+            )
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(QLabel("预览（播放时的样子）"))
+            layout.addWidget(self.preview)
+            layout.addWidget(hint)
+            layout.addWidget(buttons)
+
+            self.text_edit.textChanged.connect(self._refresh_preview)
+            self.seconds.valueChanged.connect(self._refresh_preview)
+            if event is not None:
+                colour, seconds, text = note_parts(event)
+                self.text_edit.setText(text)
+                self.seconds.setValue(seconds)
+                self._colour = colour
+            self._paint_swatch()
+            self._refresh_preview()
+
+        def pick_colour(self) -> None:
+            colour = QColorDialog.getColor(
+                QColor(self._colour or "#ffd166"), self, "补充内容的颜色"
+            )
+            if colour.isValid():
+                self._colour = colour.name()
+                self._paint_swatch()
+                self._refresh_preview()
+
+        def use_default_colour(self) -> None:
+            self._colour = ""
+            self._paint_swatch()
+            self._refresh_preview()
+
+        def _paint_swatch(self) -> None:
+            self.colour_swatch.setStyleSheet(
+                "background:%s; border:1px solid #555;" % (self._colour or "#8a93a0")
+            )
+
+        def _refresh_preview(self) -> None:
+            self.preview.setText(self.text_edit.text().strip() or "（补充内容）")
+            self.preview.setStyleSheet(
+                "background:#000; color:%s; padding:8px; border:1px solid #333;"
+                % (self._colour or "#8a93a0")
+            )
+
+        def value(self):
+            from tscp_player.format import make_note
+
+            text = self.text_edit.text().strip()
+            if not text:
+                return None
+            return make_note(text, color=self._colour, seconds=self.seconds.value())
+
+        def accept(self) -> None:
+            try:
+                note = self.value()
+            except Exception as exc:  # noqa: BLE001 - the format raises TSCPError
+                QMessageBox.warning(self, "补充内容", str(exc))
+                return
+            if note is None:
+                QMessageBox.warning(self, "补充内容", "内容不能为空")
                 return
             super().accept()
 
@@ -1291,6 +1428,7 @@ if QT_AVAILABLE:
             self.actions = [
                 ("添加对白", self.add_dialogue, "Ctrl+D", "新建一句角色对白"),
                 ("添加旁白", self.add_narration, "Ctrl+A", "新建一句旁白"),
+                ("补充内容", self.add_note, "Ctrl+B", "在剧情下方加一行带颜色、有时长的补充"),
                 ("添加暂停", self.add_sleep, "Ctrl+T", "插入一段等待时间"),
                 ("清空屏幕", self.add_clear, "Ctrl+E", "插入清屏指令"),
                 ("插入音乐", self.add_music, "Ctrl+M", "选择已有曲目或插入新音乐"),
@@ -1320,7 +1458,7 @@ if QT_AVAILABLE:
 
             self.hint = QLabel(
                 "双击一行即可编辑；所有内容都用对话框填写，不用手写脚本格式。"
-                "　快捷键：Ctrl+A 旁白、Ctrl+D 对白、Ctrl+M 音乐、"
+                "　快捷键：Ctrl+A 旁白、Ctrl+D 对白、Ctrl+B 补充、Ctrl+M 音乐、"
                 "Ctrl+P 停止音乐、Ctrl+E 清屏、Ctrl+T 暂停。"
             )
             self.hint.setObjectName("hint")
@@ -1378,7 +1516,7 @@ if QT_AVAILABLE:
             for label in ("编辑", "上移", "下移", "删除"):
                 self.action_buttons[label].setEnabled(bool(has_row))
             for label in (
-                "添加对白", "添加旁白", "添加暂停",
+                "添加对白", "添加旁白", "补充内容", "添加暂停",
                 "清空屏幕", "插入音乐", "停止音乐",
             ):
                 self.action_buttons[label].setEnabled(bool(has_script))
@@ -1485,6 +1623,16 @@ if QT_AVAILABLE:
         def add_clear(self) -> None:
             self._add(Directive("c"))
 
+        def add_note(self) -> None:
+            """Add an aside shown below the story, with its own time and colour."""
+
+            if not self.studio.require_project():
+                return
+            dialog = NoteDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._add(dialog.value())
+
         def add_stop_music(self) -> None:
             """The format's stop-the-music directive, as a first-class action.
 
@@ -1529,6 +1677,11 @@ if QT_AVAILABLE:
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     return
                 replacement = Directive("s", dialog.value())
+            elif kind == studio.NOTE:
+                dialog = NoteDialog(self, event)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                replacement = dialog.value()
             elif kind == MUSIC:
                 dialog = MusicDialog(self, self.studio, event.value)
                 if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1576,6 +1729,44 @@ if QT_AVAILABLE:
             self.script_combo = QComboBox()
             self.script_combo.currentIndexChanged.connect(lambda _i: self._reload_events())
 
+            # How the timing gets edited: by pressing keys, by dragging blocks on
+            # a timeline, or by typing durations. All three write the same delays.
+            self.view_combo = QComboBox()
+            self.view_combo.addItem("逐字录制（按计时键）", VIEW_RECORD)
+            self.view_combo.addItem("时序图（拖动改语速）", VIEW_TIMELINE)
+            self.view_combo.addItem("直接改时间（输入数值）", VIEW_NUMBERS)
+            self.view_combo.currentIndexChanged.connect(self._view_changed)
+
+            top = QHBoxLayout()
+            top.addWidget(QLabel("剧本"))
+            top.addWidget(self.script_combo, 1)
+            top.addWidget(QLabel("方式"))
+            top.addWidget(self.view_combo)
+
+            # Built before the pages: they wire their status lines into it.
+            self.status = QLabel(
+                "选择一个剧本后点「开始 / 重新计时」；第一次按键才是计时起点。"
+            )
+            self.status.setObjectName("hint")
+
+            self.pages = QStackedWidget()
+            self.pages.addWidget(self._build_record_page())
+            self.pages.addWidget(self._build_timeline_page())
+            self.pages.addWidget(self._build_numbers_page())
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(top)
+            layout.addWidget(self.pages, 1)
+            layout.addWidget(self.status)
+
+            self.model: Optional[KeyboardTimingModel] = None
+            self._wait_until = 0.0
+            self._music: Optional[MusicPlayer] = None
+            self._music_broken = False
+            self._loading_numbers = False
+
+        # -- the three pages -------------------------------------------
+        def _build_record_page(self) -> QWidget:
             self.mode = QComboBox()
             self.mode.addItem("逐句模式（句间停顿不计入）", TimingMode.PER_SENTENCE)
             self.mode.addItem("连续模式（句间停顿计入下一句）", TimingMode.CONTINUOUS)
@@ -1593,15 +1784,14 @@ if QT_AVAILABLE:
             )
             self.import_button.clicked.connect(self.import_timing)
 
-            top = QHBoxLayout()
-            top.addWidget(QLabel("剧本"))
-            top.addWidget(self.script_combo, 1)
-            top.addWidget(self.mode)
-            top.addWidget(QLabel("计时键"))
-            top.addWidget(self.key_edit)
-            top.addWidget(self.start_button)
-            top.addWidget(self.selected_button)
-            top.addWidget(self.import_button)
+            controls = QHBoxLayout()
+            controls.addWidget(self.mode)
+            controls.addWidget(QLabel("计时键"))
+            controls.addWidget(self.key_edit)
+            controls.addWidget(self.start_button)
+            controls.addWidget(self.selected_button)
+            controls.addWidget(self.import_button)
+            controls.addStretch(1)
 
             self.table = QTableWidget(0, 4)
             self.table.setHorizontalHeaderLabels(["序号", "类型", "角色", "进度"])
@@ -1627,20 +1817,250 @@ if QT_AVAILABLE:
             splitter.addWidget(self.panel)
             splitter.setSizes([520, 560])
 
-            self.status = QLabel(
-                "选择一个剧本后点「开始 / 重新计时」；第一次按键才是计时起点。"
-            )
-            self.status.setStyleSheet("color:#777;")
-
-            layout = QVBoxLayout(self)
-            layout.addLayout(top)
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 6, 0, 0)
+            layout.addLayout(controls)
             layout.addWidget(splitter, 1)
-            layout.addWidget(self.status)
+            return page
 
-            self.model: Optional[KeyboardTimingModel] = None
-            self._wait_until = 0.0
-            self._music: Optional[MusicPlayer] = None
-            self._music_broken = False
+        def _build_timeline_page(self) -> QWidget:
+            self.timeline = TimelineView()
+            self.timeline.blockSelected.connect(self._timeline_selected)
+            self.timeline.durationChanged.connect(self._timeline_dragged)
+            self.timeline.statusMessage.connect(self.status.setText)
+
+            self.zoom = QSlider(Qt.Orientation.Horizontal)
+            self.zoom.setMinimum(int(MIN_ZOOM))
+            self.zoom.setMaximum(int(MAX_ZOOM))
+            self.zoom.setValue(int(DEFAULT_ZOOM))
+            self.zoom.setMaximumWidth(240)
+            self.zoom.valueChanged.connect(self._zoom_changed)
+
+            fit = QPushButton("适应宽度")
+            fit.clicked.connect(self._fit_timeline)
+            reset = QPushButton("重置缩放")
+            reset.clicked.connect(lambda: self.zoom.setValue(int(DEFAULT_ZOOM)))
+
+            controls = QHBoxLayout()
+            controls.addWidget(QLabel("缩放"))
+            controls.addWidget(self.zoom)
+            controls.addWidget(fit)
+            controls.addWidget(reset)
+            controls.addStretch(1)
+
+            self.timeline_hint = QLabel(
+                "拖动对话块的**右边缘**改变这一句的时长，后面的内容会顺延；"
+                "滚轮缩放，中键拖动平移。音乐轨上的虚线是歌词的每一句。"
+            )
+            self.timeline_hint.setObjectName("hint")
+            self.timeline_hint.setWordWrap(True)
+
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 6, 0, 0)
+            layout.addLayout(controls)
+            # The lanes are a fixed height, so the widget should not stretch into
+            # a big empty rectangle; the slack belongs below it.
+            layout.addWidget(self.timeline)
+            layout.addStretch(1)
+            layout.addWidget(self.timeline_hint)
+            return page
+
+        def _build_numbers_page(self) -> QWidget:
+            self.numbers = QTableWidget(0, 5)
+            self.numbers.setHorizontalHeaderLabels(
+                ["序号", "类型", "角色", "内容", "时长（秒）"]
+            )
+            compact_table(self.numbers)
+            self.numbers.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.numbers.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.numbers.horizontalHeader().setStretchLastSection(False)
+            self.numbers.itemChanged.connect(self._number_edited)
+
+            self.numbers_hint = QLabel(
+                "直接改「时长」那一列，回车生效；改一句话不会影响别的时间。"
+            )
+            self.numbers_hint.setObjectName("hint")
+            self.numbers_hint.setWordWrap(True)
+
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 6, 0, 0)
+            layout.addWidget(self.numbers, 1)
+            layout.addWidget(self.numbers_hint)
+            return page
+
+        # -- mode switching --------------------------------------------
+        def current_view(self) -> str:
+            return self.view_combo.currentData() or VIEW_RECORD
+
+        def _view_changed(self) -> None:
+            index = max(0, self.view_combo.currentIndex())
+            self.pages.setCurrentIndex(index)
+            if self.current_view() == VIEW_RECORD:
+                self.status.setText(
+                    "按「开始 / 重新计时」，然后按计时键；第一次按键才是计时起点。"
+                )
+            elif self.current_view() == VIEW_TIMELINE:
+                self._load_timeline()
+                self.status.setText("拖动对话块右边缘即可改语速。")
+            else:
+                self._reload_numbers()
+                self.status.setText("双击「时长」单元格直接输入秒数。")
+
+        def _zoom_changed(self, value: int) -> None:
+            self.timeline.set_scale(float(value))
+
+        def _fit_timeline(self) -> None:
+            self.timeline.fit()
+            self.zoom.blockSignals(True)
+            self.zoom.setValue(int(max(MIN_ZOOM, min(MAX_ZOOM, self.timeline.scale))))
+            self.zoom.blockSignals(False)
+
+        def _timeline_selected(self, index: int) -> None:
+            self.table.selectRow(index)
+            self.numbers.selectRow(index)
+            self.status.setText("已选中第 %d 行，拖动它的右边缘改时长。" % (index + 1))
+
+        def _timeline_dragged(self, index: int, seconds: float) -> None:
+            before = self._duration_of(index)
+            self.set_duration(index, seconds)
+            after = self._duration_of(index)
+            self.status.setText(
+                "第 %d 行：%.2f 秒 → %.2f 秒（后面的内容顺延）"
+                % (index + 1, before, after)
+            )
+
+        # -- shared editing --------------------------------------------
+        def _duration_of(self, index: int) -> float:
+            name = self.current_script_name()
+            if self.project is None or name is None:
+                return 0.0
+            lines = self.project.script(name).lines
+            if not 0 <= index < len(lines):
+                return 0.0
+            item = lines[index]
+            if not isinstance(item, Dialogue):
+                return 0.0
+            return sum(item.delays[: visible_text_length(item.text)])
+
+        def set_duration(self, index: int, seconds: float) -> bool:
+            """Give one dialogue a new total duration, scaling its delays.
+
+            This is the single place the timeline and the numeric editor both
+            write through, so the two views can never disagree.
+            """
+
+            name = self.current_script_name()
+            if self.project is None or name is None:
+                return False
+            script = self.project.script(name)
+            if not 0 <= index < len(script.lines):
+                return False
+            item = script.lines[index]
+            if not isinstance(item, Dialogue):
+                return False
+            count = visible_text_length(item.text)
+            if count <= 0:
+                return False
+
+            target = max(0.0, float(seconds))
+            current = sum(item.delays[:count]) if item.delays else 0.0
+            if current > 0.01:
+                factor = target / current
+                delays = [max(0.0, float(value)) * factor for value in item.delays[:count]]
+            else:
+                # Never timed: spread the new duration evenly.
+                delays = [target / count] * count
+
+            self.project.replace_event(
+                name, index, Dialogue(item.character, item.text, delays)
+            )
+            self.studio.mark_dirty()
+            self._reload_events()
+            return True
+
+        def _load_timeline(self) -> None:
+            name = self.current_script_name()
+            if self.project is None or name is None:
+                self.timeline.set_script(None)
+                return
+            lyrics = {}
+            for key, track in self.project.tracks.items():
+                if not track.has_lyrics:
+                    continue
+                text = self.project.lyrics_text(key)
+                if not text.strip():
+                    continue
+                try:
+                    parsed = parse_lrc(text)
+                except Exception:  # noqa: BLE001 - a broken .lrc must not break the view
+                    continue
+                if parsed.lines:
+                    lyrics[key] = parsed.lines
+            self.timeline.set_script(
+                self.project.script(name),
+                self.project.characters,
+                self.project.tracks,
+                lyrics,
+            )
+            self.timeline.set_scale(float(self.zoom.value()))
+
+        def _reload_numbers(self) -> None:
+            name = self.current_script_name()
+            self._loading_numbers = True
+            try:
+                if self.project is None or name is None:
+                    self.numbers.setRowCount(0)
+                    return
+                script = self.project.script(name)
+                characters = self.project.characters
+                tracks = self.project.tracks
+                self.numbers.setRowCount(len(script.lines))
+                for row, event in enumerate(script.lines):
+                    values = [
+                        str(row + 1),
+                        event_label(event),
+                        studio.event_character(event, characters),
+                        studio.describe_event(event, characters, tracks),
+                    ]
+                    for column, value in enumerate(values):
+                        item = QTableWidgetItem(value)
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        self.numbers.setItem(row, column, item)
+
+                    cell = QTableWidgetItem()
+                    if isinstance(event, Dialogue):
+                        cell.setText("%.2f" % self._duration_of(row))
+                        cell.setToolTip("总时长（秒）")
+                    else:
+                        cell.setText("—")
+                        cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.numbers.setItem(row, 4, cell)
+                self.numbers.resizeColumnsToContents()
+            finally:
+                self._loading_numbers = False
+
+        def _number_edited(self, cell) -> None:
+            if self._loading_numbers or cell.column() != 4:
+                return
+            try:
+                seconds = float(cell.text())
+            except ValueError:
+                self.status.setText("时长要填一个数字")
+                self._reload_numbers()
+                return
+            if seconds < 0:
+                self.status.setText("时长不能是负数")
+                self._reload_numbers()
+                return
+            if not self.set_duration(cell.row(), seconds):
+                self._reload_numbers()
+                return
+            self.status.setText("第 %d 行改成 %.2f 秒" % (cell.row() + 1, seconds))
+            self._reload_numbers()
+            self._load_timeline()
 
         # -- helpers ---------------------------------------------------
         def current_script_name(self) -> Optional[str]:
@@ -1657,11 +2077,15 @@ if QT_AVAILABLE:
             self.script_combo.blockSignals(False)
             self.model = None
             self._reload_events()
+            self._load_timeline()
+            self._reload_numbers()
 
         def _reload_events(self) -> None:
             name = self.current_script_name()
             if self.project is None or not name:
                 self.table.setRowCount(0)
+                self._load_timeline()
+                self._reload_numbers()
                 return
             script = self.project.script(name)
             characters = self.project.characters
@@ -1680,6 +2104,8 @@ if QT_AVAILABLE:
                 for column, value in enumerate(values):
                     self.table.setItem(row, column, QTableWidgetItem(value))
             self.table.resizeColumnsToContents()
+            self._load_timeline()
+            self._reload_numbers()
 
         def _selected_row(self) -> Optional[int]:
             rows = self.table.selectionModel().selectedRows()

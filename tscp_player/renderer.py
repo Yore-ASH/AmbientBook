@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .audio import MusicPlayer
-from .format import Dialogue, Directive, Script
+from .format import Dialogue, Directive, Script, is_note
 from .music import STOP_WORDS
 from .plot import Character
 
@@ -140,3 +140,8 @@ class TerminalRenderer:
                     self.music.stop()
                 else:
                     self.music.ensure(str(self._music_path(item.value)))
+            elif is_note(item):
+                # A terminal has no area below the story to put an aside in, so
+                # supplements are not drawn here. The desktop player and the
+                # website both do show them.
+                continue

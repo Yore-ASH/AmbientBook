@@ -12,7 +12,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-from .format import Dialogue, Directive, Script, visible_text_length
+from .format import (
+    Dialogue,
+    Directive,
+    Script,
+    is_note,
+    note_parts,
+    visible_text_length,
+)
 
 
 #: Music directive values which mean "stop the music".
@@ -75,7 +82,8 @@ def line_durations(script: Script) -> List[float]:
 
     Dialogue lines use their recorded per-character delays, so a script that has
     not been timed yet reports zero for every line.  ``<s>`` reports its wait,
-    and ``<c>``/``<p>`` take no time.
+    and ``<c>``/``<p>``/supplements take no time: an aside runs *alongside* the
+    dialogue rather than holding it up.
     """
 
     durations: List[float] = []
@@ -87,6 +95,47 @@ def line_durations(script: Script) -> List[float]:
         else:
             durations.append(0.0)
     return durations
+
+
+@dataclass(frozen=True)
+class NoteSpan:
+    """One supplement's window on the timeline."""
+
+    index: int
+    start: float
+    end: float
+    color: str
+    text: str
+
+    @property
+    def seconds(self) -> float:
+        return self.end - self.start
+
+
+def note_spans(
+    script: Script, durations: Optional[Sequence[float]] = None
+) -> List[NoteSpan]:
+    """Where every supplement sits on the timeline, in seconds.
+
+    Because a supplement costs no main-timeline time, it starts the moment the
+    player reaches it and lasts its own configured duration.
+    """
+
+    if durations is None:
+        resolved = line_durations(script)
+    else:
+        resolved = list(durations)
+        if len(resolved) != len(script.lines):
+            raise ValueError("durations must have one entry per script line")
+
+    spans: List[NoteSpan] = []
+    clock = 0.0
+    for index, item in enumerate(script.lines):
+        if is_note(item):
+            color, seconds, text = note_parts(item)
+            spans.append(NoteSpan(index, clock, clock + seconds, color, text))
+        clock += resolved[index]
+    return spans
 
 
 def _apply_music(

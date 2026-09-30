@@ -1,7 +1,50 @@
 import pytest
 
-from tscp_player.format import Dialogue, Directive, Script
-from tscp_player.music import MusicCue, build_timeline, line_durations
+from tscp_player.format import Dialogue, Directive, Script, make_note
+from tscp_player.music import MusicCue, build_timeline, line_durations, note_spans
+
+
+def test_supplements_cost_no_main_timeline_time():
+    """An aside runs alongside the story, it does not hold it up."""
+
+    script = Script([
+        Dialogue("f", "你好", [0.5, 0.5]),
+        make_note("旁注", color="#ffd166", seconds=4.0),
+        Dialogue(None, "继续", [0.25, 0.25]),
+    ])
+    assert line_durations(script) == [1.0, 0.0, 0.5]
+    # Pacing is exactly what it would be without the aside.
+    without = Script([script.lines[0], script.lines[2]])
+    assert sum(line_durations(script)) == sum(line_durations(without))
+
+
+def test_note_spans_sit_where_the_player_reaches_them():
+    script = Script([
+        Directive("p", "night"),
+        Dialogue("f", "你好", [0.5, 0.5]),      # 0.0 -> 1.0
+        make_note("四秒旁注", color="#ffd166", seconds=4.0),
+        Directive("s", "2"),
+        make_note("默认时长", seconds=3.0),
+    ])
+    spans = note_spans(script)
+    assert [(s.index, s.start, s.end, s.color, s.text) for s in spans] == [
+        (2, 1.0, 5.0, "#ffd166", "四秒旁注"),
+        (4, 3.0, 6.0, "", "默认时长"),
+    ]
+    assert spans[0].seconds == pytest.approx(4.0)
+
+
+def test_note_spans_accept_an_explicit_timeline():
+    script = Script([Dialogue(None, "甲", [0.1]), make_note("注", seconds=2.0)])
+    spans = note_spans(script, [10.0, 0.0])
+    assert spans[0].start == pytest.approx(10.0)
+    with pytest.raises(ValueError):
+        note_spans(script, [1.0])
+
+
+def test_a_script_without_supplements_has_no_spans():
+    script = Script([Dialogue(None, "甲", [0.1]), Directive("c")])
+    assert note_spans(script) == []
 
 
 def test_same_track_continues_instead_of_restarting():
