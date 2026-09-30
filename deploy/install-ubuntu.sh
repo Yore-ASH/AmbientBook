@@ -76,6 +76,19 @@ chmod 644 "$UNIT"
 log "设置权限"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$APP_DIR"
 
+# 端口冲突留到启动时才失败很难查，所以在动手之前先说清楚。
+# 更新已有部署时跳过：那时占用端口的正是我们自己。
+if ! systemctl is-active --quiet tscp-web 2>/dev/null; then
+    log "检查端口 $PORT 是否空闲"
+    if command -v ss >/dev/null 2>&1; then
+        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$PORT\$"; then
+            printf '\n端口 %s 已经被占用了：\n\n' "$PORT" >&2
+            ss -ltnp 2>/dev/null | grep -E "[:.]$PORT\$" >&2 || true
+            die "换一个端口：sudo PORT=9999 ./deploy/install-ubuntu.sh"
+        fi
+    fi
+fi
+
 log "启动服务"
 systemctl daemon-reload
 systemctl enable tscp-web >/dev/null

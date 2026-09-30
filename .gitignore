@@ -9,6 +9,13 @@ venv/
 # 打包产物：用「目录打包成 .tscpkg」随时重新生成，不进仓库
 source/dist/
 
+# 自己编写的剧情包属于个人内容，不上版本库。放在 source/ 下会被 git status
+# 一直报成未跟踪，所以直接忽略。
+*.tscpkg
+
+# 生成的部署包，见 deploy/make_release.py
+tscp-web-deploy*.zip
+
 # 网页版的运行时目录：数据库、用户剧情包、音频解压缓存
 webapp/data/
 

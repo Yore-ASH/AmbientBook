@@ -7,7 +7,30 @@
 
 ---
 
-## 一键部署
+## 方式一：上传部署包（服务器上没有 git，或不想装）
+
+```bash
+python deploy/make_release.py        # 在开发机上生成，约 0.1 MB
+```
+
+把得到的 `tscp-web-deploy.zip` 上传到服务器，然后：
+
+```bash
+unzip tscp-web-deploy.zip
+cd tscp-web
+sudo ./deploy/install-ubuntu.sh
+```
+
+包里只有服务器需要的部分：`webapp/`、`PlotManager/`、`tscp_player/`、`deploy/`、
+依赖清单和许可证。桌面工具（它们要 PySide6，headless 上跑不起来）和 94 MB 的示例
+剧情都没有打进去。压缩包内的 `DEPLOY.txt` 有同样的步骤说明。
+
+**8080 已经被占用不影响** —— 这个服务默认用 8888。如果 8888 也被占了，安装脚本会
+在启动前直接报出来并告诉你怎么换端口。
+
+---
+
+## 方式二：在服务器上 git clone
 
 ```bash
 git clone https://github.com/Yore-ASH/AmbientBook.git
@@ -106,6 +129,13 @@ sudo ./deploy/install-ubuntu.sh     # 会保留 /etc/tscp-web.env 里的密钥
 ```
 
 脚本对已存在的 `/etc/tscp-web.env` **只读不写**，所以密钥和配置不会丢。
+端口检查在服务已在运行时会被跳过（那一刻占用端口的正是它自己）。
+
+用部署包的话，重新生成上传、解压覆盖、再跑一次安装脚本即可。
+
+> **改完代码必须重启服务。** 生产走 `gunicorn "webapp:create_app()"`，代码在启动时
+> 就加载进 worker 了，`git pull` 不会自动生效。前端 JS/CSS 还有浏览器缓存，更新后
+> 让用户强刷一次（Ctrl+F5）。
 
 ---
 
@@ -129,6 +159,7 @@ sudo systemctl start tscp-web
 | 现象 | 原因与处理 |
 | --- | --- |
 | 8888 连不上 | `sudo ufw allow 8888/tcp`；云厂商的安全组也要放行 |
+| `端口 8888 已经被占用` | 安装脚本会直接报出来；换端口 `sudo PORT=9999 ./deploy/install-ubuntu.sh` |
 | 服务起不来 | `journalctl -u tscp-web -n 50 --no-pager` |
 | `Address already in use` | `sudo ss -ltnp \| grep 8888` 找出占用者，或换端口 |
 | 上传音频报 413 | 同时调大 `/etc/tscp-web.env` 的 `TSCP_MAX_UPLOAD_MB` 和 nginx 的 `client_max_body_size` |
