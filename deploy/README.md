@@ -7,6 +7,24 @@
 
 ---
 
+## 前置条件
+
+Ubuntu 上 **`python3-venv` 默认不装**，而且缺了它时 `python3 -c 'import venv'` 仍然会
+成功 —— 只有真正建虚拟环境的那一刻才会报 `ensurepip is not available`。
+
+所以安装脚本现在会自己先查 `ensurepip`：
+
+* 缺了就**自动 `apt-get install python3-venv`**（先试带版本号的 `python3.10-venv`）
+* 装不上就停下并给出准确命令，不会跑到一半才失败
+
+如果你更想手动来一遍：
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-venv
+```
+
+---
+
 ## 方式一：上传部署包（服务器上没有 git，或不想装）
 
 ```bash
@@ -159,6 +177,7 @@ sudo systemctl start tscp-web
 | 现象 | 原因与处理 |
 | --- | --- |
 | 8888 连不上 | `sudo ufw allow 8888/tcp`；云厂商的安全组也要放行 |
+| `ensurepip is not available` | 缺 `python3-venv`。脚本会尽量自动装；装不上就 `sudo apt install -y python3-venv` 后重跑 |
 | `端口 8888 已经被占用` | 安装脚本会直接报出来；换端口 `sudo PORT=9999 ./deploy/install-ubuntu.sh` |
 | 服务起不来 | `journalctl -u tscp-web -n 50 --no-pager` |
 | `Address already in use` | `sudo ss -ltnp \| grep 8888` 找出占用者，或换端口 |

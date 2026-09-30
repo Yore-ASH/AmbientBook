@@ -4,7 +4,7 @@
 #
 #   sudo ./deploy/install-ubuntu.sh
 #
-# 可用环境变量覆盖：APP_DIR / DATA_DIR / SERVICE_USER / PORT
+# 可用环境变量覆盖：APP_DIR / DATA_DIR / SERVICE_USER / PORT / ENV_FILE / UNIT
 #
 set -euo pipefail
 
@@ -12,8 +12,8 @@ APP_DIR="${APP_DIR:-/opt/tscp}"
 DATA_DIR="${DATA_DIR:-/var/lib/tscp-web}"
 SERVICE_USER="${SERVICE_USER:-tscp}"
 PORT="${PORT:-8888}"
-ENV_FILE="/etc/tscp-web.env"
-UNIT="/etc/systemd/system/tscp-web.service"
+ENV_FILE="${ENV_FILE:-/etc/tscp-web.env}"
+UNIT="${UNIT:-/etc/systemd/system/tscp-web.service}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -28,6 +28,27 @@ import sys
 raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
 PY
 python3 -c 'import venv' 2>/dev/null || die "缺少 venv 模块：apt install python3-venv"
+
+# Ubuntu 上 ``import venv`` 即使没装 python3-venv 也会成功 —— 缺的是 ensurepip，
+# 只有真正建虚拟环境那一刻才暴露。所以必须单独查，并尽量自动补上。
+if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    log "缺少 ensurepip（Python $PY_VERSION），尝试自动安装 python3-venv"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y "python${PY_VERSION}-venv" >/dev/null 2>&1 \
+            || apt-get install -y python3-venv >/dev/null 2>&1 \
+            || true
+    fi
+    if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+        die "缺少 python3-venv，请手动安装后重试：
+
+  sudo apt update && sudo apt install -y python3-venv
+
+你的 Python 是 $PY_VERSION，对应的包名也可能是 python${PY_VERSION}-venv"
+    fi
+    log "python3-venv 已就绪"
+fi
 
 log "创建系统用户 $SERVICE_USER"
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -48,7 +69,8 @@ else
 fi
 
 log "创建虚拟环境并安装网页版依赖（不含 PySide6 / pygame）"
-python3 -m venv "$APP_DIR/.venv"
+# --clear 让重试是确定的：上一次半途失败的虚拟环境不会留下残缺状态。
+python3 -m venv --clear "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip >/dev/null
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements-web.txt"
 
@@ -68,7 +90,12 @@ else
 fi
 
 log "安装 systemd 单元"
+# WorkingDirectory、gunicorn 路径和 ReadWritePaths 都必须跟着 APP_DIR/DATA_DIR 走，
+# 否则改了 APP_DIR 之后服务仍然去找 /opt/tscp，直接起不来。
 sed -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR|" \
+    -e "s|^WorkingDirectory=.*|WorkingDirectory=$APP_DIR|" \
+    -e "s|^Documentation=.*|Documentation=file://$APP_DIR/webapp/README.md|" \
+    -e "s|/opt/tscp/.venv/bin/gunicorn|$APP_DIR/.venv/bin/gunicorn|" \
     -e "s|--bind 0\.0\.0\.0:8888|--bind 0.0.0.0:$PORT|" \
     "$SOURCE_DIR/deploy/tscp-web.service" > "$UNIT"
 chmod 644 "$UNIT"

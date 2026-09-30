@@ -4,7 +4,9 @@ The archive is a real deployment artefact, so its shape matters: a wrong file
 mode or a missing package turns into a confusing failure on somebody's server.
 """
 
+import shutil
 import stat
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -116,3 +118,82 @@ def test_collect_only_walks_the_expected_places():
     assert files
     tops = {path.relative_to(make_release.ROOT).parts[0] for path in files}
     assert tops <= set(make_release.INCLUDE_DIRS) | set(make_release.INCLUDE_FILES)
+
+
+# --------------------------------------------------------------------------
+# the installer itself
+# --------------------------------------------------------------------------
+
+INSTALLER = make_release.ROOT / "deploy" / "install-ubuntu.sh"
+
+
+def _bash():
+    """A real bash, if this machine has one. Git for Windows ships one."""
+
+    found = shutil.which("bash")
+    if found:
+        return found
+    for candidate in (
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        "/bin/bash",
+        "/usr/bin/bash",
+    ):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def test_the_installer_is_valid_bash():
+    bash = _bash()
+    if not bash:
+        pytest.skip("no bash on this machine")
+    result = subprocess.run(
+        [bash, "-n", str(INSTALLER)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_installer_checks_ensurepip_not_just_venv():
+    """Regression: ``import venv`` succeeds on Ubuntu without python3-venv.
+
+    Ubuntu ships ``venv`` in the base interpreter but ``ensurepip`` in a separate
+    package, so checking only ``venv`` lets the script run all the way to
+    ``python3 -m venv`` before failing with ensurepip's own message.
+    """
+
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "import ensurepip" in text
+    # ...and it has to offer a way out, not just die.
+    assert "python3-venv" in text
+    assert "apt-get install" in text
+
+
+def test_the_installer_rebuilds_the_venv_from_scratch():
+    """A half-built venv from a failed run must not be reused."""
+
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "venv --clear" in text
+
+
+def test_the_unit_rewrites_follow_the_overridable_paths():
+    """Every absolute /opt/tscp in the unit has to be rewritten.
+
+    Overriding APP_DIR used to leave WorkingDirectory and the gunicorn path
+    pointing at /opt/tscp, so the service could not start.
+    """
+
+    text = INSTALLER.read_text(encoding="utf-8")
+    for field in ("ReadWritePaths", "WorkingDirectory", "Documentation"):
+        assert "s|^%s=.*|" % field in text, field
+    assert "/opt/tscp/.venv/bin/gunicorn" in text      # rewritten to $APP_DIR
+    assert "--bind 0\\.0\\.0\\.0:8888" in text          # rewritten to $PORT
+
+
+def test_the_installer_refuses_a_port_that_is_taken():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "已经被占用" in text
+    # It must not fire on an update, when the port is ours.
+    assert "systemctl is-active --quiet tscp-web" in text
+
