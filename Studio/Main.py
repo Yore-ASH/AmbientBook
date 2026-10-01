@@ -2551,10 +2551,22 @@ if QT_AVAILABLE:
                 % (prefix, _styled_html(event.text, cursor))
             )
 
+        def _stop_music(self) -> None:
+            """Silence the backing track without forgetting which one it was.
+
+            Called when a run ends: the track was looping for the whole timing
+            session and had no reason to keep going once the last key was hit.
+            """
+
+            if self._music is not None:
+                self._music.stop()
+
         def _commit(self) -> None:
             name = self.current_script_name()
             if name is None or self.model is None:
                 return
+            # ``complete`` has just gone true, so the run is over.
+            self._stop_music()
             previous = self.project.script(name)
             targets = set(self.model.targets)
             result = self.model.result()

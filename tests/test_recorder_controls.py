@@ -464,3 +464,182 @@ def test_the_dialog_styles_the_translation_separately(qapp):
     assert styles[1.0] == {"translation_font": "Arial"}
     # The original half is untouched.
     assert "font" not in styles[1.0]
+
+
+def _tiny_flac() -> bytes:
+    """A structurally valid FLAC: STREAMINFO then some audio frames."""
+
+    streaminfo = bytes(34)
+    out = bytearray(b"fLaC")
+    out.append(0x80 | 0)                      # last metadata block, STREAMINFO
+    out += len(streaminfo).to_bytes(3, "big")
+    out += streaminfo
+    out += b"AUDIOFRAMES" * 4
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------
+# the player reads the lyric document, not just the .lrc
+# --------------------------------------------------------------------------
+
+def test_per_line_styles_reach_the_player(tmp_path):
+    """Reading only the .lrc made every line come out in the track colour."""
+
+    from PlotManager import model as plot_model
+    from tscp_player import plot
+    from tscp_player.lyrics import (
+        Lyrics,
+        LyricLine,
+        serialize_lyric_document,
+    )
+
+    song = tmp_path / "song.flac"
+    song.write_bytes(_tiny_flac())
+
+    package_path = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package_path, name="x", description="")
+    plot_model.add_tracks(
+        package_path,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=song, kind="lyrics",
+            lyrics_text="[00:01.00]a\n", color="#ff0000",
+        )],
+    )
+    plot_model.update_track(
+        package_path,
+        "iw",
+        lyric_document=serialize_lyric_document(
+            Lyrics([LyricLine(1.0, "a", color="#00ff00")])
+        ),
+    )
+
+    package = plot.load_plot(package_path)
+    assert package.track("iw").document
+    lines = package.lyrics("iw").lines
+    assert lines[0].color == "#00ff00"
+    # The track colour is still the fallback for unstyled lines.
+    assert package.track("iw").color == "#ff0000"
+
+
+def test_a_track_without_a_document_still_reads_its_lrc(tmp_path):
+    from PlotManager import model as plot_model
+    from tscp_player import plot
+
+    song = tmp_path / "song.flac"
+    song.write_bytes(_tiny_flac())
+
+    package_path = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package_path, name="x", description="")
+    plot_model.add_tracks(
+        package_path,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=song, kind="lyrics",
+            lyrics_text="[00:01.00]only\n",
+        )],
+    )
+
+    package = plot.load_plot(package_path)
+    assert package.track("iw").document is None
+    assert package.lyrics("iw").lines[0].text == "only"
+
+
+def test_a_broken_document_falls_back_to_the_lrc(tmp_path):
+    from PlotManager import model as plot_model
+    from tscp_player import plot
+
+    song = tmp_path / "song.flac"
+    song.write_bytes(_tiny_flac())
+
+    package_path = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package_path, name="x", description="")
+    plot_model.add_tracks(
+        package_path,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=song, kind="lyrics",
+            lyrics_text="[00:01.00]fallback\n",
+        )],
+    )
+    # Something that claims to be a document but is not.
+    plot_model.update_track(package_path, "iw", lyric_document="{ not json")
+
+    package = plot.load_plot(package_path)
+    assert package.lyrics("iw").lines[0].text == "fallback"
+
+
+def test_the_document_wins_over_the_lrc(tmp_path):
+    """Both are present; the richer one is the one that should be shown."""
+
+    from PlotManager import model as plot_model
+    from tscp_player import plot
+    from tscp_player.lyrics import Lyrics, LyricLine, serialize_lyric_document
+
+    song = tmp_path / "song.flac"
+    song.write_bytes(_tiny_flac())
+
+    package_path = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package_path, name="x", description="")
+    plot_model.add_tracks(
+        package_path,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=song, kind="lyrics",
+            lyrics_text="[00:01.00]from lrc\n",
+        )],
+    )
+    plot_model.update_track(
+        package_path,
+        "iw",
+        lyric_document=serialize_lyric_document(
+            Lyrics([LyricLine(1.0, "from document", font="Arial")])
+        ),
+    )
+
+    package = plot.load_plot(package_path)
+    line = package.lyrics("iw").lines[0]
+    assert line.text == "from document"
+    assert line.font == "Arial"
+
+
+# --------------------------------------------------------------------------
+# the overlay keeps itself in front
+# --------------------------------------------------------------------------
+
+def test_the_overlay_asks_to_stay_on_top(qapp):
+    from PySide6.QtCore import Qt
+
+    from tscp_player.lyricview import LyricsWindow
+
+    window = LyricsWindow()
+    flags = window.windowFlags()
+    assert flags & Qt.WindowType.WindowStaysOnTopHint
+    assert flags & Qt.WindowType.FramelessWindowHint
+
+
+def test_the_overlay_re_asserts_itself_while_showing(qapp):
+    """The hint is only a request; another app can still end up in front."""
+
+    from tscp_player.lyrics import Lyrics, LyricLine
+    from tscp_player.lyricview import LyricsWindow
+
+    window = LyricsWindow()
+    assert not window._top_timer.isActive()
+
+    window.show_track(Lyrics([LyricLine(1.0, "hi")]), "#fff", 1.0)
+    assert window._top_timer.isActive()
+    # And the timer is wired to something that re-raises rather than raising.
+    window._keep_on_top()
+
+    window.clear()
+    assert not window._top_timer.isActive()
+
+
+def test_the_overlay_stops_re_asserting_when_hidden(qapp):
+    from tscp_player.lyrics import Lyrics, LyricLine
+    from tscp_player.lyricview import LyricsWindow
+
+    window = LyricsWindow()
+    window.show_track(Lyrics([LyricLine(1.0, "hi")]), "#fff", 1.0)
+    window.hide()
+    window._keep_on_top()
+    assert not window._top_timer.isActive()
+
+

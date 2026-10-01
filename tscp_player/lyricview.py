@@ -16,7 +16,7 @@ from typing import Any, Iterable, Optional
 from .lyrics import plan_lyric_rows, to_html
 
 try:  # pragma: no cover - depends on the optional GUI package
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics
     from PySide6.QtWidgets import (
         QApplication,
@@ -79,6 +79,13 @@ if QT_AVAILABLE:
             self._dragging = None
             self.resize(960, 130)
 
+            # WindowStaysOnTopHint is a request, not a guarantee: on Windows
+            # another app taking focus can still end up in front. Re-asserting
+            # periodically is what actually keeps the lyrics visible.
+            self._top_timer = QTimer(self)
+            self._top_timer.setInterval(1000)
+            self._top_timer.timeout.connect(self._keep_on_top)
+
         # -- content -------------------------------------------------------
         def show_track(self, lyrics, color: str = "", seconds: float = 0.0) -> None:
             """Start showing *lyrics* in *color*, positioned once per track."""
@@ -89,6 +96,7 @@ if QT_AVAILABLE:
                 self._place()
                 self.show()
             self.raise_()
+            self._top_timer.start()
             self.update_line(seconds)
 
         def update_line(self, seconds: float) -> None:
@@ -103,7 +111,16 @@ if QT_AVAILABLE:
         def clear(self) -> None:
             self._lyrics = None
             self.label.clear()
+            self._top_timer.stop()
             self.resize(960, 130)
+
+        def _keep_on_top(self) -> None:
+            """Put the overlay back in front without stealing focus."""
+
+            if not self.isVisible():
+                self._top_timer.stop()
+                return
+            self.raise_()
 
         # -- rendering -----------------------------------------------------
         def _columns_width(self) -> float:

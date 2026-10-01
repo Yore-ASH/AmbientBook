@@ -52,6 +52,9 @@ class MusicTrack:
     kind: str = KIND_INSTRUMENTAL
     lyrics: Optional[str] = None
     color: str = ""
+    #: Member holding the richer lyric document (per-line font and colour).
+    #: LRC cannot express those, so they live beside it.
+    document: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -207,16 +210,43 @@ class PlotPackage:
             return None
         return self.source.materialize(member)
 
-    def lyrics(self, abbreviation: str):
-        """The parsed lyrics for one abbreviation, or empty lyrics."""
+    def lyrics_document_path(self, abbreviation: str) -> Optional[Path]:
+        """A real filename for a track's JSON lyric document, if it has one."""
 
-        from .lyrics import Lyrics, parse_lrc
+        track = self.track(abbreviation)
+        if track is None or not track.document:
+            return None
+        member = "%s/%s" % (MUSICS, track.document)
+        if not self.source.exists(member):
+            return None
+        return self.source.materialize(member)
+
+    def lyrics(self, abbreviation: str):
+        """The parsed lyrics for one abbreviation, or empty lyrics.
+
+        The JSON document wins when present: it carries everything the ``.lrc``
+        does plus the per-line font and colour, which is why reading only the
+        ``.lrc`` made every line come out in the track's own colour.
+        """
+
+        from .lyrics import Lyrics, parse_lyrics
+
+        document = self.lyrics_document_path(abbreviation)
+        if document is not None:
+            try:
+                parsed = parse_lyrics(document.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                parsed = None
+            # A document that parses to nothing is broken, not empty: falling
+            # through to the .lrc beats showing no lyrics at all.
+            if parsed:
+                return parsed
 
         path = self.lyrics_path(abbreviation)
         if path is None:
             return Lyrics([])
         try:
-            return parse_lrc(path.read_text(encoding="utf-8"))
+            return parse_lyrics(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError):
             return Lyrics([])
 
@@ -289,12 +319,14 @@ def parse_tracks(metadata: dict, music: Dict[str, str]) -> Dict[str, MusicTrack]
         if kind not in {KIND_INSTRUMENTAL, KIND_LYRICS}:
             raise PlotPackageError("music track %s has an unknown KIND" % abbreviation)
         lyrics = entry.get("LYRICS")
+        document = entry.get("LYRICS_JSON")
         tracks[abbreviation] = MusicTrack(
             abbreviation=abbreviation,
             filename=filename,
             kind=kind,
             lyrics=str(lyrics) if lyrics else None,
             color=str(entry.get("COLOR") or ""),
+            document=str(document) if document else None,
         )
     return tracks
 

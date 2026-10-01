@@ -2541,3 +2541,41 @@ def test_dialogue_dialog_has_no_multiline_editor(studio, tmp_path):
     dialog = DialogueDialog(window, window, None, narrator=False)
     assert not isinstance(dialog.text_edit, QPlainTextEdit)
 
+
+# --------------------------------------------------------------------------
+# the timing run stops its music
+# --------------------------------------------------------------------------
+
+def test_a_finished_timing_run_stops_the_music(studio, tmp_path):
+    window = studio
+    step = window.steps[2]
+    project = window.project
+    project.set_character("f", "FISH", "")
+    name = project.new_script("序章")
+    project.add_event(name, Dialogue("f", "你好", [0.5] * 2))
+    window._refresh_all()
+
+    stopped = []
+
+    class FakePlayer:
+        def stop(self):
+            stopped.append(True)
+
+    step._music = FakePlayer()
+    script = project.script(name)
+    step.model = type(
+        "M",
+        (),
+        {"targets": [], "complete": True, "result": lambda self: script},
+    )()
+    step.current_script_name = lambda: name
+
+    step._commit()
+    assert stopped == [True]
+
+
+def test_stopping_music_tolerates_never_having_played(studio, tmp_path):
+    window = studio
+    step = window.steps[2]
+    step._music = None
+    step._stop_music()          # must not raise
