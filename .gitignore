@@ -13,6 +13,11 @@ source/dist/
 # 一直报成未跟踪，所以直接忽略。
 *.tscpkg
 
+# PyInstaller 与打包产物，见 deploy/make_player_zip.py
+/build/
+/dist/
+*.spec.bak
+
 # 生成的部署包，见 deploy/make_release.py
 tscp-web-deploy*.zip
 
