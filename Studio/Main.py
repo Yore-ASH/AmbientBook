@@ -72,6 +72,9 @@ from tscp_player.lyrics import (
 from tscp_player.music import STOP_WORDS
 from tscp_player import marks, musicpack
 
+#: Written as a constant so the mark syntax never needs escaping in source.
+BACKSLASH = "\\"
+
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, Signal
     from PySide6.QtGui import (
@@ -165,10 +168,24 @@ def _ansi_css(sequence: str) -> str:
         90: "#777777", 91: "#ff6666", 92: "#66ee88", 93: "#ffff66",
         94: "#66aaff", 95: "#ee88ee", 96: "#66eeee", 97: "#ffffff",
     }
+    parts = [int(raw or 0) for raw in match.group(1).split(";")]
     css: List[str] = []
-    for raw in match.group(1).split(";"):
-        code = int(raw or 0)
-        if code == 0:
+    index = 0
+    while index < len(parts):
+        code = parts[index]
+        # ``38;2;r;g;b`` is 24-bit colour, which is what \co emits; the plain
+        # 30-37 table above cannot express it, so it used to be dropped.
+        if code == 38 and index + 1 < len(parts) and parts[index + 1] == 2:
+            if index + 4 < len(parts):
+                red, green, blue = parts[index + 2:index + 5]
+                css.append("color:#%02x%02x%02x" % (red & 0xFF, green & 0xFF, blue & 0xFF))
+                index += 5
+                continue
+        elif code == 38 and index + 1 < len(parts) and parts[index + 1] == 5:
+            if index + 2 < len(parts):
+                index += 3
+                continue
+        elif code == 0:
             css = []
         elif code in colors:
             css.append("color:%s" % colors[code])
@@ -176,6 +193,7 @@ def _ansi_css(sequence: str) -> str:
             css.append("font-weight:bold")
         elif code == 4:
             css.append("text-decoration:underline")
+        index += 1
     return ";".join(css)
 
 
@@ -616,10 +634,18 @@ if QT_AVAILABLE:
             insert_button.setToolTip("把带颜色的角色名字插到光标处")
             insert_button.clicked.connect(self.insert_name)
 
+            self.colour_button = QPushButton("选中上色")
+            self.colour_button.setToolTip(
+                "把选中的文字变成白色。文本里写成 \\co?ffffff…\\co，"
+                "播放与导出时会自动换成真正的颜色代码"
+            )
+            self.colour_button.clicked.connect(self.colour_selection)
+
             insert_row = QHBoxLayout()
             insert_row.addWidget(QLabel("插入"))
             insert_row.addWidget(self.name_combo, 1)
             insert_row.addWidget(insert_button)
+            insert_row.addWidget(self.colour_button)
             insert_row.addStretch(1)
 
             self.preview = QLabel()
@@ -682,6 +708,27 @@ if QT_AVAILABLE:
         def _set_text(self, value: str) -> None:
             self.text_edit.setText(value)
 
+        COLOUR_WHITE = "ffffff"
+
+        def colour_selection(self) -> None:
+            """Wrap the selected text so it is drawn in white.
+
+            White rather than a colour picker because the mark is also how a run
+            is made to appear as one unit when it has no style of its own -- the
+            same wrap does both jobs.
+            """
+
+            start = self.text_edit.selectionStart()
+            chosen = self.text_edit.selectedText()
+            if not chosen:
+                QMessageBox.information(self, "上色", "先选中要上色的文字")
+                return
+            wrapped = "%s%s%s%s%s" % (
+                BACKSLASH, "co?%s" % self.COLOUR_WHITE, chosen, BACKSLASH, "co",
+            )
+            self.text_edit.insert(wrapped)
+            self._refresh_preview()
+
         def insert_name(self) -> None:
             key = self.name_combo.currentData()
             character = self.characters.get(key) if key else None
@@ -724,10 +771,10 @@ if QT_AVAILABLE:
             if not text and not prefix:
                 self.preview.setText("<span style='color:#777'>（还没有内容）</span>")
                 return
-            self.preview.setText(prefix + _styled_html(text))
+            self.preview.setText(prefix + _styled_html(marks.expand_colours(text)))
 
         def values(self) -> Optional[Dialogue]:
-            text = self.text().strip()
+            text = marks.expand_colours(self.text().strip())
             if not text:
                 return None
             character = None if self.narrator else self.character_combo.currentData()

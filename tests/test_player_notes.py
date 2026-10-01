@@ -149,3 +149,99 @@ def test_supplements_do_not_hold_up_the_story(window):
     without = Script([window.script.lines[0], window.script.lines[1],
                       window.script.lines[3], window.script.lines[4]])
     assert sum(durations) == pytest.approx(sum(line_durations(without)))
+
+
+# --------------------------------------------------------------------------
+# the player no longer drifts behind its recording
+# --------------------------------------------------------------------------
+
+def test_the_schedule_starts_immediately():
+    from Main import PlayerWindow
+
+    due = PlayerWindow._build_schedule("abcd", [0.5, 0.5, 0.5, 0.5])
+    assert due[0] == 0.0
+    assert due == [0.0, 0.5, 1.0, 1.5]
+
+
+def test_the_schedule_gives_a_group_one_moment():
+    """Delays of zero mean "same moment as the one before"."""
+
+    from Main import PlayerWindow
+
+    due = PlayerWindow._build_schedule("abcd", [0.5, 0.0, 0.0, 0.5])
+    assert due[1] == due[2] == due[3] == 0.5
+
+
+def test_the_schedule_copes_with_missing_delays():
+    from Main import PlayerWindow
+
+    due = PlayerWindow._build_schedule("abcd", [0.2])
+    assert len(due) == 4
+    assert due == [0.0, 0.2, 0.2, 0.2]
+
+
+def test_the_schedule_ignores_negative_delays():
+    from Main import PlayerWindow
+
+    due = PlayerWindow._build_schedule("ab", [-1.0, 0.5])
+    assert due == [0.0, 0.0]
+
+
+def test_the_schedule_is_monotonic():
+    """A character can never be due before the one in front of it."""
+
+    from Main import PlayerWindow
+
+    due = PlayerWindow._build_schedule("abcdef", [0.1, 0.0, 0.3, 0.0, 0.2, 0.4])
+    assert due == sorted(due)
+
+
+def test_an_empty_line_has_an_empty_schedule():
+    from Main import PlayerWindow
+
+    assert PlayerWindow._build_schedule("", []) == []
+
+
+# --------------------------------------------------------------------------
+# \co's 24-bit colour actually reaches the preview
+# --------------------------------------------------------------------------
+
+def test_ansi_truecolour_becomes_css(qapp):
+    from Studio.Main import _ansi_css
+
+    assert _ansi_css("\x1b[38;2;0;255;170m") == "color:#00ffaa"
+    assert _ansi_css("\x1b[38;2;255;0;0m") == "color:#ff0000"
+
+
+def test_the_plain_colour_table_still_works(qapp):
+    from Studio.Main import _ansi_css
+
+    assert _ansi_css("\x1b[33m") == "color:#cccc33"
+    assert _ansi_css("\x1b[1;31m") == "font-weight:bold;color:#cc3333"
+
+
+def test_a_reset_clears_everything(qapp):
+    from Studio.Main import _ansi_css
+
+    assert _ansi_css("\x1b[0m") == ""
+
+
+def test_the_256_colour_form_is_skipped_not_misread(qapp):
+    """``38;5;n`` must not be read as if it were ``38;2;r;g;b``."""
+
+    from Studio.Main import _ansi_css
+
+    assert _ansi_css("\x1b[38;5;208m") == ""
+
+
+def test_a_mark_reaches_the_preview_as_colour(qapp):
+    from Studio.Main import _ansi_css, _styled_html
+    from tscp_player import marks
+
+    expanded = marks.expand_colours(chr(92) + "co?00ffaa文字" + chr(92) + "co")
+    markup = _styled_html(expanded)
+    assert "color:#00ffaa" in markup
+    # One span per character -- the panel highlights any single character, so the
+    # text is not contiguous in the markup.
+    assert markup.count("color:#00ffaa") == 2
+    assert "文" in markup and "字" in markup

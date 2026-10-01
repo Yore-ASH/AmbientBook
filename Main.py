@@ -400,21 +400,54 @@ if QT_AVAILABLE:
             self.current_text = _plain(item.text)
             self.current_delays = list(item.delays)
             self.char_index = 0
+            # When each character is due, measured from the start of the line.
+            # A chain of single-shot timers accumulates the event loop's latency
+            # at every character; an absolute schedule cannot.
+            self._due = self._build_schedule(self.current_text, self.current_delays)
+            self._line_started = time.monotonic()
             self.status.setText("播放中 · " + speaker)
             self._write_character()
+
+        @staticmethod
+        def _build_schedule(characters: str, delays) -> List[float]:
+            """Seconds at which each character should appear.
+
+            The first character is due immediately; ``delays[i]`` is the gap
+            before character ``i + 1``, which is how the format defines it.
+            """
+
+            due: List[float] = []
+            clock = 0.0
+            for index in range(len(characters)):
+                due.append(clock)
+                if index < len(delays):
+                    clock += max(0.0, float(delays[index]))
+            return due
 
         def _write_character(self) -> None:
             if self.char_index >= len(self.current_text):
                 QTimer.singleShot(0, self._next_event)
                 return
+
+            elapsed = time.monotonic() - self._line_started
             cursor = self.output.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText(self.current_text[self.char_index])
+            # Everything already due goes in together, so a timer that fired
+            # late does not push every later character further behind.
+            while (
+                self.char_index < len(self.current_text)
+                and self._due[self.char_index] <= elapsed
+            ):
+                cursor.insertText(self.current_text[self.char_index])
+                self.char_index += 1
             self.output.setTextCursor(cursor)
             self._center_cursor(cursor)
-            delay = self.current_delays[self.char_index] if self.char_index < len(self.current_delays) else 0.0
-            self.char_index += 1
-            QTimer.singleShot(max(0, round(delay * 1000)), self._write_character)
+
+            if self.char_index >= len(self.current_text):
+                QTimer.singleShot(0, self._next_event)
+                return
+            wait = self._due[self.char_index] - elapsed
+            QTimer.singleShot(max(0, round(wait * 1000)), self._write_character)
 
         def _center_cursor(self, cursor: QTextCursor) -> None:
             self.output.ensureCursorVisible()
