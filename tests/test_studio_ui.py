@@ -1676,7 +1676,7 @@ def test_dialogue_dialog_lists_characters_by_name(studio, tmp_path):
     assert labels == ["FISH", "Teiresias"]
     # ...while each entry still carries the file key.
     assert dialog.character_combo.itemData(0) == "f"
-    dialog.text_edit.setPlainText("你好")
+    dialog.text_edit.setText("你好")
     assert dialog.values() == Dialogue("f", "你好")
 
 
@@ -1707,19 +1707,17 @@ def test_narration_is_a_single_line_and_enter_commits(studio, tmp_path):
 
 
 def test_dialogue_inserts_a_coloured_character_name(studio, tmp_path):
-    from PySide6.QtGui import QTextCursor
-
     from Studio.Main import DialogueDialog
 
     window = studio
     _story(window, tmp_path)
     dialog = DialogueDialog(window, window, None, narrator=False)
-    dialog.text_edit.setPlainText("说：")
-    dialog.text_edit.moveCursor(QTextCursor.MoveOperation.End)
+    dialog.text_edit.setText("说：")
+    dialog.text_edit.end(False)          # QLineEdit, not a QTextEdit
     dialog.name_combo.setCurrentIndex(1)          # FISH
     dialog.insert_name()
 
-    text = dialog.text_edit.toPlainText()
+    text = dialog.text_edit.text()
     assert text == "说：\033[1;33mFISH\033[0m"
     # The preview renders the colour rather than the escape codes.
     assert "#cccc33" in dialog.preview.text() or "font-weight:bold" in dialog.preview.text()
@@ -2498,3 +2496,48 @@ def test_the_preview_follows_the_mixers_position(studio, tmp_path, monkeypatch):
     step._sync_preview()
 
     assert seen == [1.5]
+
+def test_dialogue_is_a_single_line_and_enter_commits(studio, tmp_path):
+    """A spoken line is one line, written the same way narration is."""
+
+    from PySide6.QtWidgets import QLineEdit
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+
+    assert isinstance(dialog.text_edit, QLineEdit)
+    assert not isinstance(dialog.text_edit, type(None))
+    dialog.character_combo.setCurrentIndex(1)          # Teiresias
+    dialog.text_edit.setText("灯还亮着。")
+    dialog.text_edit.returnPressed.emit()
+
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert dialog.values() == Dialogue("t", "灯还亮着。")
+
+
+def test_dialogue_and_narration_use_the_same_editor_type(studio, tmp_path):
+    from PySide6.QtWidgets import QLineEdit
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    spoken = DialogueDialog(window, window, None, narrator=False)
+    told = DialogueDialog(window, window, None, narrator=True)
+
+    assert type(spoken.text_edit) is type(told.text_edit) is QLineEdit
+
+
+def test_dialogue_dialog_has_no_multiline_editor(studio, tmp_path):
+    from PySide6.QtWidgets import QPlainTextEdit
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    assert not isinstance(dialog.text_edit, QPlainTextEdit)
+

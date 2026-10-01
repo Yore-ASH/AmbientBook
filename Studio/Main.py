@@ -560,15 +560,18 @@ if QT_AVAILABLE:
     class DialogueDialog(QDialog):
         """Write one line of dialogue or narration.
 
-        Characters are picked by **name** — the file key never appears.  Narration
-        is a single line and Enter finishes it, because that is how it is written.
+        Characters are picked by **name** — the file key never appears.  Both
+        kinds are a single line and Enter finishes them, because that is how a
+        line gets written; a spoken line is no more two lines than narration is.
         Either kind can drop a coloured character name into the text.
         """
 
         def __init__(self, parent, studio_window, event: Optional[Dialogue], narrator: bool) -> None:
             super().__init__(parent)
             self.setWindowTitle("添加旁白" if narrator else "角色对白")
-            self.resize(640, 300 if narrator else 480)
+            # Tall enough for the character picker and the preview, not for a
+            # multi-line editor that no longer exists.
+            self.resize(640, 320 if narrator else 360)
             self.studio = studio_window
             self.narrator = narrator
             self.characters = dict(studio_window.project.characters)
@@ -579,14 +582,13 @@ if QT_AVAILABLE:
                 self.character_combo.addItem(character.name, key)
 
             # -- what ------------------------------------------------------
-            if narrator:
-                self.text_edit = QLineEdit()
-                self.text_edit.setPlaceholderText("这一句旁白，按 Enter 完成")
-                self.text_edit.returnPressed.connect(self.accept)
-            else:
-                self.text_edit = QPlainTextEdit()
-                self.text_edit.setPlaceholderText("这一句要说的话")
-                self.text_edit.setMinimumHeight(170)
+            # One line either way: a spoken line is a line, and Enter finishing
+            # it is how both kinds get written.
+            self.text_edit = QLineEdit()
+            self.text_edit.setPlaceholderText(
+                "这一句旁白，按 Enter 完成" if narrator else "这一句要说的话，按 Enter 完成"
+            )
+            self.text_edit.returnPressed.connect(self.accept)
 
             # -- drop in a coloured name -----------------------------------
             self.name_combo = QComboBox()
@@ -621,23 +623,16 @@ if QT_AVAILABLE:
                 layout.addLayout(form)
             layout.addWidget(QLabel("内容"))
             # A single-line editor has no business absorbing vertical space.
-            if narrator:
-                layout.addWidget(self.text_edit)
-            else:
-                layout.addWidget(self.text_edit, 1)
+            layout.addWidget(self.text_edit)
             layout.addLayout(insert_row)
             layout.addWidget(QLabel("预览（播放时的样子；上面框里的颜色代码不可见）"))
             layout.addWidget(self.preview)
 
-            hint = QLabel(
-                "标点和符号也会参与计时，只有空格是自动显示的。"
-                + ("" if narrator else "　Ctrl+Enter 也可以完成。")
-            )
+            hint = QLabel("标点和符号也会参与计时，只有空格是自动显示的。")
             hint.setObjectName("hint")
             layout.addWidget(hint)
-            if narrator:
-                # Nothing above wants to grow, so push the buttons to the bottom.
-                layout.addStretch(1)
+            # Nothing above wants to grow, so push the buttons to the bottom.
+            layout.addStretch(1)
 
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -650,9 +645,6 @@ if QT_AVAILABLE:
             layout.addWidget(buttons)
 
             self.text_edit.textChanged.connect(self._refresh_preview)
-            if not narrator:
-                shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
-                shortcut.activated.connect(self.accept)
 
             if event is not None:
                 self._set_text(event.text)
@@ -663,15 +655,10 @@ if QT_AVAILABLE:
             self._refresh_preview()
 
         def text(self) -> str:
-            return (
-                self.text_edit.text() if self.narrator else self.text_edit.toPlainText()
-            )
+            return self.text_edit.text()
 
         def _set_text(self, value: str) -> None:
-            if self.narrator:
-                self.text_edit.setText(value)
-            else:
-                self.text_edit.setPlainText(value)
+            self.text_edit.setText(value)
 
         def insert_name(self) -> None:
             key = self.name_combo.currentData()
@@ -683,11 +670,7 @@ if QT_AVAILABLE:
                 if character.style
                 else character.name
             )
-            # A one-line editor has no plain-text API beyond insert().
-            if self.narrator:
-                self.text_edit.insert(snippet)
-            else:
-                self.text_edit.insertPlainText(snippet)
+            self.text_edit.insert(snippet)
             self._refresh_preview()
 
         def _refresh_preview(self) -> None:
