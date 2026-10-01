@@ -96,6 +96,7 @@ try:  # pragma: no cover - depends on the optional GUI package
         QDialogButtonBox,
         QDoubleSpinBox,
         QFontDialog,
+        QStyledItemDelegate,
         QFileDialog,
         QFormLayout,
         QHBoxLayout,
@@ -213,6 +214,16 @@ def _style_css(style: str) -> str:
 COMPACT_ROW_HEIGHT = 22
 
 
+if QT_AVAILABLE:
+
+    class CentredDelegate(QStyledItemDelegate):
+        """Draw every cell centred, whatever alignment the item was given."""
+
+        def initStyleOption(self, option, index) -> None:
+            super().initStyleOption(option, index)
+            option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+
+
 def compact_table(table) -> None:
     """Make a table dense: no row-number gutter, fixed short rows.
 
@@ -222,6 +233,10 @@ def compact_table(table) -> None:
 
     if not QT_AVAILABLE:  # pragma: no cover - the whole UI is absent
         return
+    # Centring is a property of the table, not of each cell: a delegate means a
+    # new column does not quietly come out left-aligned because whoever added it
+    # did not know to ask.
+    table.setItemDelegate(CentredDelegate(table))
     header = table.verticalHeader()
     header.setVisible(False)
     header.setDefaultSectionSize(COMPACT_ROW_HEIGHT)
@@ -2474,6 +2489,7 @@ if QT_AVAILABLE:
                 targets=targets,
             )
             self.model.arm()
+            self._restart_music()
             self._reload_events()
             self.status.setText(message)
 
@@ -2584,6 +2600,23 @@ if QT_AVAILABLE:
                 "<div style='line-height:1.9'>%s%s</div>"
                 % (prefix, _styled_html(event.text, cursor))
             )
+
+        def _restart_music(self) -> None:
+            """Put the track back to the start for a fresh run.
+
+            Re-timing used to leave the music wherever the last attempt stopped,
+            so line one was timed against the middle of the song.
+            """
+
+            if self._music is None:
+                return
+            current = self._music.current
+            if not current:
+                return
+            try:
+                self._music.ensure(current, restart=True)
+            except (OSError, RuntimeError):
+                pass          # no audio is a usable, if silent, session
 
         def _stop_music(self) -> None:
             """Silence the backing track without forgetting which one it was.

@@ -2671,3 +2671,122 @@ def test_an_empty_preview_still_says_so(studio, tmp_path):
     _story(window, tmp_path)
     dialog = DialogueDialog(window, window, None, narrator=True)
     assert "还没有内容" in dialog.preview.text()
+
+
+# --------------------------------------------------------------------------
+# table content is centred by the table, not by each cell
+# --------------------------------------------------------------------------
+
+def test_compact_tables_centre_their_cells(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+
+    from Studio.Main import CentredDelegate, compact_table
+
+    table = QTableWidget(1, 2)
+    # Left-aligned explicitly, the way a populating site would leave it.
+    for column in range(2):
+        item = QTableWidgetItem("x")
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        table.setItem(0, column, item)
+    compact_table(table)
+
+    assert isinstance(table.itemDelegate(), CentredDelegate)
+
+    # The delegate is what centres, so ask it for the option it would draw.
+    option = table.itemDelegate().initStyleOption
+    assert callable(option)
+
+    from PySide6.QtWidgets import QStyleOptionViewItem
+
+    view_option = QStyleOptionViewItem()
+    table.itemDelegate().initStyleOption(view_option, table.model().index(0, 0))
+    assert view_option.displayAlignment & Qt.AlignmentFlag.AlignHCenter
+
+
+def test_the_delegate_centres_vertically_too(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QStyleOptionViewItem, QTableWidget, QTableWidgetItem
+
+    from Studio.Main import compact_table
+
+    table = QTableWidget(1, 1)
+    table.setItem(0, 0, QTableWidgetItem("x"))
+    compact_table(table)
+
+    option = QStyleOptionViewItem()
+    table.itemDelegate().initStyleOption(option, table.model().index(0, 0))
+    assert option.displayAlignment & Qt.AlignmentFlag.AlignVCenter
+
+
+def test_studio_tables_go_through_compact_table(studio):
+    """If a table skips the helper it silently stays left-aligned."""
+
+    from Studio.Main import CentredDelegate
+
+    checked = 0
+    for step in studio.steps:
+        table = getattr(step, "table", None)
+        if table is None:
+            continue
+        checked += 1
+        assert isinstance(table.itemDelegate(), CentredDelegate), step
+    assert checked >= 3
+
+
+# --------------------------------------------------------------------------
+# re-timing starts the song again
+# --------------------------------------------------------------------------
+
+def test_retiming_restarts_the_loaded_track(studio, tmp_path):
+    window = studio
+    step = window.steps[2]
+    _timed_story(window, tmp_path)
+
+    calls = []
+
+    class FakePlayer:
+        current = "song.flac"
+
+        def ensure(self, path, restart=False):
+            calls.append((path, restart))
+            return True
+
+    step._music = FakePlayer()
+    step._restart_music()
+
+    assert calls == [("song.flac", True)]
+
+
+def test_restarting_music_is_safe_with_nothing_loaded(studio):
+    window = studio
+    step = window.steps[2]
+
+    class FakePlayer:
+        current = None
+
+        def ensure(self, path, restart=False):
+            raise AssertionError("should not be called")
+
+    step._music = FakePlayer()
+    step._restart_music()          # must not raise
+
+
+def test_restarting_music_is_safe_without_a_player(studio):
+    window = studio
+    window.steps[2]._music = None
+    window.steps[2]._restart_music()
+
+
+def test_a_failing_restart_does_not_break_the_run(studio):
+    window = studio
+    step = window.steps[2]
+
+    class BrokenPlayer:
+        current = "song.flac"
+
+        def ensure(self, path, restart=False):
+            raise RuntimeError("no audio device")
+
+    step._music = BrokenPlayer()
+    step._restart_music()          # silent session is still a session

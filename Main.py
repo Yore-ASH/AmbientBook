@@ -441,6 +441,9 @@ if QT_AVAILABLE:
             if self.lyrics_window is not None:
                 self.lyrics_window.close()
                 self.lyrics_window = None
+            # Stop first: quitting the mixer is not guaranteed to have
+            # run if the window is torn down rather than closed.
+            self.music.stop()
             self.music.close()
             event.accept()
 
