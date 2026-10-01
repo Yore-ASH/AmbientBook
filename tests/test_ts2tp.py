@@ -260,3 +260,87 @@ def test_timing_keeps_supplements_and_walks_past_them():
     # Only the two dialogues carry timing.
     assert result.lines[0].delays and result.lines[2].delays
     assert result.lines[1].value == script.lines[1].value
+
+
+# --------------------------------------------------------------------------
+# \ge groups and the timing model
+# --------------------------------------------------------------------------
+
+BACKSLASH = chr(92)
+GROUPED = "前" + BACKSLASH + "ge整个名字" + BACKSLASH + "ge接着说话"
+ANSI_GROUPED = "\x1b[38;2;0;255;170m" + GROUPED + "\x1b[0m"
+
+
+def test_a_group_consumes_a_single_key_press():
+    from Ts2Tp.model import timed_character_positions, visible_characters
+
+    characters = visible_characters(GROUPED)
+    positions = timed_character_positions(GROUPED)
+
+    assert "".join(characters) == "前整个名字接着说话"
+    assert len(characters) == 9
+    # 前, the group head, then the four characters after it.
+    assert positions == [0, 1, 5, 6, 7, 8]
+
+
+def test_group_members_after_the_first_are_not_timed():
+    from Ts2Tp.model import timed_character_positions
+
+    positions = timed_character_positions(GROUPED)
+    # 个名字 live at 2, 3, 4 and must not each want a press.
+    assert not ({2, 3, 4} & set(positions))
+
+
+def test_the_group_tail_gets_a_zero_delay():
+    """Zero means "the same moment as the one before", which is the whole point."""
+
+    from Ts2Tp.model import _SentenceTiming, timed_character_positions, visible_characters
+
+    timing = _SentenceTiming(
+        visible_characters(GROUPED), timed_character_positions(GROUPED)
+    )
+    clock = 100.0
+    for _ in timed_character_positions(GROUPED):
+        clock += 0.5
+        timing.record(clock)
+
+    assert timing.delays[1] == 0.5            # the group head carries the gap
+    assert timing.delays[2:5] == [0.0, 0.0, 0.0]
+    assert timing.complete is True
+    # One delay per visible character, which is what the format requires.
+    assert len(timing.delays) == len(visible_characters(GROUPED))
+
+
+def test_ansi_does_not_shift_the_group():
+    from Ts2Tp.model import timed_character_positions
+
+    assert timed_character_positions(ANSI_GROUPED) == timed_character_positions(GROUPED)
+
+
+def test_text_without_groups_still_times_every_character():
+    from Ts2Tp.model import timed_character_positions
+
+    assert timed_character_positions("逐字播放") == [0, 1, 2, 3]
+
+
+def test_group_markers_are_not_counted_as_characters():
+    from tscp_player.format import visible_text_length
+
+    assert visible_text_length(GROUPED) == 9
+    assert visible_text_length(ANSI_GROUPED) == 9
+    assert visible_text_length("普通文本") == 4
+
+
+def test_a_script_with_groups_still_compiles():
+    """The delay count and the visible length must stay in step."""
+
+    from tscp_player.format import Dialogue, Script, parse_tscp, parse_tscps, serialize_tscp
+    from tscp_player.format import visible_text_length
+
+    dialogue = parse_tscps(GROUPED).lines[0]
+    length = visible_text_length(dialogue.text)
+    built = serialize_tscp(
+        Script([Dialogue(dialogue.character, dialogue.text, [0.25] * length)])
+    )
+    back = parse_tscp(built)
+    assert len(back.lines[0].delays) == length

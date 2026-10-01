@@ -18,6 +18,7 @@ from typing import (
     Union,
 )
 
+from tscp_player import marks
 from tscp_player.format import (
     ANSI_SEQUENCE_RE,
     Dialogue,
@@ -64,10 +65,29 @@ def visible_characters(text: str) -> List[str]:
     """Return characters which should receive timing entries.
 
     ANSI control sequences may be literal (``\\033[31m``) or already expanded
-    terminal escapes.  Neither form is visible and neither consumes a key.
+    terminal escapes.  Neither form is visible and neither consumes a key, and
+    the author-facing ``\\ge`` group markers are invisible in exactly the same
+    way.
     """
 
-    return list(ANSI_SEQUENCE_RE.sub("", text))
+    return list(ANSI_SEQUENCE_RE.sub("", marks.strip_groups(text)))
+
+
+def _group_tail(text: str) -> Set[int]:
+    """Visible indices inside a ``\\ge`` group except its first character.
+
+    Those characters share the group's single timestamp, which is already how
+    the format works: a delay of zero means "same moment as the one before".
+    Only the first character of a group therefore consumes a key press.
+    """
+
+    # Strip ANSI first so the indices line up with visible_characters, but keep
+    # the group markers: that is what they are measured against.
+    without_ansi = ANSI_SEQUENCE_RE.sub("", text)
+    skip: Set[int] = set()
+    for start, end in marks.groups(without_ansi):
+        skip.update(range(start + 1, end))
+    return skip
 
 
 def is_timed_character(character: str) -> bool:
@@ -88,15 +108,17 @@ def is_timed_character(character: str) -> bool:
 def timed_character_positions(text: str) -> List[int]:
     """Return visible indices which need a key press.
 
-    Every visible character needs one except whitespace.  Indices refer to
+    Every visible character needs one except whitespace, and except the tail of
+    a ``\\ge`` group: the whole group appears on one press.  Indices refer to
     :func:`visible_characters`, not the raw string; ANSI escape sequences
     therefore never affect the positions.
     """
 
+    skip = _group_tail(text)
     return [
         index
         for index, character in enumerate(visible_characters(text))
-        if is_timed_character(character)
+        if is_timed_character(character) and index not in skip
     ]
 
 

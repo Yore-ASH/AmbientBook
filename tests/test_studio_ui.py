@@ -2790,3 +2790,18 @@ def test_a_failing_restart_does_not_break_the_run(studio):
 
     step._music = BrokenPlayer()
     step._restart_music()          # silent session is still a session
+
+
+# --------------------------------------------------------------------------
+# group markers are never drawn
+# --------------------------------------------------------------------------
+
+def test_the_timing_panel_does_not_draw_group_markers(qapp):
+    from Studio.Main import _styled_html
+
+    source = "前" + chr(92) + "ge整个名字" + chr(92) + "ge接着说话"
+    markup = _styled_html(source)
+
+    assert chr(92) not in markup
+    assert "整个名字" in markup
+    assert "接着说话" in markup

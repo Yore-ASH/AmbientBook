@@ -16,6 +16,7 @@ from tscp_player.format import (
     is_note,
     note_parts,
 )
+from tscp_player import marks
 from tscp_player.music import STOP_WORDS
 from tscp_player.plot import (
     PlotPackageError,
@@ -39,7 +40,15 @@ def base_dir() -> Path:
 
 
 def _plain(text: str) -> str:
-    return ANSI_SEQUENCE_RE.sub("", text.replace("\\033", "\033").replace("\\x1b", "\033"))
+    """The characters a reader sees, with every marker and escape removed.
+
+    Group markers are invisible to the reader but present in the text, and this
+    string is walked one character at a time -- left in, they would be printed
+    as two stray backslashes.
+    """
+
+    expanded = text.replace("\\033", "\033").replace("\\x1b", "\033")
+    return ANSI_SEQUENCE_RE.sub("", marks.strip(expanded))
 
 
 try:  # pragma: no cover - depends on the optional GUI dependency

@@ -70,7 +70,7 @@ from tscp_player.lyrics import (
     timed_from_marks,
 )
 from tscp_player.music import STOP_WORDS
-from tscp_player import musicpack
+from tscp_player import marks, musicpack
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, Signal
@@ -182,7 +182,9 @@ def _ansi_css(sequence: str) -> str:
 def _styled_html(text: str, current_index: Optional[int] = None) -> str:
     """Render dialogue text with ANSI styling and an optional current-character mark."""
 
-    parts = re.split("(" + ANSI_SEQUENCE_RE.pattern + ")", text)
+    # The panel draws one character at a time, so a group marker left in would
+    # be rendered as literal backslashes.
+    parts = re.split("(" + ANSI_SEQUENCE_RE.pattern + ")", marks.strip_groups(text))
     visible_index = 0
     style = ""
     output: List[str] = []
