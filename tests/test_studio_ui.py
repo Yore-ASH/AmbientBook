@@ -2805,3 +2805,122 @@ def test_the_timing_panel_does_not_draw_group_markers(qapp):
     assert chr(92) not in markup
     assert "整个名字" in markup
     assert "接着说话" in markup
+
+
+# --------------------------------------------------------------------------
+# exporting a script as source
+# --------------------------------------------------------------------------
+
+BACKSLASH = chr(92)
+
+
+def _export_fixture(window):
+    from tscp_player import marks
+
+    window.project.set_character("f", "FISH", "\x1b[1;33m")
+    name = window.project.new_script("序章")
+    window.project.add_event(name, Directive("p", "iw"))
+    window.project.add_event(
+        name,
+        Dialogue("f", marks.expand_colours(BACKSLASH + "co?00ffaa绿灯" + BACKSLASH + "co")),
+    )
+    window.project.add_event(
+        name, Dialogue(None, "前" + BACKSLASH + "ge整个名字" + BACKSLASH + "ge后")
+    )
+    window.project.add_event(name, Dialogue(None, "旁白", [0.5, 0.5]))
+    window._refresh_all()
+    return name
+
+
+def test_exporting_a_script_writes_source_without_timing(studio, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QInputDialog
+
+    from tscp_player.format import parse_tscps
+
+    window = studio
+    name = _export_fixture(window)
+    target = tmp_path / "out.tscps"
+
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), ""))
+    )
+    monkeypatch.setattr(
+        QInputDialog, "getItem", staticmethod(lambda *a, **k: (name, True))
+    )
+
+    window.steps[4].export_script()
+
+    assert target.is_file()
+    body = target.read_text(encoding="utf-8")
+
+    # Source form: hand-editable, and never any timing.
+    assert "0.5" not in body
+    assert "[0.50]" not in body
+    # The marks are back, and no raw escape sequences remain.
+    assert BACKSLASH + "co?00ffaa" in body
+    assert BACKSLASH + "ge整个名字" + BACKSLASH + "ge" in body
+    assert "\x1b" not in body
+    # Control lines survive.
+    assert "<p>iw" in body.replace(" ", "")
+
+    # And it reads back as the very same script.
+    original = window.project.script(name)
+    rebuilt = parse_tscps(body)
+    before = [getattr(e, "text", getattr(e, "value", "")) for e in original.lines]
+    after = [getattr(e, "text", getattr(e, "value", "")) for e in rebuilt.lines]
+    assert before == after
+
+
+def test_exporting_offers_a_choice_when_there_are_several(studio, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QInputDialog
+
+    window = studio
+    _export_fixture(window)
+    window.project.new_script("第二章")
+    window._refresh_all()
+
+    asked = []
+
+    def _choose(*_args, **kwargs):
+        asked.append(_args[3] if len(_args) > 3 else "")
+        return ("（全部）", False)          # cancelled
+
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(_choose))
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: "")
+    )
+
+    window.steps[4].export_script()
+    assert asked, "the user was never asked which script to export"
+    assert "（全部）" in asked[0]
+
+
+def test_exporting_every_script_writes_one_file_each(studio, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QInputDialog
+
+    window = studio
+    _export_fixture(window)
+    window.project.new_script("第二章")
+    window._refresh_all()
+
+    folder = tmp_path / "out"
+    folder.mkdir()
+    monkeypatch.setattr(
+        QInputDialog, "getItem", staticmethod(lambda *a, **k: ("（全部）", True))
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(folder))
+    )
+
+    window.steps[4].export_script()
+    written = sorted(p.name for p in folder.glob("*.tscps"))
+    assert len(written) == 2
+    assert "已导出 2 个剧本" in window.status.text()
+
+
+def test_exporting_with_no_scripts_says_so(studio, messages):
+    from Studio.Main import ExportStep
+
+    window = studio
+    window.steps[4].export_script()
+    assert any("还没有剧本" in text for _kind, text in messages)

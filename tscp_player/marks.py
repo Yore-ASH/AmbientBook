@@ -156,3 +156,33 @@ def strip_groups(text: str) -> str:
 
     return text.replace("\\ge", "") if "\\ge" in text else text
 
+
+#: The true-colour sequence :func:`_colour_escape` produces, and a plain reset.
+ANSI_TRUECOLOR_RE = re.compile(r"\x1b\[38;2;(\d+);(\d+);(\d+)m")
+ANSI_RESET_RE = re.compile(r"\x1b\[0m")
+
+
+def contract_colours(text: str) -> str:
+    """Turn our own escapes back into marks, for writing a source file.
+
+    The text held in memory has real escape sequences in it -- that is what the
+    renderers want.  A ``.tscps`` is read by a person, so the marks go back in
+    on the way out.  Escapes that did not come from a mark (a character's own
+    style, say) are left exactly as they are: there is no mark that means the
+    same thing, and inventing one would change how the line looks.
+    """
+
+    if "\x1b" not in text:
+        return text
+
+    def contract(match) -> str:
+        red, green, blue = (int(value) for value in match.groups())
+        return "\\co?%02x%02x%02x" % (red, green, blue)
+
+    # A function rather than a replacement string: ``re`` reads ``\c`` in a
+    # replacement as a broken escape.
+    return ANSI_RESET_RE.sub(
+        lambda _match: "\\co", ANSI_TRUECOLOR_RE.sub(contract, text)
+    )
+
+

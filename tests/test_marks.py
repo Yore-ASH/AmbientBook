@@ -119,3 +119,38 @@ def test_the_helpers_match_parse():
     assert marks.strip(text) == parsed.visible
     assert marks.render(text) == parsed.rendered
     assert marks.groups(text) == parsed.groups
+
+
+BACKSLASH = chr(92)
+
+# --------------------------------------------------------------------------
+# escapes turn back into marks when writing a source file
+# --------------------------------------------------------------------------
+
+def test_contract_undoes_expand():
+    for original in (
+        BACKSLASH + "co?00ffaa上色" + BACKSLASH + "co",
+        "前" + BACKSLASH + "ge整体" + BACKSLASH + "ge后",
+        BACKSLASH + "co?ff0000红" + BACKSLASH + "co和" + BACKSLASH + "co?00ff00绿" + BACKSLASH + "co",
+        "普通文本",
+    ):
+        assert marks.contract_colours(marks.expand_colours(original)) == original
+
+
+def test_contract_leaves_foreign_escapes_alone():
+    """A character's own style has no mark, so it must survive verbatim."""
+
+    styled = "\x1b[1;33mFISH\x1b[0m"
+    out = marks.contract_colours(styled)
+    assert out.startswith("\x1b[1;33mFISH")
+    # Only the reset, which \co means exactly, is rewritten.
+    assert out.endswith(BACKSLASH + "co")
+
+
+def test_contract_is_a_no_op_without_escapes():
+    assert marks.contract_colours("普通文本") == "普通文本"
+    assert marks.contract_colours("") == ""
+
+
+def test_contract_pads_short_components():
+    assert marks.contract_colours("\x1b[38;2;1;2;3m") == BACKSLASH + "co?010203"

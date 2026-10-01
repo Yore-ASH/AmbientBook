@@ -49,6 +49,7 @@ from Studio.model import (
 from Ts2Tp.model import KeyboardTimingModel, TimingMode
 from tscp_player.audio import MusicPlayer
 from tscp_player.format import (
+    serialize_tscps,
     ANSI_SEQUENCE_RE,
     Dialogue,
     Directive,
@@ -3237,11 +3238,17 @@ if QT_AVAILABLE:
             import_button = QPushButton("从已有剧情导入…")
             import_button.setToolTip("把一个 .tscpkg／.tscpkgs 或旧式 Musics/Scripts 文件夹合并进来")
             import_button.clicked.connect(self.import_from_source)
+            script_button = QPushButton("导出剧本（.tscps）…")
+            script_button.setToolTip(
+                "把剧本导出成源文件 .tscps：纯文本、不含任何计时数据，"
+                "可以直接手改，也可以再导入回工坊"
+            )
+            script_button.clicked.connect(self.export_script)
 
             buttons = QHBoxLayout()
             for button in (
                 save_button, bookmark_button, export_button,
-                play_button, folder_button, import_button,
+                play_button, folder_button, script_button, import_button,
             ):
                 buttons.addWidget(button)
             buttons.addStretch(1)
@@ -3315,6 +3322,85 @@ if QT_AVAILABLE:
                 problems.append("所有改动都已经写进剧情包了")
             self.issues.setText("\n".join(problems))
             self.refresh_history()
+
+        ALL_SCRIPTS = "（全部）"
+
+        def chosen_scripts(self) -> List[str]:
+            """Which scripts to export, asking when there is more than one."""
+
+            names = [] if self.project is None else list(self.project.scripts)
+            if not names:
+                QMessageBox.information(self, "导出剧本", "还没有剧本")
+                return []
+            if len(names) == 1:
+                return names
+            choice, accepted = QInputDialog.getItem(
+                self,
+                "导出剧本",
+                "要导出哪一个？",
+                [self.ALL_SCRIPTS] + names,
+                0,
+                False,
+            )
+            if not accepted:
+                return []
+            return names if choice == self.ALL_SCRIPTS else [choice]
+
+        def export_script(self) -> None:
+            """Write one or more scripts out as source .tscps files.
+
+            These are the hand-editable form: no timings, and the author-facing
+            colour marks rather than raw escape sequences.
+            """
+
+            names = self.chosen_scripts()
+            if not names:
+                return
+
+            if len(names) == 1:
+                name = names[0]
+                suggestion = str(
+                    Path(self.project.path).with_name("%s.tscps" % Path(name).stem)
+                )
+                filename, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "导出剧本",
+                    suggestion,
+                    "TSCP 剧本源文件 (*.tscps);;所有文件 (*)",
+                )
+                if not filename:
+                    return
+                try:
+                    written = self._write_script(name, Path(filename))
+                except (OSError, StudioError) as exc:
+                    QMessageBox.critical(self, "导出剧本", str(exc))
+                    return
+                self.studio.status.setText("已导出剧本 %s" % written.name)
+                return
+
+            folder = QFileDialog.getExistingDirectory(self, "导出全部剧本到文件夹")
+            if not folder:
+                return
+            written = 0
+            try:
+                for name in names:
+                    self._write_script(name, Path(folder) / ("%s.tscps" % Path(name).stem))
+                    written += 1
+            except (OSError, StudioError) as exc:
+                QMessageBox.critical(self, "导出剧本", str(exc))
+                return
+            self.studio.status.setText("已导出 %d 个剧本到 %s" % (written, folder))
+
+        def _write_script(self, name: str, target: Path) -> Path:
+            """Serialise one script and put it on disk."""
+
+            script = self.project.script(name)
+            # Marks back in place of the escapes the editor works with, so the
+            # file reads like something a person wrote.
+            body = marks.contract_colours(serialize_tscps(script))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            return target
 
         def refresh_history(self) -> None:
             if self.project is None:
