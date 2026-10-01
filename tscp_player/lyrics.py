@@ -591,7 +591,10 @@ def to_html(
             style += "font-family:'%s';" % chosen
         if not family and wants_italic(script):
             style += "font-style:italic;"
-        escaped = escape(segment).replace(" ", "&nbsp;")
+        # A normal space, deliberately: ``&nbsp;`` cannot be broken, so one
+        # measuring error turns into text running off the window instead of a
+        # line break the renderer could still make by itself.
+        escaped = escape(segment)
         pieces.append('<span style="%s">%s</span>' % (style, escaped))
     return "".join(pieces)
 

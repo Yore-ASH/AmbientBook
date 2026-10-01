@@ -24,6 +24,20 @@ from tscp_player.plot import (
 )
 
 
+def base_dir() -> Path:
+    """The folder the user actually sees.
+
+    Frozen by PyInstaller, ``__file__`` points inside the bundle (a temporary
+    one with --onefile), so ``source/`` has to be resolved against the
+    executable instead -- that is where somebody unzipping the release drops
+    their plots.
+    """
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def _plain(text: str) -> str:
     return ANSI_SEQUENCE_RE.sub("", text.replace("\\033", "\033").replace("\\x1b", "\033"))
 
@@ -477,7 +491,7 @@ def main(argv=None) -> int:
         if not source.is_absolute():
             source = (Path.cwd() / source).resolve()
     else:
-        source = Path(__file__).resolve().parent / "source"
+        source = base_dir() / "source"
     try:
         playlists, problems = load_playlists(source)
     except (PlotPackageError, OSError, ValueError, RuntimeError) as exc:

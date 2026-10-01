@@ -32,7 +32,11 @@ except ImportError:  # pragma: no cover
 
 
 #: The pair never gets more than this share of the screen before it wraps.
-MAX_SCREEN_SHARE = 0.92
+MAX_SCREEN_SHARE = 0.90
+#: Taken off the wrapping limit on top of the share above. Measured text and
+#: rendered text are never quite the same width, and the difference has to go
+#: somewhere other than past the edge of the window.
+WRAP_SLACK = 24
 #: Space between the original column and the translation column.
 COLUMN_GAP = "　　"
 #: Point size of a lyric line.
@@ -140,7 +144,7 @@ if QT_AVAILABLE:
                 line.text,
                 line.translation,
                 metrics.horizontalAdvance,
-                self._columns_width(),
+                max(80.0, self._columns_width() - WRAP_SLACK),
                 gap,
             )
 
@@ -157,24 +161,34 @@ if QT_AVAILABLE:
 
             if len(rows) == 1 and not rows[0][1]:
                 return render_original(rows[0][0])
+
+            left_cell = (
+                '<td align="right" valign="middle" '
+                'style="word-wrap:break-word;overflow-wrap:break-word;">%s</td>'
+            )
+            right_cell = (
+                '<td align="left" valign="middle" '
+                'style="padding-left:%dpx;'
+                'word-wrap:break-word;overflow-wrap:break-word;">%s</td>'
+            )
+            open_table = '<table width="100%" cellspacing="0" cellpadding="0">'
             if len(rows) == 1:
                 left, right = rows[0]
                 return (
-                    '<table width="100%%" cellspacing="0" cellpadding="0"><tr>'
-                    '<td align="right">%s</td>'
-                    '<td align="left" style="padding-left:%dpx">%s</td>'
-                    "</tr></table>"
-                    % (render_original(left), int(gap), render_translation(right))
+                    open_table
+                    + "<tr>"
+                    + left_cell % render_original(left)
+                    + right_cell % (int(gap), render_translation(right))
+                    + "</tr></table>"
                 )
             body = "".join(
-                '<tr><td align="right">%s</td>'
-                '<td align="left" style="padding-left:%dpx">%s</td></tr>'
-                % (render_original(left), int(gap), render_translation(right))
+                "<tr>"
+                + left_cell % render_original(left)
+                + right_cell % (int(gap), render_translation(right))
+                + "</tr>"
                 for left, right in rows
             )
-            return (
-                '<table width="100%%" cellspacing="0" cellpadding="0">%s</table>' % body
-            )
+            return open_table + body + "</table>"
 
         def _set_html(self, html: str) -> None:
             self.label.setText(html)
@@ -187,6 +201,7 @@ if QT_AVAILABLE:
             width = int(self._columns_width()) + 56
             if screen is not None:
                 width = min(width, screen.availableGeometry().width())
+            self.setMaximumWidth(width)
             self.setFixedWidth(width)
             self.label.setFixedWidth(width - 56)
             height = max(130, self.label.sizeHint().height() + 28)

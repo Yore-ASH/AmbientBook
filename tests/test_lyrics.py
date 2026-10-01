@@ -179,8 +179,11 @@ def test_to_html_uses_a_font_per_script():
 def test_to_html_escapes_markup_and_keeps_spaces():
     markup = to_html("a <b> c", "#fff", [])
     assert "&lt;b&gt;" in markup
-    assert "&nbsp;" in markup
     assert "<b>" not in markup
+    # The space stays a real space: a non-breaking one would stop the rich text
+    # from wrapping, which is how lines used to run off the window.
+    assert "&nbsp;" not in markup
+    assert "a " in markup
 
 
 def test_to_html_falls_back_to_the_widget_default():
