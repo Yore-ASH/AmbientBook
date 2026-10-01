@@ -2579,3 +2579,95 @@ def test_stopping_music_tolerates_never_having_played(studio, tmp_path):
     step = window.steps[2]
     step._music = None
     step._stop_music()          # must not raise
+
+
+# --------------------------------------------------------------------------
+# the dialogue preview shows who is speaking
+# --------------------------------------------------------------------------
+
+def test_the_dialogue_preview_shows_the_character_name(studio, tmp_path):
+    """It used to render the content alone, disagreeing with playback."""
+
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    dialog.character_combo.setCurrentIndex(0)          # FISH
+    dialog.text_edit.setText("你好")
+
+    markup = dialog.preview.text()
+    assert "FISH" in markup
+    assert "你好" in markup
+    # The name comes first, with a separator, the way the player shows it.
+    assert markup.index("FISH") < markup.index("你好")
+    assert ":" in markup
+
+
+def test_the_preview_name_carries_the_character_colour(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)          # FISH is \033[1;33m
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    dialog.character_combo.setCurrentIndex(0)
+
+    css = dialog._preview_prefix_html()
+    assert "FISH" in css
+    assert "color" in css             # the style became inline CSS
+
+
+def test_the_preview_follows_the_character_picker(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    dialog.text_edit.setText("台词")
+
+    dialog.character_combo.setCurrentIndex(0)
+    assert "FISH" in dialog.preview.text()
+    dialog.character_combo.setCurrentIndex(1)
+    assert "Teiresias" in dialog.preview.text()
+    assert "FISH" not in dialog.preview.text()
+
+
+def test_narration_has_no_name_prefix(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=True)
+    assert dialog._preview_prefix_html() == ""
+    dialog.text_edit.setText("雨声")
+    assert "雨声" in dialog.preview.text()
+
+
+def test_the_preview_prefix_matches_playback(studio, tmp_path):
+    """Both must agree, or the preview is worse than useless."""
+
+    from Studio.Main import DialogueDialog, _style_css, _styled_html
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=False)
+    dialog.character_combo.setCurrentIndex(1)
+    character = window.project.characters.get("t")
+    dialog.text_edit.setText("灯还亮着。")
+
+    # The same pieces the timing panel puts together.
+    shown = (
+        "<span style='%s'>%s</span>" % (_style_css(character.style), character.name)
+        if character.style
+        else character.name
+    )
+    assert dialog.preview.text() == shown + " : " + _styled_html("灯还亮着。")
+
+
+def test_an_empty_preview_still_says_so(studio, tmp_path):
+    from Studio.Main import DialogueDialog
+
+    window = studio
+    _story(window, tmp_path)
+    dialog = DialogueDialog(window, window, None, narrator=True)
+    assert "还没有内容" in dialog.preview.text()

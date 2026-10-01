@@ -645,6 +645,11 @@ if QT_AVAILABLE:
             layout.addWidget(buttons)
 
             self.text_edit.textChanged.connect(self._refresh_preview)
+            # Changing who is speaking changes the head of the line. Subclasses
+            # such as NoteDialog never build the picker.
+            combo = getattr(self, "character_combo", None)
+            if combo is not None:
+                combo.currentIndexChanged.connect(self._refresh_preview)
 
             if event is not None:
                 self._set_text(event.text)
@@ -673,12 +678,36 @@ if QT_AVAILABLE:
             self.text_edit.insert(snippet)
             self._refresh_preview()
 
+        def _preview_prefix_html(self) -> str:
+            """The ``名字 : `` head, exactly as playback renders it.
+
+            The preview used to show the content alone, which made it disagree
+            with the player: a reader would see no name here and then a name on
+            screen, with no way to check the colour beforehand.
+            """
+
+            if self.narrator:
+                return ""
+            key = self.character_combo.currentData()
+            character = self.characters.get(key) if key else None
+            name = character.name if character else str(key or "")
+            if not name:
+                return ""
+            css = _style_css(character.style if character else "")
+            shown = (
+                "<span style='%s'>%s</span>" % (css, html.escape(name))
+                if css
+                else html.escape(name)
+            )
+            return "%s : " % shown
+
         def _refresh_preview(self) -> None:
             text = self.text()
-            if not text:
+            prefix = self._preview_prefix_html()
+            if not text and not prefix:
                 self.preview.setText("<span style='color:#777'>（还没有内容）</span>")
                 return
-            self.preview.setText(_styled_html(text))
+            self.preview.setText(prefix + _styled_html(text))
 
         def values(self) -> Optional[Dialogue]:
             text = self.text().strip()
@@ -760,6 +789,11 @@ if QT_AVAILABLE:
             layout.addWidget(buttons)
 
             self.text_edit.textChanged.connect(self._refresh_preview)
+            # Changing who is speaking changes the head of the line. Subclasses
+            # such as NoteDialog never build the picker.
+            combo = getattr(self, "character_combo", None)
+            if combo is not None:
+                combo.currentIndexChanged.connect(self._refresh_preview)
             self.seconds.valueChanged.connect(self._refresh_preview)
             if event is not None:
                 colour, seconds, text = note_parts(event)
