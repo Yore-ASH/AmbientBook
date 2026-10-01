@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, current_app, jsonify, request, send_file
 
 from PlotManager.model import MusicDraft
+from tscp_player import musicpack
 from tscp_player.lyrics import lyric_source_lines, serialize_lrc, timed_from_marks
 from tscp_player.plot import KIND_INSTRUMENTAL, KIND_LYRICS
 
@@ -22,7 +23,10 @@ from .auth import admin_required, current_user, login_required
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
-AUDIO_SUFFIXES = {".flac", ".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac"}
+AUDIO_SUFFIXES = {
+    ".flac", ".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac",
+    musicpack.PACK_SUFFIX,
+}
 
 
 class ApiError(ValueError):
@@ -251,7 +255,8 @@ def add_music(plot_id: str):
     if upload is None or not upload.filename:
         return _json_error(ApiError("请选择要插入的音乐文件"))
     suffix = Path(upload.filename).suffix.lower()
-    if suffix not in AUDIO_SUFFIXES:
+    is_pack = suffix == musicpack.PACK_SUFFIX
+    if not is_pack and suffix not in AUDIO_SUFFIXES:
         return _json_error(ApiError("不支持的音频格式：%s" % suffix))
     abbreviation = str(request.form.get("abbreviation", "")).strip()
     if not abbreviation:
@@ -260,6 +265,11 @@ def add_music(plot_id: str):
     if kind not in {KIND_INSTRUMENTAL, KIND_LYRICS}:
         return _json_error(ApiError("未知的音乐类型：%s" % kind))
     color = str(request.form.get("color") or "").strip()
+
+    if is_pack:
+        # A .tscpmc carries its own audio, lyrics and colour, so the form does
+        # not have to supply any of them; add_tracks unpacks it.
+        return _add_pack(plot_id, upload, abbreviation)
 
     lyrics_text: Optional[str] = None
     lyrics_name: Optional[str] = None
@@ -291,6 +301,30 @@ def add_music(plot_id: str):
         target = Path(folder) / Path(upload.filename).name
         upload.save(target)
         draft.source = target
+        try:
+            storage.add_music(data_dir(), plot_id, [draft])
+        except storage.StorageError as exc:
+            return _json_error(exc)
+    db.touch_plot(db.get_db(), plot_id)
+    return jsonify({"detail": storage.describe(storage.load(data_dir(), plot_id))}), 201
+
+
+def _add_pack(plot_id: str, upload, abbreviation: str):
+    """Insert a ``.tscpmc``: audio, lyrics and colour all arrive inside it."""
+
+    draft = MusicDraft(abbreviation=abbreviation, kind=KIND_INSTRUMENTAL)
+    with tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / Path(upload.filename).name
+        upload.save(target)
+        try:
+            pack = musicpack.read(target)
+        except musicpack.MusicPackError as exc:
+            return _json_error(ApiError(str(exc)))
+        # ``add_tracks`` unpacks the container, but it needs the file to still
+        # exist, so the whole thing happens inside this temp folder.
+        draft.source = target
+        draft.kind = pack.kind
+        draft.color = pack.color
         try:
             storage.add_music(data_dir(), plot_id, [draft])
         except storage.StorageError as exc:

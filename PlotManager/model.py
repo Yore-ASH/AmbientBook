@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from tscp_player import archive
+from tscp_player import archive, musicpack
 from tscp_player.format import (
     Dialogue,
     Script,
@@ -411,8 +411,15 @@ def _lyrics_member_name(draft: MusicDraft, key: str) -> str:
 
 
 def _normalise_newlines(text: str) -> str:
-    """Store lyrics with LF so a container does not depend on the build OS."""
+    """Store lyrics with LF so a container does not depend on the build OS.
 
+    A leading byte-order mark is dropped too: Windows editors add one to ``.lrc``
+    files, and left in place it becomes an invisible first character of the first
+    lyric line.
+    """
+
+    if text.startswith("\ufeff"):
+        text = text[1:]
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -426,14 +433,49 @@ def _read_lyrics(path: PathLike) -> str:
         raise PackError("无法读取歌词 %s：%s" % (source, exc)) from exc
 
 
+def resolve_music_source(draft: MusicDraft) -> MusicDraft:
+    """Turn a ``.tscpmc`` draft into a plain one.
+
+    A pack already carries its audio, its lyrics and its colour, so inserting one
+    should not require the caller to unpack it by hand.  Anything that is not a
+    pack comes back untouched.
+    """
+
+    source = Path(draft.source)
+    if not musicpack.is_pack(source):
+        return draft
+    try:
+        pack = musicpack.read(source)
+        audio = musicpack.extract_cached(source)
+    except musicpack.MusicPackError as exc:
+        raise PackError(str(exc)) from exc
+    except OSError as exc:
+        raise PackError("无法展开 %s：%s" % (source, exc)) from exc
+
+    resolved = replace(draft, source=audio)
+    if pack.kind == KIND_LYRICS:
+        if draft.lyrics_file is None and draft.lyrics_text is None and pack.lyrics:
+            resolved = replace(
+                resolved,
+                kind=KIND_LYRICS,
+                lyrics_text=pack.lyrics,
+                lyrics_name="%s.lrc" % draft.abbreviation,
+            )
+    if pack.color and not draft.color:
+        resolved = replace(resolved, color=pack.color)
+    return resolved
+
+
 def add_tracks(path: PathLike, drafts: Sequence[MusicDraft]) -> List[str]:
     """Embed audio (and lyrics) and record their metadata in one rewrite.
 
     Each draft either embeds a finished ``.lrc`` file or carries the LRC text
     produced by the recorder.  The audio, the lyric file and the updated
     ``Musics/__init__.json`` all land in the container in a single pass.
+    A ``.tscpmc`` source is unpacked here, so callers can pass one directly.
     """
 
+    drafts = [resolve_music_source(draft) for draft in drafts]
     if not drafts:
         return sorted(music_config(path))
     document = music_document(path)

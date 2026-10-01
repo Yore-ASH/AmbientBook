@@ -85,6 +85,11 @@ def parse_lrc(text: str) -> Lyrics:
     lyric.
     """
 
+    # Windows editors happily save .lrc with a byte-order mark, which would
+    # otherwise ride along invisibly on the first lyric line.
+    if text.startswith("\ufeff"):
+        text = text[1:]
+
     collected: List[LyricLine] = []
     offset = 0.0
     for raw in text.splitlines():

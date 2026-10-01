@@ -193,6 +193,21 @@ python Studio/Main.py source/dist/ExamplePlot.tscpkg
 点「保存到剧情包」写入。带歌词的曲目在播放时会弹出歌词窗（汉字宋体、英文
 Times New Roman 斜体）。
 
+**「导出为 .tscpmc…」** 把这首歌和它的歌词合成一个文件带走：
+
+* 歌词**同时写进音频自己的标签**（FLAC 的 `LYRICS`、MP3 的 `USLT`），所以把音频
+  单独拿出来，任何播放器也能看到歌词；音频之后的字节逐字节不变
+* `.lrc` 和小清单一起装进容器，所以 OGG/WAV 这类没有歌词标签的格式也能用，
+  歌词颜色也不会丢。状态栏会告诉你这次是哪种情况
+* 把 `.tscpmc` 再当音乐文件插进来（工坊或网页版都行），音频、歌词、颜色会
+  **自动取出**，不用再回答任何问题
+
+命令行等价物：
+
+```bash
+python -m tscp_player.musicpack song.flac --lyrics song.lrc --title "歌名" -o track.tscpmc
+```
+
 ### ⑤ 导出
 
 列出角色数、剧本数、音乐数、带歌词曲目数、逐字计时进度，并**指出还缺什么**：

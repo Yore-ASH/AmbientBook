@@ -58,6 +58,7 @@ from tscp_player.format import (
 )
 from tscp_player.lyrics import lyric_source_lines, parse_lrc, serialize_lrc, timed_from_marks
 from tscp_player.music import STOP_WORDS
+from tscp_player import musicpack
 
 try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, Signal
@@ -111,7 +112,9 @@ except ImportError:  # pragma: no cover
 
 
 AUDIO_FILTER = (
-    "音频 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac);;所有文件 (*)"
+    "音频或 .tscpmc 音乐包 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac *.tscpmc);;"
+    "音频 (*.flac *.mp3 *.ogg *.oga *.opus *.wav *.m4a *.aac);;"
+    "TSCP 音乐包 (*.tscpmc);;所有文件 (*)"
 )
 LYRIC_COLOR_DEFAULT = "#ffffff"
 
@@ -1060,6 +1063,26 @@ if QT_AVAILABLE:
         if not filename:
             return None
         source = Path(filename)
+        # A .tscpmc already answers every question below: its audio, its lyrics
+        # and its colour are all inside. Hand it over as-is and let
+        # ``add_tracks`` unpack it.
+        if musicpack.is_pack(source):
+            try:
+                pack = musicpack.read(source)
+            except musicpack.MusicPackError as exc:
+                QMessageBox.critical(parent, "音乐", str(exc))
+                return None
+            key = studio.suggest_key(
+                Path(pack.audio_name).stem or source.stem,
+                set(studio_window.project.tracks),
+                prefix="m",
+            )
+            return MusicDraft(
+                abbreviation=key,
+                source=source,
+                kind=pack.kind,
+                color=pack.color,
+            )
         # The internal key is derived from the file, not asked for: nobody should
         # have to invent a short code just to drop a song into a scene.
         taken = set(studio_window.project.tracks)
@@ -2410,6 +2433,12 @@ if QT_AVAILABLE:
             tools.addWidget(colour_button)
             tools.addStretch(1)
 
+            self.pack_button = QPushButton("导出为 .tscpmc…")
+            self.pack_button.setToolTip(
+                "把这首歌和它的歌词合成一个文件；音频自己的标签里也会写入歌词"
+            )
+            self.pack_button.clicked.connect(self.export_pack)
+
             apply_button = QPushButton("保存到剧情包")
             apply_button.clicked.connect(self.apply_lyrics)
 
@@ -2420,7 +2449,11 @@ if QT_AVAILABLE:
             right_layout.addWidget(QLabel("歌词（LRC，一行一句）"))
             right_layout.addWidget(self.lyrics_edit, 1)
             right_layout.addLayout(tools)
-            right_layout.addWidget(apply_button)
+            pack_row = QHBoxLayout()
+            pack_row.addWidget(apply_button)
+            pack_row.addWidget(self.pack_button)
+            pack_row.addStretch(1)
+            right_layout.addLayout(pack_row)
 
             splitter = QSplitter(Qt.Orientation.Horizontal)
             splitter.addWidget(left)
@@ -2560,6 +2593,66 @@ if QT_AVAILABLE:
             if colour.isValid():
                 self._colour = colour.name()
                 self._paint_swatch()
+
+        def export_pack(self) -> None:
+            """Write the selected track out as a standalone ``.tscpmc``.
+
+            The lyrics go into the audio's own tags as well, so the file is
+            useful outside TSCP too.
+            """
+
+            key = self._selected_abbreviation()
+            if self.project is None or key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            track = self.project.tracks[key]
+            if not track.has_lyrics:
+                QMessageBox.information(
+                    self, "歌词", "这首歌没有歌词，先选「带歌词」并保存"
+                )
+                return
+            lyrics = self.project.lyrics_text(key)
+            if not lyrics.strip():
+                QMessageBox.warning(self, "歌词", "歌词还是空的")
+                return
+            try:
+                audio = self.project.audio_path(key)
+            except StudioError as exc:
+                QMessageBox.critical(self, "歌词", str(exc))
+                return
+
+            stem = Path(track.filename).stem or key
+            suggestion = Path(self.project.path).with_name(stem + musicpack.PACK_SUFFIX)
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                "导出为 .tscpmc",
+                str(suggestion),
+                "TSCP 音乐包 (*.tscpmc);;所有文件 (*)",
+            )
+            if not filename:
+                return
+            try:
+                target = musicpack.write(
+                    Path(filename),
+                    audio,
+                    lyrics,
+                    title=stem,
+                    color=track.color,
+                    kind="lyrics",
+                )
+            except (musicpack.MusicPackError, OSError) as exc:
+                QMessageBox.critical(self, "歌词", str(exc))
+                return
+
+            # Ask about the audio inside the pack, not about the pack itself.
+            if musicpack.supports_tagging(track.filename):
+                note = "，歌词也写进了音频标签"
+            else:
+                note = "（这种格式没有歌词标签，歌词只存在包里）"
+            self.studio.status.setText(
+                "已导出 %s（%.1f MB）%s"
+                % (target.name, target.stat().st_size / (1024 * 1024), note)
+            )
 
         def apply_lyrics(self) -> None:
             key = self._selected_abbreviation()

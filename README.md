@@ -52,6 +52,32 @@ source/ExamplePlot/
 方式存入（FLAC/OGG/MP3 本身已压缩），所以任何解压工具都能打开它，直接把新音乐
 拖进去也有效。播放器、`tscp-player` 和素材管理器两种形式都支持。
 
+## 音乐包 `.tscpmc`
+
+一首歌和它的歌词可以合成一个文件：
+
+```bash
+python -m tscp_player.musicpack song.flac --lyrics song.lrc --title "歌名" -o track.tscpmc
+python -m tscp_player.musicpack track.tscpmc --show        # 看看里面有什么
+python -m tscp_player.musicpack track.tscpmc --extract -o out/   # 取回音频和歌词
+```
+
+做两件事：
+
+* **歌词写进音频自己的标签** —— FLAC 用 Vorbis comment 的 `LYRICS`，MP3 用
+  ID3v2.4 的 `USLT` 帧。所以把音频单独拿出来，任何普通播放器也能看到歌词；
+* 再和一份 `.lrc`、一个小清单一起装进容器，这样不支持标签的格式（OGG、WAV…）
+  也能用，TSCP 自己的信息（颜色）也不会丢。
+
+音频之后的字节**逐字节不变**，只有元数据增长 —— 真实的 94 MB FLAC 只增加了 79 字节。
+重复嵌入是幂等的，更新歌词是替换而不是追加。
+
+OGG/Opus 要重排 Ogg 页才能写标签、WAV 根本没有标准歌词字段，这两种只靠容器携带歌词，
+清单里的 `EMBEDDED` 会如实标成 `false`。
+
+在桌面工坊的「④ 歌词」里点**「导出为 .tscpmc…」**即可生成；把 `.tscpmc` 当音乐文件
+插进剧情包（工坊或网页版都行）时，音频、歌词和颜色会被自动取出，不用再回答任何问题。
+
 推荐的工作流：
 
 ```text

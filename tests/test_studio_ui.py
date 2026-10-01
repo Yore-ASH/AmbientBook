@@ -1437,6 +1437,190 @@ def test_a_real_clear_is_still_reported_as_a_clear(studio):
 
 
 # --------------------------------------------------------------------------
+# .tscpmc music packs
+# --------------------------------------------------------------------------
+
+def _synthetic_flac(audio: bytes = b"AUDIOFRAMES" * 8) -> bytes:
+    """A FLAC with only STREAMINFO -- enough to exercise the tag writer."""
+
+    streaminfo = bytes(34)
+    out = bytearray(b"fLaC")
+    out.append(0x80 | 0)
+    out += len(streaminfo).to_bytes(3, "big")
+    out += streaminfo
+    out += audio
+    return bytes(out)
+
+
+def _patch_save(monkeypatch, target):
+    from PySide6.QtWidgets import QFileDialog
+
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), ""))
+    )
+
+
+def test_exporting_a_track_as_a_tscpmc(studio, tmp_path, monkeypatch):
+    from tscp_player import musicpack
+
+    window = studio
+    _timed_story(window, tmp_path)          # track "iw", lyrics, colour #ffd166
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    target = tmp_path / "track.tscpmc"
+    _patch_save(monkeypatch, target)
+    step.export_pack()
+
+    assert target.is_file()
+    pack = musicpack.read(target)
+    assert pack.title == "song"
+    assert pack.color == "#ffd166"
+    assert "第一句" in pack.lyrics
+    assert pack.kind == "lyrics"
+    assert "已导出" in window.status.text()
+
+
+def test_exporting_needs_lyrics(studio, tmp_path, messages):
+    window = studio
+    window.project.set_character("f", "FISH", "")
+    window.project.add_music([MusicDraft(
+        abbreviation="iw", source=_song(tmp_path), kind="instrumental"
+    )])
+    window._refresh_all()
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+    step.export_pack()
+    assert any("没有歌词" in text for _kind, text in messages)
+
+
+def test_exporting_needs_a_selection(studio, tmp_path, messages):
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.clearSelection()
+    step.export_pack()
+    assert any("先选择" in text for _kind, text in messages)
+
+
+def test_a_pack_really_tags_the_audio_it_carries(studio, tmp_path, monkeypatch):
+    """With a taggable format inside, the lyrics land in the audio's own metadata."""
+
+    from tscp_player import musicpack
+
+    window = studio
+    project = window.project
+    project.set_character("f", "FISH", "")
+    flac = tmp_path / "real.flac"
+    flac.write_bytes(_synthetic_flac())
+    project.add_music([MusicDraft(
+        abbreviation="iw", source=flac, kind="lyrics",
+        lyrics_text="[00:01.00]第一句\n", color="#ffd166",
+    )])
+    window._refresh_all()
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    target = tmp_path / "out.tscpmc"
+    _patch_save(monkeypatch, target)
+    step.export_pack()
+
+    pack = musicpack.read(target)
+    assert pack.tagged is True
+    assert musicpack.read_embedded_lyrics(pack.audio, pack.audio_name) == "[00:01.00]第一句\n"
+    assert "音频标签" in window.status.text()
+
+
+def test_a_pack_of_an_untaggable_format_says_so(studio, tmp_path, monkeypatch):
+    from tscp_player import musicpack
+
+    window = studio
+    project = window.project
+    project.set_character("f", "FISH", "")
+    wav = tmp_path / "plain.wav"
+    wav.write_bytes(b"RIFF" + bytes(64))
+    project.add_music([MusicDraft(
+        abbreviation="iw", source=wav, kind="lyrics",
+        lyrics_text="[00:01.00]甲\n", color="",
+    )])
+    window._refresh_all()
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    target = tmp_path / "out.tscpmc"
+    _patch_save(monkeypatch, target)
+    step.export_pack()
+
+    pack = musicpack.read(target)
+    assert pack.tagged is False
+    assert pack.lyrics == "[00:01.00]甲\n"
+    assert "只存在包里" in window.status.text()
+
+
+def test_inserting_a_pack_answers_the_dialog_questions(studio, tmp_path, monkeypatch):
+    """A pack already knows its kind and colour; the flow must not ask again."""
+
+    from PySide6.QtWidgets import QFileDialog
+
+    from Studio.Main import collect_new_track
+    from tscp_player import musicpack
+
+    window = studio
+    source = tmp_path / "song.flac"
+    source.write_bytes(_synthetic_flac())
+    pack = musicpack.write(
+        tmp_path / "song", source, "[00:01.00]甲\n", title="song", color="#33cccc"
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(pack), ""))
+    )
+
+    draft = collect_new_track(window, window)
+    assert draft is not None
+    assert draft.source == pack
+    assert draft.kind == "lyrics"
+    assert draft.color == "#33cccc"
+    # The key is derived from the audio inside, not from the pack name.
+    assert draft.abbreviation == "song"
+
+
+def test_inserting_a_pack_adds_the_track(studio, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from Studio.Main import collect_new_track
+    from tscp_player import musicpack
+
+    window = studio
+    project = window.project
+    project.set_character("f", "FISH", "")
+    source = tmp_path / "song.flac"
+    source.write_bytes(_synthetic_flac())
+    pack = musicpack.write(
+        tmp_path / "song", source, "[00:01.00]甲\n", title="song", color="#33cccc"
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(pack), ""))
+    )
+
+    project.add_music([collect_new_track(window, window)])
+    track = project.tracks["song"]
+    assert track.has_lyrics is True
+    assert track.color == "#33cccc"
+    assert project.lyrics_text("song") == "[00:01.00]甲\n"
+
+
+def test_the_music_file_filter_offers_tscpmc(studio):
+    from Studio.Main import AUDIO_FILTER
+
+    assert ".tscpmc" in AUDIO_FILTER
+
+
+# --------------------------------------------------------------------------
 # script names never expose the extension
 # --------------------------------------------------------------------------
 

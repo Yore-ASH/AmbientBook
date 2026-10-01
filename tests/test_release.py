@@ -7,6 +7,7 @@ mode or a missing package turns into a confusing failure on somebody's server.
 import shutil
 import stat
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -65,12 +66,54 @@ def test_the_archive_carries_what_the_site_needs(archive):
         "webapp/templates/base.html", "webapp/static/app.js",
         "PlotManager/__init__.py", "PlotManager/model.py",
         "tscp_player/__init__.py", "tscp_player/format.py",
+        "tscp_player/musicpack.py",
         "requirements-web.txt", "pyproject.toml", "LICENSE",
         "deploy/install-ubuntu.sh", "deploy/tscp-web.service",
         "deploy/nginx-8888.conf", "deploy/tscp-web.env.example",
         "deploy/README.md",
     ):
         assert "tscp-web/" + needed in names, needed
+
+
+def test_the_extracted_archive_can_actually_import_the_site(archive, tmp_path):
+    """The only check that catches a missing module the web app imports.
+
+    A file list can only assert what somebody remembered to list; running the
+    import finds whatever the deploy actually needs.
+    """
+
+    with zipfile.ZipFile(archive) as opened:
+        opened.extractall(tmp_path)
+    root = tmp_path / "tscp-web"
+
+    probe = (
+        "import sys\n"
+        "class Blocker:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname.split('.')[0] in "
+        "{'pygame', 'PySide6', 'shiboken6', 'pyside6'}:\n"
+        "            raise ImportError('blocked: ' + fullname)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Blocker())\n"
+        "from webapp import create_app\n"
+        "app = create_app(DATA_DIR=%r, MAX_CONTENT_LENGTH=1024 * 1024)\n"
+        "client = app.test_client()\n"
+        "assert client.get('/').status_code == 200\n"
+        "made = client.post('/api/auth/register', "
+        "json={'username': 'smoke', 'password': 'secret1'})\n"
+        "assert made.status_code == 201, made.get_data(as_text=True)\n"
+        "plot = client.post('/api/plots', json={'name': 'Smoke'})\n"
+        "assert plot.status_code == 201, plot.get_data(as_text=True)\n"
+        "print('SMOKE OK')\n"
+    ) % str(tmp_path / "runtime-data")
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(root),
+    )
+    assert result.returncode == 0, result.stderr[-800:]
+    assert "SMOKE OK" in result.stdout
 
 
 def test_the_desktop_tools_and_demo_assets_stay_out(archive):

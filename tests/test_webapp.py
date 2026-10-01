@@ -283,6 +283,22 @@ def _song():
     return io.BytesIO(b"FLAC" * 64)
 
 
+#: Lyrics used by the music tests that need real LRC.
+LRC_TEXT = "[00:01.00]第一句\n[00:03.50]Second line\n"
+
+
+def _synthetic_flac(audio: bytes = b"AUDIOFRAMES" * 8) -> bytes:
+    """A FLAC with only STREAMINFO -- enough to exercise the tag writer."""
+
+    streaminfo = bytes(34)
+    out = bytearray(b"fLaC")
+    out.append(0x80 | 0)
+    out += len(streaminfo).to_bytes(3, "big")
+    out += streaminfo
+    out += audio
+    return bytes(out)
+
+
 def test_insert_instrumental_music(client):
     register(client)
     plot_id = make_plot(client)
@@ -319,6 +335,51 @@ def test_insert_music_with_a_lrc(client):
 
     lyrics = client.get("/api/plots/%s/lyrics/iw" % plot_id).get_json()["lrc"]
     assert "第一句" in lyrics and "Second line" in lyrics
+
+
+def test_uploading_a_tscpmc_supplies_everything(client, tmp_path):
+    """A pack already carries its audio, lyrics and colour."""
+
+    from tscp_player import musicpack
+
+    register(client)
+    plot_id = make_plot(client)
+
+    source = tmp_path / "track.flac"
+    source.write_bytes(_synthetic_flac())
+    pack = musicpack.write(
+        tmp_path / "track", source, LRC_TEXT, title="track", color="#33cccc"
+    )
+
+    response = upload(
+        client,
+        "/api/plots/%s/music" % plot_id,
+        {"abbreviation": "pk"},
+        {"file": (io.BytesIO(pack.read_bytes()), pack.name)},
+    )
+    assert response.status_code == 201, response.get_json()
+    track = response.get_json()["detail"]["music"][0]
+    assert track["abbreviation"] == "pk"
+    assert track["filename"] == "track.flac"
+    # Everything came out of the pack, not out of the form.
+    assert track["kind"] == "lyrics"
+    assert track["has_lyrics"] is True
+    assert track["color"] == "#33cccc"
+
+
+def test_a_broken_pack_is_rejected(client):
+    from tscp_player import musicpack
+
+    register(client)
+    plot_id = make_plot(client)
+    response = upload(
+        client,
+        "/api/plots/%s/music" % plot_id,
+        {"abbreviation": "bad"},
+        {"file": (io.BytesIO(b"not a zip at all"), "broken" + musicpack.PACK_SUFFIX)},
+    )
+    assert response.status_code == 400
+    assert "error" in response.get_json()
 
 
 def test_recorded_lyric_times_become_lrc(client):
