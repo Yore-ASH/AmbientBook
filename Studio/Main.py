@@ -1187,8 +1187,10 @@ if QT_AVAILABLE:
                 round(time_, 2): dict(entry) for time_, entry in styles.items()
             }
 
-            self.table = QTableWidget(len(self._lines), 4)
-            self.table.setHorizontalHeaderLabels(["时间", "歌词", "字体", "颜色"])
+            self.table = QTableWidget(len(self._lines), 6)
+            self.table.setHorizontalHeaderLabels(
+                ["时间", "歌词", "原文字体", "原文颜色", "翻译字体", "翻译颜色"]
+            )
             compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             # Multi-select, because setting a font one line at a time is
@@ -1198,14 +1200,24 @@ if QT_AVAILABLE:
             )
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self.table.horizontalHeader().setStretchLastSection(True)
-            self.table.setColumnWidth(0, 70)
-            self.table.setColumnWidth(2, 150)
-            self.table.setColumnWidth(3, 90)
+            self.table.setColumnWidth(0, 60)
+            for column in (2, 4):
+                self.table.setColumnWidth(column, 130)
+            for column in (3, 5):
+                self.table.setColumnWidth(column, 80)
 
-            font_button = QPushButton("设置字体…")
-            font_button.clicked.connect(self.pick_font)
-            colour_button = QPushButton("设置颜色…")
-            colour_button.clicked.connect(self.pick_colour)
+            font_button = QPushButton("原文字体…")
+            font_button.clicked.connect(lambda: self.pick_font("font"))
+            colour_button = QPushButton("原文颜色…")
+            colour_button.clicked.connect(lambda: self.pick_colour("color"))
+            trans_font_button = QPushButton("翻译字体…")
+            trans_font_button.setToolTip("不设就跟着原文的字体")
+            trans_font_button.clicked.connect(lambda: self.pick_font("translation_font"))
+            trans_colour_button = QPushButton("翻译颜色…")
+            trans_colour_button.setToolTip("不设就跟着原文的颜色")
+            trans_colour_button.clicked.connect(
+                lambda: self.pick_colour("translation_color")
+            )
             clear_button = QPushButton("清除选中")
             clear_button.clicked.connect(self.clear_row)
             clear_all = QPushButton("全部清除")
@@ -1222,6 +1234,8 @@ if QT_AVAILABLE:
             tools = QHBoxLayout()
             tools.addWidget(font_button)
             tools.addWidget(colour_button)
+            tools.addWidget(trans_font_button)
+            tools.addWidget(trans_colour_button)
             tools.addWidget(clear_button)
             tools.addWidget(clear_all)
             tools.addWidget(self.select_all_button)
@@ -1258,16 +1272,28 @@ if QT_AVAILABLE:
                 text.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.table.setItem(row, 1, text)
 
-                family = QTableWidgetItem(entry.get("font", "") or "（自动）")
-                family.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                self.table.setItem(row, 2, family)
+                for column, key, fallback in (
+                    (2, "font", "（自动）"),
+                    (4, "translation_font", "（同原文）"),
+                ):
+                    item = QTableWidgetItem(entry.get(key, "") or fallback)
+                    item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    )
+                    self.table.setItem(row, column, item)
 
-                swatch = QTableWidgetItem(entry.get("color", "") or "（曲目颜色）")
-                swatch.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                colour = entry.get("color", "")
-                if colour:
-                    swatch.setForeground(QColor(colour))
-                self.table.setItem(row, 3, swatch)
+                for column, key, fallback in (
+                    (3, "color", "（曲目颜色）"),
+                    (5, "translation_color", "（同原文）"),
+                ):
+                    item = QTableWidgetItem(entry.get(key, "") or fallback)
+                    item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    )
+                    colour = entry.get(key, "")
+                    if colour:
+                        item.setForeground(QColor(colour))
+                    self.table.setItem(row, column, item)
 
         def _target_rows(self) -> List[int]:
             """Which rows an action applies to.
@@ -1300,36 +1326,44 @@ if QT_AVAILABLE:
                     QAbstractItemView.ScrollHint.PositionAtCenter,
                 )
 
-        def pick_font(self) -> None:
+        def pick_font(self, field: str = "font") -> None:
+            """Set a font on the original or on the translation.
+
+            *field* is the key to write, which is what makes the two halves
+            independently styleable.
+            """
+
             rows = self._target_rows()
             if not rows:
                 return
+            side = "翻译" if field.startswith("translation") else "原文"
             first = self._styles.get(round(self._lines[rows[0]].time, 2), {})
-            current = QFont(first.get("font", "") or self.font().family())
+            current = QFont(first.get(field, "") or self.font().family())
             chosen, accepted = QFontDialog.getFont(
-                current, self, "字体（将应用到 %d 句）" % len(rows)
+                current, self, "%s字体（将应用到 %d 句）" % (side, len(rows))
             )
             if not accepted:
                 return
             for row in rows:
-                self._entry(row)["font"] = chosen.family()
+                self._entry(row)[field] = chosen.family()
             self._fill()
             self._restore_selection(rows)
 
-        def pick_colour(self) -> None:
+        def pick_colour(self, field: str = "color") -> None:
             rows = self._target_rows()
             if not rows:
                 return
+            side = "翻译" if field.startswith("translation") else "原文"
             first = self._styles.get(round(self._lines[rows[0]].time, 2), {})
             chosen = QColorDialog.getColor(
-                QColor(first.get("color", "") or "#ffd166"),
+                QColor(first.get(field, "") or "#ffd166"),
                 self,
-                "颜色（将应用到 %d 句）" % len(rows),
+                "%s颜色（将应用到 %d 句）" % (side, len(rows)),
             )
             if not chosen.isValid():
                 return
             for row in rows:
-                self._entry(row)["color"] = chosen.name()
+                self._entry(row)[field] = chosen.name()
             self._fill()
             self._restore_selection(rows)
 
@@ -1350,9 +1384,9 @@ if QT_AVAILABLE:
             """Only the lines that actually carry an override."""
 
             return {
-                time_: dict(entry)
+                time_: {key: value for key, value in entry.items() if value}
                 for time_, entry in self._styles.items()
-                if entry.get("font") or entry.get("color")
+                if any(entry.values())
             }
 
     class Step(QWidget):
@@ -2632,7 +2666,11 @@ if QT_AVAILABLE:
             import_button.clicked.connect(self.import_lyrics)
             record_button = QPushButton("录制每句时间…")
             record_button.clicked.connect(self.record_from_text)
-            colour_button = QPushButton("歌词颜色…")
+            colour_button = QPushButton("默认颜色…")
+            colour_button.setToolTip(
+                "整首歌的默认颜色；没有单独设置颜色的句子用它。"
+                "要逐句改颜色用「逐句字体/颜色…」"
+            )
             colour_button.clicked.connect(self.pick_colour)
             self.colour_swatch = QLabel("　")
             self.colour_swatch.setFixedWidth(28)
@@ -2647,7 +2685,7 @@ if QT_AVAILABLE:
             tools.addWidget(import_button)
             tools.addWidget(record_button)
             tools.addWidget(self.styles_button)
-            tools.addWidget(QLabel("颜色"))
+            tools.addWidget(QLabel("默认颜色"))
             tools.addWidget(self.colour_swatch)
             tools.addWidget(colour_button)
             tools.addStretch(1)
@@ -2863,7 +2901,10 @@ if QT_AVAILABLE:
                 QMessageBox.critical(self, "歌词", str(exc))
                 return
             try:
-                player.play(str(audio))
+                # loops=0: a preview exists to hear the song once and check the
+                # lyrics. The mixer loops by default, which is why it never
+                # stopped before.
+                player.play(str(audio), loops=0)
             except (OSError, RuntimeError) as exc:
                 QMessageBox.critical(self, "歌词", "无法播放 %s：%s" % (key, exc))
                 return
@@ -2888,7 +2929,17 @@ if QT_AVAILABLE:
         def _sync_preview(self) -> None:
             if self.preview_window is None:
                 return
-            self.preview_window.update_line(time.monotonic() - self.preview_started)
+            player = self.preview_player
+            # Stop as soon as the track is over, instead of leaving the last
+            # line up with the button still reading "停止".
+            if player is not None and not player.is_busy():
+                self.stop_preview()
+                self.studio.status.setText("预播放结束")
+                return
+            seconds = player.position() if player is not None else None
+            if seconds is None:
+                seconds = time.monotonic() - self.preview_started
+            self.preview_window.update_line(seconds)
 
         def _edited_lyrics(self):
             """The lyrics as currently typed, styled with the loaded colours."""
@@ -2909,6 +2960,10 @@ if QT_AVAILABLE:
                         line,
                         font=entry.get("font", "") or line.font,
                         color=entry.get("color", "") or line.color,
+                        translation_font=entry.get("translation_font", "")
+                        or line.translation_font,
+                        translation_color=entry.get("translation_color", "")
+                        or line.translation_color,
                     )
                 )
             return Lyrics(styled)
@@ -3042,6 +3097,8 @@ if QT_AVAILABLE:
                         line,
                         font=entry.get("font", "") or "",
                         color=entry.get("color", "") or "",
+                        translation_font=entry.get("translation_font", "") or "",
+                        translation_color=entry.get("translation_color", "") or "",
                     )
                 )
             if not has_style(Lyrics(styled)):

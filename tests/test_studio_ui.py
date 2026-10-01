@@ -2186,9 +2186,16 @@ def test_preview_play_uses_the_shared_lyric_window(studio, tmp_path, monkeypatch
     class FakePlayer:
         def play(self, path, loops=None, volume=1.0):
             played["path"] = path
+            played["loops"] = loops
 
         def stop(self):
             played["stopped"] = True
+
+        def is_busy(self):
+            return True
+
+        def position(self):
+            return None
 
     monkeypatch.setattr(studio_main, "MusicPlayer", FakePlayer)
     step.preview_player = None
@@ -2196,6 +2203,9 @@ def test_preview_play_uses_the_shared_lyric_window(studio, tmp_path, monkeypatch
 
     step.start_preview()
     assert "path" in played
+    # 0 means "once": the mixer loops by default, which is why the preview
+    # never used to stop.
+    assert played["loops"] == 0
     assert step.play_button.text() == "■ 停止"
     assert step.preview_window is not None
     assert step.preview_window.isVisible()
@@ -2237,6 +2247,12 @@ def test_preview_toggle_stops_when_running(studio, tmp_path, monkeypatch):
 
         def stop(self):
             pass
+
+        def is_busy(self):
+            return True
+
+        def position(self):
+            return None
 
     monkeypatch.setattr(studio_main, "MusicPlayer", FakePlayer)
     step.preview_player = None
@@ -2318,7 +2334,7 @@ def test_styles_are_keyed_by_time_not_row(studio, tmp_path):
 
     step._styles = {2.5: {"font": "Arial"}}
     step.apply_lyrics()
-    assert window.project.track_styles("iw").get(2.5) == {"font": "Arial", "color": ""}
+    assert window.project.track_styles("iw").get(2.5) == {"font": "Arial"}
 
 
 def test_the_preview_shows_the_edited_colours(studio, tmp_path):
@@ -2396,3 +2412,89 @@ def test_track_document_is_empty_for_a_plain_track(tmp_path):
         package, [plot_model.MusicDraft(abbreviation="iw", source=_song(tmp_path))]
     )
     assert plot_model.track_document(package, "iw") == ""
+
+
+# --------------------------------------------------------------------------
+# preview playback stops when the track does
+# --------------------------------------------------------------------------
+
+def test_the_preview_stops_itself_when_the_track_ends(studio, tmp_path, monkeypatch):
+    """The mixer loops by default, so this is what used to leave it running."""
+
+    import Studio.Main as studio_main
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    class FinishingPlayer:
+        busy = True
+
+        def play(self, path, loops=None, volume=1.0):
+            self.loops = loops
+
+        def stop(self):
+            self.stopped = True
+
+        def is_busy(self):
+            return self.busy
+
+        def position(self):
+            return 1.5
+
+    player = FinishingPlayer()
+    monkeypatch.setattr(studio_main, "MusicPlayer", lambda: player)
+    step.preview_player = None
+    step.preview_broken = False
+
+    step.start_preview()
+    assert player.loops == 0                 # play once, not forever
+    assert step.preview_timer.isActive()
+
+    # The song finishes between ticks.
+    player.busy = False
+    step._sync_preview()
+
+    assert not step.preview_timer.isActive()
+    assert step.play_button.text() == "▶ 预播放"
+    assert not step.preview_window.isVisible()
+    assert getattr(player, "stopped", False) is True
+    assert "预播放结束" in window.status.text()
+
+
+def test_the_preview_follows_the_mixers_position(studio, tmp_path, monkeypatch):
+    """A wall clock would keep advancing after the audio stopped."""
+
+    import Studio.Main as studio_main
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    seen = []
+
+    class FakePlayer:
+        def play(self, *a, **k):
+            pass
+
+        def stop(self):
+            pass
+
+        def is_busy(self):
+            return True
+
+        def position(self):
+            return 1.5
+
+    monkeypatch.setattr(studio_main, "MusicPlayer", FakePlayer)
+    step.preview_player = None
+    step.preview_broken = False
+    step.start_preview()
+    step.preview_window.update_line = lambda seconds: seen.append(seconds)
+    step._sync_preview()
+
+    assert seen == [1.5]

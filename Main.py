@@ -334,7 +334,18 @@ if QT_AVAILABLE:
         def _tick_lyrics(self) -> None:
             if self.lyrics_window is None or self._lyrics_started_at is None:
                 return
-            self.lyrics_window.update_line(time.monotonic() - self._lyrics_started_at)
+            # Ask the mixer where it is rather than counting seconds ourselves:
+            # a wall clock keeps running after the track has finished, which
+            # left the last line on screen forever.
+            if self.music is not None and not self.music.is_busy():
+                if self.music.current is not None:
+                    self._hide_lyrics()
+                    self.status.setText("播放中 · 音乐已结束")
+                    return
+            seconds = self.music.position() if self.music is not None else None
+            if seconds is None:
+                seconds = time.monotonic() - self._lyrics_started_at
+            self.lyrics_window.update_line(seconds)
 
         def _hide_lyrics(self) -> None:
             self._lyrics_timer.stop()

@@ -1213,7 +1213,16 @@ class StudioProject:
         except (lyrics.LyricError, ValueError):
             return {}
         return {
-            round(line.time, 2): {"font": line.font, "color": line.color}
+            round(line.time, 2): {
+                key: value
+                for key, value in (
+                    ("font", line.font),
+                    ("color", line.color),
+                    ("translation_font", line.translation_font),
+                    ("translation_color", line.translation_color),
+                )
+                if value
+            }
             for line in lines
             if line.has_style
         }

@@ -131,6 +131,20 @@ class MusicPlayer:
             return
         self._paused = False
 
+    def is_busy(self) -> bool:
+        """Whether the mixer is still playing something.
+
+        pygame loops by default (``loops=-1``), so without asking the mixer
+        there is no way to notice that a one-shot track has finished.
+        """
+
+        if self._mixer is None or self._current is None:
+            return False
+        try:
+            return bool(self._mixer.music.get_busy())
+        except Exception:
+            return False
+
     def position(self) -> Optional[float]:
         """Seconds since playback started, or ``None`` when nothing is playing.
 

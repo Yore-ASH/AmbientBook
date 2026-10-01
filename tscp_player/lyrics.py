@@ -69,6 +69,9 @@ class LyricLine:
     translation: str = ""
     font: str = ""
     color: str = ""
+    #: A translation may be styled on its own; empty means "follow the original".
+    translation_font: str = ""
+    translation_color: str = ""
 
     @property
     def has_translation(self) -> bool:
@@ -76,7 +79,36 @@ class LyricLine:
 
     @property
     def has_style(self) -> bool:
-        return bool(self.font or self.color)
+        return bool(
+            self.font
+            or self.color
+            or self.translation_font
+            or self.translation_color
+        )
+
+    @property
+    def text_font(self) -> str:
+        """Family for the original half."""
+
+        return self.font
+
+    @property
+    def text_color(self) -> str:
+        """Colour for the original half."""
+
+        return self.color
+
+    @property
+    def translated_font(self) -> str:
+        """Family for the translation, falling back to the original's."""
+
+        return self.translation_font or self.font
+
+    @property
+    def translated_color(self) -> str:
+        """Colour for the translation, falling back to the original's."""
+
+        return self.translation_color or self.color
 
     @property
     def lrc_text(self) -> str:
@@ -234,6 +266,8 @@ def parse_lrc(text: str) -> Lyrics:
                 item.translation,
                 item.font,
                 item.color,
+                item.translation_font,
+                item.translation_color,
             )
             for item in collected
         ]
@@ -314,6 +348,10 @@ def serialize_lyric_document(lyrics: Lyrics) -> str:
             entry["font"] = line.font
         if line.color:
             entry["color"] = line.color
+        if line.translation_font:
+            entry["translation_font"] = line.translation_font
+        if line.translation_color:
+            entry["translation_color"] = line.translation_color
         lines.append(entry)
     document = {"FORMAT": LYRIC_DOCUMENT_FORMAT, "LINES": lines}
     return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
@@ -355,6 +393,8 @@ def parse_lyric_document(text: str) -> Lyrics:
                 translation=str(entry.get("translation", "") or ""),
                 font=str(entry.get("font", "") or ""),
                 color=str(entry.get("color", "") or ""),
+                translation_font=str(entry.get("translation_font", "") or ""),
+                translation_color=str(entry.get("translation_color", "") or ""),
             )
         )
     collected.sort(key=lambda item: (item.time, item.text))

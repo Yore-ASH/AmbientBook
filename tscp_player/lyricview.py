@@ -116,6 +116,7 @@ if QT_AVAILABLE:
 
         def _html_for(self, line) -> str:
             colour = line.color or self._color
+            translated_colour = line.translation_color or colour
             metrics = QFontMetrics(self.label.font())
             gap = metrics.horizontalAdvance(COLUMN_GAP)
             rows = plan_lyric_rows(
@@ -126,23 +127,32 @@ if QT_AVAILABLE:
                 gap,
             )
 
-            def render(text: str) -> str:
-                return to_html(text, colour, self._families, family=line.font)
+            def render_original(text: str) -> str:
+                return to_html(text, colour, self._families, family=line.text_font)
+
+            def render_translation(text: str) -> str:
+                return to_html(
+                    text,
+                    translated_colour,
+                    self._families,
+                    family=line.translated_font,
+                )
 
             if len(rows) == 1 and not rows[0][1]:
-                return render(rows[0][0])
+                return render_original(rows[0][0])
             if len(rows) == 1:
                 left, right = rows[0]
                 return (
                     '<table width="100%%" cellspacing="0" cellpadding="0"><tr>'
                     '<td align="right">%s</td>'
                     '<td align="left" style="padding-left:%dpx">%s</td>'
-                    "</tr></table>" % (render(left), int(gap), render(right))
+                    "</tr></table>"
+                    % (render_original(left), int(gap), render_translation(right))
                 )
             body = "".join(
                 '<tr><td align="right">%s</td>'
                 '<td align="left" style="padding-left:%dpx">%s</td></tr>'
-                % (render(left), int(gap), render(right))
+                % (render_original(left), int(gap), render_translation(right))
                 for left, right in rows
             )
             return (

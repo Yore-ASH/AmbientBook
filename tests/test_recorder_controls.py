@@ -391,3 +391,76 @@ def test_the_table_allows_multi_selection(qapp):
         dialog.table.selectionMode()
         == QAbstractItemView.SelectionMode.ExtendedSelection
     )
+
+
+# --------------------------------------------------------------------------
+# knowing when the music has finished
+# --------------------------------------------------------------------------
+
+def test_is_busy_reports_the_mixers_state(tmp_path):
+    from tscp_player.audio import MusicPlayer
+
+    song = tmp_path / "song.ogg"
+    song.write_bytes(b"x")
+
+    class Mixer:
+        def __init__(self):
+            self.music = self
+            self.busy = True
+
+        def load(self, key):
+            pass
+
+        def set_volume(self, value):
+            pass
+
+        def play(self, loops=None):
+            pass
+
+        def get_busy(self):
+            return self.busy
+
+        def get_pos(self):
+            return 0
+
+    mixer = Mixer()
+    player = MusicPlayer(mixer=mixer)
+    assert player.is_busy() is False          # nothing loaded
+    player.play(str(song))
+    assert player.is_busy() is True
+    mixer.busy = False
+    assert player.is_busy() is False
+
+
+# The two preview-playback tests live in test_studio_ui.py, which owns the
+# studio fixture and the _timed_story helper they need.
+
+
+def test_the_dialog_styles_the_translation_separately(qapp):
+    from PySide6.QtWidgets import QFontDialog
+
+    from Studio.Main import LineStyleDialog
+    from tscp_player.lyrics import LyricLine, Lyrics
+
+    dialog = LineStyleDialog(
+        None, Lyrics([LyricLine(1.0, "a", "b")]), {}
+    )
+    dialog.apply_all.setChecked(True)
+
+    class FakeFont:
+        @staticmethod
+        def family():
+            return "Arial"
+
+    # QFontDialog.getFont returns (font, accepted).
+    original = QFontDialog.getFont
+    QFontDialog.getFont = staticmethod(lambda *a, **k: (FakeFont(), True))
+    try:
+        dialog.pick_font("translation_font")
+    finally:
+        QFontDialog.getFont = original
+
+    styles = dialog.styles()
+    assert styles[1.0] == {"translation_font": "Arial"}
+    # The original half is untouched.
+    assert "font" not in styles[1.0]

@@ -405,3 +405,97 @@ def test_normalise_can_write_somewhere_else(mixed_pack, tmp_path):
     # The source is left alone, and no backup is made for it.
     assert "{" in musicpack.read(mixed_pack).lyrics
     assert not Path(str(mixed_pack) + ".lrc.bak").exists()
+
+
+# --------------------------------------------------------------------------
+# the original and the translation are styled independently
+# --------------------------------------------------------------------------
+
+def test_the_translation_falls_back_to_the_originals_style():
+    line = LyricLine(1.0, "Hello", "你好", font="SimSun", color="#ffd166")
+    assert line.text_font == "SimSun"
+    assert line.translated_font == "SimSun"
+    assert line.translated_color == "#ffd166"
+
+
+def test_the_translation_can_be_styled_on_its_own():
+    line = LyricLine(
+        1.0, "Hello", "你好",
+        font="SimSun", color="#ffd166",
+        translation_font="Arial", translation_color="#33cccc",
+    )
+    assert line.text_font == "SimSun"
+    assert line.text_color == "#ffd166"
+    assert line.translated_font == "Arial"
+    assert line.translated_color == "#33cccc"
+
+
+def test_styling_only_the_translation_still_counts():
+    assert has_line_styles(Lyrics([LyricLine(1.0, "a", "b", translation_font="Arial")]))
+    assert has_line_styles(
+        Lyrics([LyricLine(1.0, "a", "b", translation_color="#123456")])
+    )
+    assert has_line_styles(Lyrics([LyricLine(1.0, "a", "b")])) is False
+
+
+def test_the_two_new_fields_survive_the_document():
+    original = Lyrics([
+        LyricLine(
+            1.0, "Hello", "你好",
+            font="SimSun", color="#ffd166",
+            translation_font="Arial", translation_color="#33cccc",
+        )
+    ])
+    text = serialize_lyric_document(original)
+    assert "translation_font" in text and "translation_color" in text
+    assert parse_lyric_document(text).lines == original.lines
+
+
+def test_an_unstyled_translation_adds_no_keys():
+    text = serialize_lyric_document(Lyrics([LyricLine(1.0, "a", "b")]))
+    assert "translation_font" not in text
+    assert "translation_color" not in text
+
+
+def test_a_translation_keeps_its_own_font_through_a_pack(tmp_path):
+    source = tmp_path / "track.flac"
+    source.write_bytes(_flac())
+    lines = Lyrics([
+        LyricLine(1.0, "Hello", "你好", font="SimSun", translation_font="Arial")
+    ])
+    pack = musicpack.write(
+        tmp_path / "out", source, serialize_lrc(lines), title="t", lines=lines
+    )
+    loaded = musicpack.read(pack).lines().lines
+    assert loaded[0].font == "SimSun"
+    assert loaded[0].translation_font == "Arial"
+    assert loaded[0].translated_font == "Arial"
+
+
+def test_rendering_uses_a_family_per_half(qapp):
+    from tscp_player.lyricview import LyricsWindow
+
+    window = LyricsWindow()
+    lyrics = Lyrics([
+        LyricLine(1.0, "Hello", "你好", font="SimSun", translation_font="Arial")
+    ])
+    window.show_track(lyrics, "#ffffff", 1.0)
+    html = window.label.text()
+
+    assert "'SimSun'" in html
+    assert "'Arial'" in html
+
+
+def test_rendering_can_colour_the_two_halves_differently(qapp):
+    from tscp_player.lyricview import LyricsWindow
+    from tscp_player.lyrics import Lyrics as L
+
+    window = LyricsWindow()
+    lyrics = L([
+        LyricLine(1.0, "Hello", "你好", color="#ff0000", translation_color="#00ff00")
+    ])
+    window.show_track(lyrics, "#ffffff", 1.0)
+    html = window.label.text()
+
+    assert "#ff0000" in html
+    assert "#00ff00" in html
