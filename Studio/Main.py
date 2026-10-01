@@ -1191,7 +1191,11 @@ if QT_AVAILABLE:
             self.table.setHorizontalHeaderLabels(["时间", "歌词", "字体", "颜色"])
             compact_table(self.table)
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            # Multi-select, because setting a font one line at a time is
+            # exactly the tedium the batch controls exist to remove.
+            self.table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
             self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self.table.horizontalHeader().setStretchLastSection(True)
             self.table.setColumnWidth(0, 70)
@@ -1202,17 +1206,27 @@ if QT_AVAILABLE:
             font_button.clicked.connect(self.pick_font)
             colour_button = QPushButton("设置颜色…")
             colour_button.clicked.connect(self.pick_colour)
-            clear_button = QPushButton("清除本句")
+            clear_button = QPushButton("清除选中")
             clear_button.clicked.connect(self.clear_row)
             clear_all = QPushButton("全部清除")
             clear_all.clicked.connect(self.clear_all)
+
+            self.apply_all = QCheckBox("应用到全部句子")
+            self.apply_all.setToolTip(
+                "勾上以后，选字体或颜色会一次设给所有句子；"
+                "不勾则设给选中的句子（可按住 Ctrl / Shift 多选，一个都不选就是当前句）"
+            )
+            self.select_all_button = QPushButton("全选")
+            self.select_all_button.clicked.connect(self.table.selectAll)
 
             tools = QHBoxLayout()
             tools.addWidget(font_button)
             tools.addWidget(colour_button)
             tools.addWidget(clear_button)
             tools.addWidget(clear_all)
+            tools.addWidget(self.select_all_button)
             tools.addStretch(1)
+            tools.addWidget(self.apply_all)
 
             hint = QLabel(
                 "只给需要变化的句子设置即可；没设置的句子沿用曲目自己的颜色和自动字体。"
@@ -1255,53 +1269,78 @@ if QT_AVAILABLE:
                     swatch.setForeground(QColor(colour))
                 self.table.setItem(row, 3, swatch)
 
-        def _selected_row(self) -> Optional[int]:
-            rows = [index.row() for index in self.table.selectedIndexes()]
+        def _target_rows(self) -> List[int]:
+            """Which rows an action applies to.
+
+            The checkbox wins; otherwise every selected row; otherwise the
+            focused one, so a single click still works.
+            """
+
+            if getattr(self, "apply_all", None) is not None and self.apply_all.isChecked():
+                return list(range(len(self._lines)))
+            rows = sorted({index.row() for index in self.table.selectedIndexes()})
             if rows:
-                return rows[0]
-            # The selection can be empty right after the table is refilled;
-            # fall back to the focused row so the buttons keep working.
+                return rows
             current = self.table.currentRow()
-            return current if current >= 0 else None
+            # Nothing selected and nothing focused still means "the first line",
+            # rather than a button that quietly does nothing.
+            return [current if current >= 0 else 0]
 
         def _entry(self, row: int) -> Dict[str, str]:
             time_ = round(self._lines[row].time, 2)
             return self._styles.setdefault(time_, {})
 
+        def _restore_selection(self, rows: List[int]) -> None:
+            self.table.clearSelection()
+            for row in rows:
+                self.table.selectRow(row)
+            if rows:
+                self.table.scrollToItem(
+                    self.table.item(rows[0], 0),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
+
         def pick_font(self) -> None:
-            row = self._selected_row()
-            if row is None:
+            rows = self._target_rows()
+            if not rows:
                 return
-            entry = self._entry(row)
-            current = QFont(entry.get("font", "") or self.font().family())
-            chosen, accepted = QFontDialog.getFont(current, self, "这句歌词的字体")
+            first = self._styles.get(round(self._lines[rows[0]].time, 2), {})
+            current = QFont(first.get("font", "") or self.font().family())
+            chosen, accepted = QFontDialog.getFont(
+                current, self, "字体（将应用到 %d 句）" % len(rows)
+            )
             if not accepted:
                 return
-            entry["font"] = chosen.family()
+            for row in rows:
+                self._entry(row)["font"] = chosen.family()
             self._fill()
-            self.table.selectRow(row)
+            self._restore_selection(rows)
 
         def pick_colour(self) -> None:
-            row = self._selected_row()
-            if row is None:
+            rows = self._target_rows()
+            if not rows:
                 return
-            entry = self._entry(row)
+            first = self._styles.get(round(self._lines[rows[0]].time, 2), {})
             chosen = QColorDialog.getColor(
-                QColor(entry.get("color", "") or "#ffd166"), self, "这句歌词的颜色"
+                QColor(first.get("color", "") or "#ffd166"),
+                self,
+                "颜色（将应用到 %d 句）" % len(rows),
             )
             if not chosen.isValid():
                 return
-            entry["color"] = chosen.name()
+            for row in rows:
+                self._entry(row)["color"] = chosen.name()
             self._fill()
-            self.table.selectRow(row)
+            self._restore_selection(rows)
 
         def clear_row(self) -> None:
-            row = self._selected_row()
-            if row is None:
+            rows = self._target_rows()
+            if not rows:
                 return
-            self._styles.pop(round(self._lines[row].time, 2), None)
+            for row in rows:
+                self._styles.pop(round(self._lines[row].time, 2), None)
             self._fill()
-            self.table.selectRow(row)
+            self._restore_selection(rows)
 
         def clear_all(self) -> None:
             self._styles.clear()

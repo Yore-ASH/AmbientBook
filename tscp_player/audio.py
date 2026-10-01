@@ -11,6 +11,31 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+#: SDL_mixer only implements SetMusicPosition for these.  For FLAC and WAV
+#: ``set_pos`` returns without moving, so the format is what decides whether a
+#: track can be started from the middle -- not a runtime check.
+SEEKABLE_SUFFIXES = frozenset({".ogg", ".oga", ".opus", ".mp3"})
+
+
+class SeekUnsupported(RuntimeError):
+    """Raised when the loaded format cannot be positioned."""
+
+    def __init__(self, name: str) -> None:
+        suffix = Path(str(name)).suffix.lower()
+        self.suffix = suffix
+        super().__init__(
+            "这种格式（%s）无法定位播放，只能从头开始" % (suffix.lstrip(".") or "未知")
+        )
+
+
+def supports_seek(filename) -> bool:
+    """Whether a track of this format can be started from the middle."""
+
+    try:
+        return Path(filename).suffix.lower() in SEEKABLE_SUFFIXES
+    except TypeError:
+        return False
+
 
 class MusicPlayer:
     def __init__(self, mixer=None, loops: int = -1) -> None:
@@ -105,6 +130,37 @@ class MusicPlayer:
             self._paused = False
             return
         self._paused = False
+
+    def position(self) -> Optional[float]:
+        """Seconds since playback started, or ``None`` when nothing is playing.
+
+        This is the mixer's own clock, which is what a seek has to be measured
+        against -- asking the file is not possible through pygame.
+        """
+
+        if self._mixer is None or self._current is None:
+            return None
+        try:
+            return self._mixer.music.get_pos() / 1000.0
+        except Exception:
+            return None
+
+    def seek(self, seconds: float) -> None:
+        """Start the loaded track from *seconds*.
+
+        Raises :class:`SeekUnsupported` for a format SDL_mixer cannot position,
+        rather than silently continuing from where it was -- which is exactly
+        what ``set_pos`` does on a FLAC.
+        """
+
+        if self._mixer is None or self._current is None:
+            raise RuntimeError("没有正在播放的音乐")
+        if not supports_seek(self._current):
+            raise SeekUnsupported(self._current)
+        try:
+            self._mixer.music.set_pos(max(0.0, float(seconds)))
+        except Exception as exc:  # noqa: BLE001
+            raise SeekUnsupported(self._current) from exc
 
     def stop(self) -> None:
         if self._mixer is not None:
