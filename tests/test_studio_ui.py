@@ -2924,3 +2924,132 @@ def test_exporting_with_no_scripts_says_so(studio, messages):
     window = studio
     window.steps[4].export_script()
     assert any("还没有剧本" in text for _kind, text in messages)
+
+
+# --------------------------------------------------------------------------
+# the single-file script editor
+# --------------------------------------------------------------------------
+
+def test_the_editor_renders_markup_as_framed_blocks(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    body = (
+        "<p>iw" + chr(10)
+        + "[f]" + BACKSLASH + "co?00ffaa绿灯" + BACKSLASH + "co 后面" + chr(10)
+        + "前" + BACKSLASH + "ge整个名字" + BACKSLASH + "ge后" + chr(10)
+        + "\x1b[1;33mFISH\x1b[0m 说话" + chr(10)
+    )
+    dialog = ScriptEditorDialog(None, None, body)
+    html = dialog.view.toHtml()
+
+    assert "border" in html                     # every block is framed
+    assert "#00ffaa" in html                    # the colour is applied
+    assert "绿灯" in html and "整个名字" in html
+    # An old-style escape is shown as a chip rather than hidden.
+    assert "FISH" in html
+
+
+def test_the_editor_round_trips_its_text(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    body = "前" + BACKSLASH + "ge整体" + BACKSLASH + "ge后"
+    dialog = ScriptEditorDialog(None, None, body)
+    assert dialog.source.toPlainText() == body
+    assert len(dialog.source.toPlainText()) == len(body)
+
+
+def test_the_editor_renders_an_empty_file(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "")
+    dialog.render()          # must not raise
+    assert dialog.dirty is False
+
+
+def test_the_editor_converts_truecolour_to_marks(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "\x1b[38;2;0;255;170m绿灯\x1b[0m")
+    dialog.convert_ansi()
+    assert dialog.source.toPlainText() == BACKSLASH + "co?00ffaa绿灯" + BACKSLASH + "co"
+
+
+def test_the_editor_says_when_there_is_nothing_to_convert(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "普通文本")
+    dialog.convert_ansi()
+    assert "原样保留" in dialog.status.text()
+
+
+def test_the_editor_wraps_a_selection_as_a_group(qapp):
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "整体出现")
+    dialog.source.selectAll()
+    dialog.wrap_group()
+    assert dialog.source.toPlainText() == (
+        BACKSLASH + "ge整体出现" + BACKSLASH + "ge"
+    )
+
+
+def test_wrapping_needs_a_selection(qapp, messages):
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "没有选中")
+    dialog.source.moveCursor(dialog.source.textCursor().MoveOperation.Start)
+    dialog.wrap_group()
+    assert any("先选中" in text for _kind, text in messages)
+
+
+def test_the_editor_saves_and_reloads(qapp, tmp_path):
+    from Studio.script_editor import ScriptEditorDialog
+
+    target = tmp_path / "demo.tscps"
+    dialog = ScriptEditorDialog(None, target)
+    dialog.source.setPlainText("旁白一句话" + chr(10))
+    assert dialog.save() is True
+    assert target.read_text(encoding="utf-8") == "旁白一句话" + chr(10)
+
+    reopened = ScriptEditorDialog(None, target)
+    assert reopened.source.toPlainText() == "旁白一句话" + chr(10)
+    assert reopened.dirty is False
+
+
+def test_the_editor_has_apply_and_cancel(qapp):
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    from Studio.script_editor import ScriptEditorDialog
+
+    dialog = ScriptEditorDialog(None, None, "文本")
+    assert dialog.findChild(QDialogButtonBox) is not None
+
+
+def test_the_story_step_can_open_the_editor(studio, tmp_path, monkeypatch):
+    """Applying the editor's text replaces the script."""
+
+    from PySide6.QtWidgets import QDialog
+
+    from Studio.script_editor import ScriptEditorDialog
+
+    window = studio
+    _story(window, tmp_path)
+    step = window.steps[1]
+    step.refresh()
+    name = step.current_script_name()
+
+    monkeypatch.setattr(
+        ScriptEditorDialog, "exec", lambda self: QDialog.DialogCode.Accepted
+    )
+    original = ScriptEditorDialog.__init__
+
+    def _seeded(self, parent=None, path=None, text=""):
+        original(self, parent, path, "只有这一句旁白" + chr(10))
+
+    monkeypatch.setattr(ScriptEditorDialog, "__init__", _seeded)
+
+    step.open_in_editor()
+
+    lines = window.project.script(name).lines
+    assert len(lines) == 1
+    assert getattr(lines[0], "text", "") == "只有这一句旁白"

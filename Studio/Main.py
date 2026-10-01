@@ -25,6 +25,7 @@ import CharacterCreator.model as characters_model
 from PlotManager.model import MusicDraft, PackError
 from PlotManager.recorder import LyricsRecorderDialog
 from Studio import model as studio
+from Studio.script_editor import ScriptEditorDialog
 from Studio import theme
 from Studio.timeline import (
     DEFAULT_SCALE as DEFAULT_ZOOM,
@@ -49,6 +50,8 @@ from Studio.model import (
 from Ts2Tp.model import KeyboardTimingModel, TimingMode
 from tscp_player.audio import MusicPlayer
 from tscp_player.format import (
+    TSCPError,
+    parse_tscps,
     serialize_tscps,
     ANSI_SEQUENCE_RE,
     Dialogue,
@@ -1742,6 +1745,11 @@ if QT_AVAILABLE:
             rename_script.clicked.connect(self.rename_script)
             delete_script = QPushButton("删除剧本")
             delete_script.clicked.connect(self.delete_script)
+            self.editor_button = QPushButton("在编辑器里打开…")
+            self.editor_button.setToolTip(
+                "用标记视图编辑这个剧本：颜色和分组会画成带框的块"
+            )
+            self.editor_button.clicked.connect(self.open_in_editor)
             import_script = QPushButton("导入剧本…")
             import_script.setToolTip("从已有的 .tscp（含时间）或 .tscps（原稿）导入")
             import_script.clicked.connect(self.import_script)
@@ -1820,6 +1828,32 @@ if QT_AVAILABLE:
                 self.script_combo.setCurrentText(current)
             self.script_combo.blockSignals(False)
             self._reload_events()
+
+        def open_in_editor(self) -> None:
+            """Edit this script in the markup-aware editor.
+
+            The editor shows colours and groups as framed chips, which is the
+            only way to see where a block starts and ends in a script that mixes
+            ``\\co`` marks with the raw escapes older files use.
+            """
+
+            name = self.current_script_name()
+            if self.project is None or name is None:
+                QMessageBox.information(self, "剧本", "先选择或新建一个剧本")
+                return
+            body = marks.contract_colours(serialize_tscps(self.project.script(name)))
+            dialog = ScriptEditorDialog(self, None, body)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            try:
+                script = parse_tscps(dialog.source.toPlainText())
+            except (TSCPError, ValueError) as exc:
+                QMessageBox.critical(self, "剧本", "改完之后解析不了了：%s" % exc)
+                return
+            self.project.set_script(name, script)
+            self.studio.mark_dirty()
+            self._reload_events()
+            self.studio.status.setText("已在编辑器中更新 %s" % name)
 
         def current_script_name(self) -> Optional[str]:
             return self.script_combo.currentText() or None

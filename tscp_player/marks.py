@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html import escape
 from typing import List, Tuple
 
 #: ``\co?RRGGBB`` opens a colour; ``\co`` closes it.
@@ -184,5 +185,252 @@ def contract_colours(text: str) -> str:
     return ANSI_RESET_RE.sub(
         lambda _match: "\\co", ANSI_TRUECOLOR_RE.sub(contract, text)
     )
+
+
+# --------------------------------------------------------------------------
+# tokenising, for an editor that shows the markup instead of hiding it
+# --------------------------------------------------------------------------
+
+#: Every SGR sequence, literal spelling or real escape, that sets a colour.
+ANSI_COLOUR_RE = re.compile(
+    r"(?:\\033|\\x1b|\x1b)\[([0-9;]*)m"
+)
+
+TEXT = "text"
+COLOUR = "colour"
+RESET = "reset"
+GROUP = "group"
+ANSI = "ansi"
+
+#: The eight/eight-bright palette the renderers understand.
+ANSI_PALETTE = {
+    30: "#000000", 31: "#cc3333", 32: "#33cc66", 33: "#cccc33",
+    34: "#4488ff", 35: "#cc66cc", 36: "#33cccc", 37: "#eeeeee",
+    90: "#777777", 91: "#ff6666", 92: "#66ee88", 93: "#ffff66",
+    94: "#66aaff", 95: "#ee88ee", 96: "#66eeee", 97: "#ffffff",
+}
+
+
+@dataclass(frozen=True)
+class Token:
+    """One piece of a marked-up line, as an editor would show it.
+
+    ``kind`` is one of :data:`TEXT`, :data:`COLOUR`, :data:`RESET`,
+    :data:`GROUP` or :data:`ANSI`.  ``source`` is the exact text that has to go
+    back into the file; for a text run it is the run itself, and for a marker it
+    is the marker.
+    """
+
+    kind: str
+    source: str
+    #: For a text run: the colour in effect, as ``#rrggbb`` or ``""``.
+    colour: str = ""
+    #: For a marker: a short label an editor can show on the chip.
+    label: str = ""
+
+
+def _colour_from_sgr(parameters: str) -> str:
+    """The ``#rrggbb`` a sequence selects, or ``""`` when it is not a colour."""
+
+    parts = [int(value or 0) for value in parameters.split(";")]
+    index = 0
+    while index < len(parts):
+        code = parts[index]
+        if code == 38 and index + 1 < len(parts):
+            if parts[index + 1] == 2 and index + 4 < len(parts):
+                red, green, blue = parts[index + 2:index + 5]
+                return "#%02x%02x%02x" % (red & 0xFF, green & 0xFF, blue & 0xFF)
+            if parts[index + 1] == 5:
+                return ""
+        if code in ANSI_PALETTE:
+            return ANSI_PALETTE[code]
+        index += 1
+    return ""
+
+
+def tokenize(text: str) -> List[Token]:
+    """Break a line into text runs and the markers between them.
+
+    An editor needs to see the markup rather than have it applied, so that a
+    colour can be inspected, moved, or deleted.  Each text run carries the
+    colour that was in effect where it sits, which is what lets the run be drawn
+    in the right colour without re-parsing.
+    """
+
+    tokens: List[Token] = []
+    colour = ""
+    group_open = False
+    position = 0
+    pattern = re.compile(
+        "|".join(
+            (
+                "(" + COLOUR_OPEN + ")",
+                "(" + COLOUR_CLOSE + ")",
+                "(" + GROUP_TOGGLE + ")",
+                "(" + ANSI_COLOUR_RE.pattern + ")",
+            )
+        )
+    )
+
+    for match in pattern.finditer(text):
+        chunk = text[position:match.start()]
+        if chunk:
+            tokens.append(Token(TEXT, chunk, colour=colour))
+        position = match.end()
+        token = match.group(0)
+
+        # The token is re-read rather than pulled out by group number: the
+        # alternatives nest their own groups, so numbering is easy to get wrong
+        # and silently picks up the wrong piece.
+        if token.startswith("\\co?"):
+            colour = "#" + token[4:].lower()
+            tokens.append(Token(COLOUR, token, colour=colour, label=colour))
+        elif token == "\\co":
+            colour = ""
+            tokens.append(Token(RESET, token, label="还原"))
+        elif token == "\\ge":
+            group_open = not group_open
+            tokens.append(
+                Token(GROUP, token, label="整体开始" if group_open else "整体结束")
+            )
+        else:
+            parameters = ANSI_COLOUR_RE.match(token)
+            codes = parameters.group(1) if parameters else ""
+            selected = _colour_from_sgr(codes)
+            if selected:
+                colour = selected
+            elif codes.strip() in ("0", ""):
+                colour = ""
+            tokens.append(Token(ANSI, token, colour=colour, label=token))
+
+    tail = text[position:]
+    if tail:
+        tokens.append(Token(TEXT, tail, colour=colour))
+    return tokens
+
+
+# --------------------------------------------------------------------------
+# turning tokens into something an editor can draw
+# --------------------------------------------------------------------------
+
+def blocks(text: str) -> List[List[Token]]:
+    """Group tokens into blocks: a marker and everything it governs.
+
+    An editor wants to draw a box around ``\\co?00ffaa绿灯\\co`` as one thing,
+    rather than leaving three unrelated chips in a row.  A colour block runs
+    from its opening marker to the matching reset; a group block runs from one
+    ``\\ge`` to the next.  Anything between blocks stands on its own.
+    """
+
+    grouped: List[List[Token]] = []
+    open_colour: List[Token] = []
+    open_group: List[Token] = []
+
+    for token in tokenize(text):
+        if token.kind == COLOUR:
+            if open_colour:                      # an unclosed one, flush it
+                grouped.append(open_colour)
+            open_colour = [token]
+            continue
+        if token.kind == RESET and open_colour:
+            open_colour.append(token)
+            grouped.append(open_colour)
+            open_colour = []
+            continue
+        if token.kind == GROUP:
+            if open_group:
+                open_group.append(token)
+                grouped.append(open_group)
+                open_group = []
+            else:
+                open_group = [token]
+            continue
+        if open_colour:
+            open_colour.append(token)
+        elif open_group:
+            open_group.append(token)
+        else:
+            grouped.append([token])
+
+    # Unclosed markers still get shown, running to the end of the line.
+    if open_colour:
+        grouped.append(open_colour)
+    if open_group:
+        grouped.append(open_group)
+    return grouped
+
+
+#: Chip colours, kept in one place so the editor and any other view agree.
+CHIP_BACKGROUND = "#2f3640"
+CHIP_BORDER = "#57606f"
+CHIP_TEXT = "#dfe4ea"
+GROUP_BACKGROUND = "#3d3a2f"
+GROUP_BORDER = "#8a7a3f"
+
+
+def to_editor_html(text: str, *, background: str = "#1e2229", foreground: str = "#e8e8e8") -> str:
+    """Render a line for an editor: markup as framed chips, text in its colour.
+
+    The markup stays visible and labelled, which is the whole point -- hiding a
+    colour behind its effect makes it impossible to see, move, or delete.
+    """
+
+    output: List[str] = []
+    for block in blocks(text):
+        markers = [token for token in block if token.kind != TEXT]
+        runs = [token for token in block if token.kind == TEXT]
+
+        if not markers:
+            for token in runs:
+                output.append(_span(token.source, token.colour, foreground))
+            continue
+
+        open_token = markers[0]
+        label = open_token.label
+        if open_token.kind == ANSI:
+            # A raw escape: show the bytes, tinted with what they select.
+            chip_colour = open_token.colour or CHIP_TEXT
+        elif open_token.kind == GROUP:
+            chip_colour = "#ffd166"
+        else:
+            chip_colour = open_token.colour or CHIP_TEXT
+
+        framed = ""
+
+        chips = "".join(
+            _chip(token.label, chip_colour, group=token.kind == GROUP)
+            for token in markers
+        )
+        body = "".join(
+            _span(token.source, token.colour, foreground) for token in runs
+        )
+        border = GROUP_BORDER if open_token.kind == GROUP else CHIP_BORDER
+        fill = GROUP_BACKGROUND if open_token.kind == GROUP else "transparent"
+        output.append(
+            '<span style="border:1px solid %s;border-radius:4px;'
+            'background:%s;padding:0 2px;">%s%s</span>' % (border, fill, chips, body)
+        )
+
+    return (
+        '<div style="background:%s;color:%s;padding:6px 8px;'
+        'font-family:Consolas,monospace;">%s</div>' % (background, foreground, "".join(output))
+    )
+
+
+def _span(text: str, colour: str, fallback: str) -> str:
+    painted = colour or fallback
+    return '<span style="color:%s;">%s</span>' % (painted, escape(text))
+
+
+def _chip(label: str, colour: str, *, group: bool = False) -> str:
+    fill = GROUP_BACKGROUND if group else CHIP_BACKGROUND
+    border = GROUP_BORDER if group else CHIP_BORDER
+    return (
+        '<span style="background:%s;border:1px solid %s;border-radius:3px;'
+        'color:%s;padding:0 3px;font-size:8pt;">%s</span>'
+        % (fill, border, colour, escape(label))
+    )
+
+
 
 
