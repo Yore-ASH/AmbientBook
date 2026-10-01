@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Union
 
+from . import marks
+
 
 FORMAT_VERSION = 1
 #: Match literal spellings used in source files as well as real terminal
@@ -31,8 +33,14 @@ _NOTE_SECONDS_LIMIT = 3600.0
 
 
 def visible_text_length(text: str) -> int:
-    """Count printable characters while ignoring embedded ANSI SGR sequences."""
-    return len(ANSI_SEQUENCE_RE.sub("", text))
+    """Count printable characters while ignoring embedded ANSI SGR sequences.
+
+    The author-facing ``\\ge`` group markers are ignored too: nobody sees them,
+    and counting them would put the delay list one entry out of step with the
+    text, shifting every later character.
+    """
+
+    return len(ANSI_SEQUENCE_RE.sub("", marks.strip_groups(text)))
 
 
 class TSCPError(ValueError):
@@ -205,9 +213,14 @@ def parse_tscps(source: str) -> Script:
             end = line.find("]")
             if end < 2:
                 raise TSCPError("line %d: malformed character prefix" % number)
-            lines.append(Dialogue(line[1:end], line[end + 1:].lstrip()))
+            lines.append(
+                Dialogue(
+                    marks.expand_colours(line[1:end]),
+                    marks.expand_colours(line[end + 1:].lstrip()),
+                )
+            )
         else:
-            lines.append(Dialogue(None, line))
+            lines.append(Dialogue(None, marks.expand_colours(line)))
     return Script(lines)
 
 
