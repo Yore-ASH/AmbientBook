@@ -540,11 +540,16 @@ def update_track(
     lyrics_text: Optional[str] = None,
     lyrics_name: Optional[str] = None,
     color: Optional[str] = None,
+    lyric_document: Optional[str] = None,
 ) -> None:
-    """Change one existing track's kind, lyrics or colour.
+    """Change one existing track's kind, lyrics, colour or line styling.
 
     Lyrics are only touched when new content is supplied, so switching a track
     back to instrumental keeps its ``.lrc`` on disk in case it is wanted again.
+
+    *lyric_document* is the JSON form, which is where per-line fonts and colours
+    live -- LRC cannot express them.  It is written beside the ``.lrc``, never
+    instead of it.
     """
 
     key = _check_abbreviation(abbreviation)
@@ -562,10 +567,26 @@ def update_track(
         entry["KIND"] = wanted
     entry.setdefault("KIND", KIND_INSTRUMENTAL)
 
-    # Colour is applied up front so it survives the lyrics branch below, which
-    # returns early: passing lyrics and a colour together must set both.
+    writes: Dict[str, str] = {}
+    changed = False
+
     if color is not None:
         entry["COLOR"] = str(color)
+        changed = True
+
+    removals: List[str] = []
+    if lyric_document is not None:
+        name = "%s.json" % key
+        member = "%s/%s" % (archive.MUSICS_DIR, name)
+        if lyric_document:
+            entry["LYRICS_JSON"] = name
+            writes[member] = lyric_document
+        else:
+            # An empty document means the overrides are gone, so drop both the
+            # reference and the member instead of leaving a stale one behind.
+            entry.pop("LYRICS_JSON", None)
+            removals.append(member)
+        changed = True
 
     if lyrics_file is not None or lyrics_text is not None:
         draft = MusicDraft(
@@ -578,22 +599,38 @@ def update_track(
         )
         name = _lyrics_member_name(draft, key)
         member = "%s/%s" % (archive.MUSICS_DIR, name)
-        texts: Dict[str, str] = {}
         if lyrics_file is not None:
-            texts[member] = _read_lyrics(lyrics_file)
+            writes[member] = _read_lyrics(lyrics_file)
         else:
-            texts[member] = _normalise_newlines(lyrics_text or "")
+            writes[member] = _normalise_newlines(lyrics_text or "")
         entry["KIND"] = KIND_LYRICS
         entry["LYRICS"] = name
-        document["TRACKS"] = tracks
-        tracks[key] = entry
-        texts[MUSIC_META] = _write_json(document)
-        archive.update(path, text=texts)
-        return
+        changed = True
 
+    if not changed:
+        return
     tracks[key] = entry
     document["TRACKS"] = tracks
-    archive.update(path, text={MUSIC_META: _write_json(document)})
+    writes[MUSIC_META] = _write_json(document)
+    archive.update(path, text=writes, remove=removals)
+
+
+def track_document(path: PathLike, abbreviation: str) -> str:
+    """The JSON lyric document stored for one track, or ``""``.
+
+    Written only when a line carries its own font or colour.
+    """
+
+    key = _check_abbreviation(abbreviation)
+    tracks = _track_table(music_document(path))
+    entry = tracks.get(key) or {}
+    name = str(entry.get("LYRICS_JSON", "") or "")
+    if not name:
+        return ""
+    member = "%s/%s" % (archive.MUSICS_DIR, name)
+    if not archive.has_member(path, member):
+        return ""
+    return archive.read_text(path, member)
 
 
 def remove_music(path: PathLike, abbreviations: Iterable[str]) -> List[str]:

@@ -32,6 +32,8 @@ PACK_FORMAT = "tscpmc 1"
 MANIFEST = "__init__.json"
 AUDIO_DIR = "Audio"
 LYRICS_MEMBER = "lyrics.lrc"
+#: Written only when lines carry a font or a colour, which LRC cannot express.
+LYRIC_DOCUMENT_MEMBER = "lyrics.json"
 
 #: Where the lyrics are kept inside the audio itself.
 FLAC_COMMENT_BLOCK = 4
@@ -347,14 +349,25 @@ class MusicPack:
     kind: str = "lyrics"
     tagged: bool = False
     notes: List[str] = field(default_factory=list)
+    #: The richer lyric document, when the pack carries one.
+    document: str = ""
 
     @property
     def audio_suffix(self) -> str:
         return Path(self.audio_name).suffix.lower()
 
+    def lines(self):
+        """The lyrics as timed lines, in whichever form the pack stored."""
+
+        from .lyrics import parse_lyrics
+
+        if self.document:
+            return parse_lyrics(self.document)
+        return parse_lyrics(self.lyrics)
+
 
 def _manifest(pack: MusicPack) -> Dict[str, object]:
-    return {
+    document = {
         "FORMAT": PACK_FORMAT,
         "TITLE": pack.title,
         "KIND": pack.kind,
@@ -363,6 +376,9 @@ def _manifest(pack: MusicPack) -> Dict[str, object]:
         "LYRICS": LYRICS_MEMBER,
         "EMBEDDED": pack.tagged,
     }
+    if pack.document:
+        document["LYRICS_JSON"] = LYRIC_DOCUMENT_MEMBER
+    return document
 
 
 def write(
@@ -373,8 +389,14 @@ def write(
     title: str = "",
     color: str = "",
     kind: str = "lyrics",
+    lines=None,
 ) -> Path:
-    """Pack *audio* and *lyrics* into one ``.tscpmc``."""
+    """Pack *audio* and *lyrics* into one ``.tscpmc``.
+
+    Pass *lines* (a :class:`~tscp_player.lyrics.Lyrics`) when any line carries
+    its own font or colour: those cannot be written into an ``.lrc``, so the
+    richer JSON document rides along beside it.
+    """
 
     source = Path(audio)
     if not source.is_file():
@@ -400,6 +422,14 @@ def write(
     except MusicPackError:
         tagged_bytes, tagged = raw, False
 
+    # Only pay for the JSON document when a line actually needs it.
+    document = ""
+    if lines is not None:
+        from .lyrics import has_line_styles, serialize_lyric_document
+
+        if has_line_styles(lines):
+            document = serialize_lyric_document(lines)
+
     pack = MusicPack(
         path=destination,
         audio_name=source.name,
@@ -409,6 +439,7 @@ def write(
         color=color,
         kind=kind,
         tagged=tagged,
+        document=document,
     )
     with zipfile.ZipFile(destination, "w") as archive:
         archive.writestr(
@@ -416,6 +447,8 @@ def write(
         )
         if pack.lyrics:
             archive.writestr(LYRICS_MEMBER, pack.lyrics)
+        if document:
+            archive.writestr(LYRIC_DOCUMENT_MEMBER, document)
         # Audio is already compressed; storing it keeps the pack streamable and
         # makes the bytes inside identical to the original.
         archive.writestr(
@@ -450,6 +483,10 @@ def read(path: PathLike) -> MusicPack:
             lyrics = ""
             if lyrics_member in names:
                 lyrics = archive.read(lyrics_member).decode("utf-8")
+            document_member = str(document.get("LYRICS_JSON", "") or "")
+            rich = ""
+            if document_member and document_member in names:
+                rich = archive.read(document_member).decode("utf-8")
             audio = archive.read(audio_member)
     except (zipfile.BadZipFile, OSError, ValueError, UnicodeError) as exc:
         raise MusicPackError("无法读取 %s：%s" % (source, exc)) from exc
@@ -463,6 +500,7 @@ def read(path: PathLike) -> MusicPack:
         color=str(document.get("COLOR", "")),
         kind=str(document.get("KIND", "lyrics")),
         tagged=bool(document.get("EMBEDDED", False)),
+        document=rich,
     )
 
     # A pack whose audio claims to carry tags but does not is worth saying out
@@ -533,6 +571,83 @@ def copy_into(pack_path: PathLike, folder: PathLike) -> Path:
 # command line
 # --------------------------------------------------------------------------
 
+def rewrite_lyrics(
+    path: PathLike,
+    *,
+    lyrics: Optional[str] = None,
+    lines=None,
+    color: Optional[str] = None,
+    title: Optional[str] = None,
+    target: Optional[PathLike] = None,
+) -> Path:
+    """Rewrite one pack's lyrics (and optionally its colour), keeping its audio.
+
+    Reads *path* and writes *target* (default: the same file).  The audio member
+    is copied byte for byte and only re-tagged, so a rewrite never degrades the
+    recording.  The new pack is built beside the destination and swapped in with
+    an atomic replace, so a failure leaves the original intact.
+    """
+
+    import os
+
+    from .lyrics import has_line_styles, parse_lyrics, serialize_lrc, serialize_lyric_document
+
+    source = Path(path)
+    pack = read(source)
+    if lines is None and lyrics is not None:
+        lines = parse_lyrics(lyrics)
+
+    if lyrics is None and lines is not None:
+        lyrics = serialize_lrc(lines)
+    text = pack.lyrics if lyrics is None else lyrics
+    if not text.strip() and pack.kind != "instrumental":
+        raise MusicPackError("歌词不能为空")
+
+    document = ""
+    if lines is not None:
+        document = serialize_lyric_document(lines) if has_line_styles(lines) else ""
+    else:
+        document = pack.document
+
+    label = pack.title if title is None else title
+    tagged, tagged_ok = embed_lyrics(pack.audio, pack.audio_name, text, title=label)
+
+    manifest = {
+        "FORMAT": PACK_FORMAT,
+        "TITLE": label,
+        "KIND": pack.kind,
+        "COLOR": pack.color if color is None else color,
+        "AUDIO": "%s/%s" % (AUDIO_DIR, pack.audio_name),
+        "LYRICS": LYRICS_MEMBER,
+        "EMBEDDED": tagged_ok,
+    }
+    if document:
+        manifest["LYRICS_JSON"] = LYRIC_DOCUMENT_MEMBER
+
+    destination = source if target is None else Path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    helper = destination.with_name(destination.name + ".rewriting")
+    try:
+        with zipfile.ZipFile(helper, "w") as archive:
+            archive.writestr(
+                MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+            if text:
+                archive.writestr(LYRICS_MEMBER, text)
+            if document:
+                archive.writestr(LYRIC_DOCUMENT_MEMBER, document)
+            archive.writestr(
+                "%s/%s" % (AUDIO_DIR, pack.audio_name),
+                tagged,
+                compress_type=zipfile.ZIP_STORED,
+            )
+        os.replace(helper, destination)
+    except BaseException:
+        helper.unlink(missing_ok=True)
+        raise
+    return destination
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """``python -m tscp_player.musicpack`` -- make, inspect or unpack a pack."""
 
@@ -552,9 +667,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--show", action="store_true", help="只显示包里的信息")
     action.add_argument("--extract", action="store_true", help="解出音频和歌词")
+    action.add_argument(
+        "--normalise",
+        action="store_true",
+        help="把包里的歌词重写成标准 LRC（时间不变），音频原样保留",
+    )
     args = parser.parse_args(argv)
 
     try:
+        if args.normalise:
+            from .lyrics import serialize_lrc
+
+            source = Path(args.path)
+            pack = read(source)
+            lines = pack.lines()
+            if not lines.lines:
+                print("这个包里没有可解析的歌词。", file=sys.stderr)
+                return 2
+            target = Path(args.output) if args.output else source
+            if target == source:
+                # Keep the old text beside the file: it is tiny, and it is the
+                # only copy of whatever the original mixed formats held.
+                source.with_suffix(source.suffix + ".lrc.bak").write_text(
+                    pack.lyrics, encoding="utf-8"
+                )
+            written = rewrite_lyrics(
+                source, lines=lines, lyrics=serialize_lrc(lines), target=target
+            )
+            print(
+                "已重写 %s：%d 行标准 LRC（时间不变，音频原样保留）"
+                % (written, len(lines.lines))
+            )
+            return 0
+
         if args.show or args.extract:
             pack = read(args.path)
             if args.show:

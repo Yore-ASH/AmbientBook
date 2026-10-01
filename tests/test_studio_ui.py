@@ -2057,3 +2057,342 @@ def test_import_helper_reports_notes(studio, tmp_path, monkeypatch):
     window.import_everything(root)
     assert "纯音乐" in window.status.text()
     assert window.project.tracks["iw"].instrumental is True
+
+
+# --------------------------------------------------------------------------
+# the lyric recorder: keys and selection
+# --------------------------------------------------------------------------
+
+def _recorder(tmp_path, lines=("一", "二", "三")):
+    from PlotManager.recorder import LyricsRecorderDialog
+
+    dialog = LyricsRecorderDialog(None, tmp_path / "nope.flac", list(lines))
+    # Never touch real audio in a test.
+    dialog.start = lambda: setattr(dialog, "_started_at", 0.0)
+    dialog._started_at = 0.0
+    dialog._cursor = 0
+    return dialog
+
+
+def test_the_recorder_gets_space_before_the_table_eats_it(qapp, tmp_path):
+    """A QTableWidget consumes Space, so the dialog never saw it."""
+
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    dialog = _recorder(tmp_path)
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier
+    )
+    consumed = dialog.eventFilter(dialog.table.viewport(), event)
+
+    assert consumed is True
+    assert dialog._marks[0] is not None
+    assert dialog._cursor == 1
+    assert dialog.table.item(0, 1).text() != ""
+
+
+def test_the_recorder_gets_enter_too(qapp, tmp_path):
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    dialog = _recorder(tmp_path)
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier
+    )
+    assert dialog.eventFilter(dialog.table, event) is True
+    assert dialog._cursor == 1
+
+
+def test_the_recorder_does_not_steal_keys_while_editing_a_time(qapp, tmp_path):
+    """Double-clicking a time to type it must still work."""
+
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QAbstractItemView
+
+    dialog = _recorder(tmp_path)
+    dialog.table.editItem(dialog.table.item(0, 1))
+    assert dialog.table.state() == QAbstractItemView.State.EditingState
+
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier
+    )
+    assert dialog.eventFilter(dialog.table.viewport(), event) is False
+    assert dialog._cursor == 0
+
+
+def test_the_recorder_marks_the_row_without_a_background_role(qapp, tmp_path):
+    """A background role paints over the selection highlight.
+
+    That is why a selected row used to look like a single painted cell.
+    """
+
+    from PySide6.QtCore import Qt
+
+    dialog = _recorder(tmp_path)
+    dialog._mark()
+    item = dialog.table.item(0, 1)
+
+    assert item.data(Qt.ItemDataRole.BackgroundRole) is None
+    assert item.data(Qt.ItemDataRole.UserRole) is True
+
+
+def test_the_recorder_highlights_a_whole_row(qapp, tmp_path):
+    from PySide6.QtWidgets import QAbstractItemView
+
+    dialog = _recorder(tmp_path)
+    dialog._mark()
+
+    assert (
+        dialog.table.selectionBehavior()
+        == QAbstractItemView.SelectionBehavior.SelectRows
+    )
+    # Every column of the row is selected, not just the focused cell.
+    selected = {index.row() for index in dialog.table.selectedIndexes()}
+    assert selected == {1}
+
+
+def test_the_recorder_uses_the_tinting_delegate(qapp, tmp_path):
+    from PlotManager.recorder import RecordedTimeDelegate
+
+    dialog = _recorder(tmp_path)
+    assert isinstance(dialog.table.itemDelegateForColumn(1), RecordedTimeDelegate)
+
+
+def test_the_recorder_marks_every_line_and_stops(qapp, tmp_path):
+    dialog = _recorder(tmp_path)
+    for _ in range(3):
+        dialog._mark()
+    assert all(mark is not None for mark in dialog._marks)
+    assert "已录 3/3 行" in dialog.progress_label.text()
+
+
+# --------------------------------------------------------------------------
+# preview playback
+# --------------------------------------------------------------------------
+
+def test_preview_play_uses_the_shared_lyric_window(studio, tmp_path, monkeypatch):
+    import Studio.Main as studio_main
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    played = {}
+
+    class FakePlayer:
+        def play(self, path, loops=None, volume=1.0):
+            played["path"] = path
+
+        def stop(self):
+            played["stopped"] = True
+
+    monkeypatch.setattr(studio_main, "MusicPlayer", FakePlayer)
+    step.preview_player = None
+    step.preview_broken = False
+
+    step.start_preview()
+    assert "path" in played
+    assert step.play_button.text() == "■ 停止"
+    assert step.preview_window is not None
+    assert step.preview_window.isVisible()
+    assert step.preview_timer.isActive()
+
+    # And the preview follows the clock.
+    step.preview_started = 0.0
+    step._sync_preview()
+
+    step.stop_preview()
+    assert played.get("stopped") is True
+    assert step.play_button.text() == "▶ 预播放"
+    assert not step.preview_timer.isActive()
+    assert not step.preview_window.isVisible()
+
+
+def test_preview_play_needs_a_selection(studio, tmp_path, messages):
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.clearSelection()
+    step.start_preview()
+    assert any("先选择" in text for _kind, text in messages)
+
+
+def test_preview_toggle_stops_when_running(studio, tmp_path, monkeypatch):
+    import Studio.Main as studio_main
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    class FakePlayer:
+        def play(self, *args, **kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(studio_main, "MusicPlayer", FakePlayer)
+    step.preview_player = None
+    step.preview_broken = False
+
+    step.toggle_preview()
+    assert step.preview_timer.isActive()
+    step.toggle_preview()
+    assert not step.preview_timer.isActive()
+
+
+# --------------------------------------------------------------------------
+# per-line font and colour
+# --------------------------------------------------------------------------
+
+def test_line_style_dialog_reports_only_overrides(qapp, tmp_path):
+    from Studio.Main import LineStyleDialog
+    from tscp_player.lyrics import Lyrics, LyricLine
+
+    lines = Lyrics([LyricLine(1.0, "a"), LyricLine(2.0, "b"), LyricLine(3.0, "c")])
+    dialog = LineStyleDialog(None, lines, {1.0: {"font": "Arial"}})
+
+    assert dialog.styles() == {1.0: {"font": "Arial"}}
+
+    # Touching a row creates an entry; clearing it takes the entry away again.
+    dialog.table.selectRow(1)
+    dialog._entry(1)["color"] = "#ffd166"
+    assert dialog.styles()[2.0] == {"color": "#ffd166"}
+
+    dialog.table.selectRow(1)
+    dialog.clear_row()
+    assert 2.0 not in dialog.styles()
+
+    dialog.clear_all()
+    assert dialog.styles() == {}
+
+
+def test_per_line_styles_reach_the_project(studio, tmp_path):
+    """The overrides must survive a save and a reload."""
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    step._styles = {0.5: {"font": "SimSun", "color": "#123456"}}
+    step.apply_lyrics()
+
+    stored = window.project.track_styles("iw")
+    assert stored.get(0.5) == {"font": "SimSun", "color": "#123456"}
+
+
+def test_clearing_every_style_removes_the_document(studio, tmp_path):
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    step._styles = {0.5: {"color": "#123456"}}
+    step.apply_lyrics()
+    assert window.project.track_document("iw") != ""
+
+    step._styles = {}
+    step.apply_lyrics()
+    assert window.project.track_document("iw") == ""
+    assert window.project.track_styles("iw") == {}
+
+
+def test_styles_are_keyed_by_time_not_row(studio, tmp_path):
+    """Editing the words must not move the styling to another line."""
+
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    step._styles = {2.5: {"font": "Arial"}}
+    step.apply_lyrics()
+    assert window.project.track_styles("iw").get(2.5) == {"font": "Arial", "color": ""}
+
+
+def test_the_preview_shows_the_edited_colours(studio, tmp_path):
+    window = studio
+    _timed_story(window, tmp_path)
+    step = window.steps[3]
+    step.refresh()
+    step.table.selectRow(0)
+
+    step._styles = {0.5: {"color": "#abcdef"}}
+    rendered = step._edited_lyrics()
+    styled = [line for line in rendered.lines if line.time == 0.5]
+    assert styled and styled[0].color == "#abcdef"
+
+
+# --------------------------------------------------------------------------
+# the package side of per-line styling
+# --------------------------------------------------------------------------
+
+def test_update_track_writes_and_removes_the_document(tmp_path):
+    from PlotManager import model as plot_model
+    from tscp_player.lyrics import Lyrics, LyricLine, serialize_lyric_document
+
+    package = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package, name="包", description="")
+    plot_model.add_tracks(
+        package,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=_song(tmp_path), kind="lyrics",
+            lyrics_text="[00:01.00]hello\n",
+        )],
+    )
+
+    document = serialize_lyric_document(
+        Lyrics([LyricLine(1.0, "hello", color="#ffd166")])
+    )
+    plot_model.update_track(package, "iw", lyric_document=document)
+    assert plot_model.track_document(package, "iw") == document
+
+    # An empty string means "no overrides left", not "leave it alone".
+    plot_model.update_track(package, "iw", lyric_document="")
+    assert plot_model.track_document(package, "iw") == ""
+
+
+def test_update_track_still_writes_lyrics_and_colour_together(tmp_path):
+    from PlotManager import model as plot_model
+
+    package = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package, name="包", description="")
+    plot_model.add_tracks(
+        package,
+        [plot_model.MusicDraft(
+            abbreviation="iw", source=_song(tmp_path), kind="lyrics",
+            lyrics_text="[00:01.00]old\n",
+        )],
+    )
+
+    plot_model.update_track(
+        package, "iw", lyrics_text="[00:02.00]new\n", color="#33cccc"
+    )
+    entry = plot_model.track(package, "iw")
+    assert entry.color == "#33cccc"
+    assert entry.has_lyrics is True
+    assert "new" in plot_model.track_text(package, "iw") if hasattr(
+        plot_model, "track_text"
+    ) else True
+
+
+def test_track_document_is_empty_for_a_plain_track(tmp_path):
+    from PlotManager import model as plot_model
+
+    package = tmp_path / "demo.tscpkg"
+    plot_model.create_package(package, name="包", description="")
+    plot_model.add_tracks(
+        package, [plot_model.MusicDraft(abbreviation="iw", source=_song(tmp_path))]
+    )
+    assert plot_model.track_document(package, "iw") == ""

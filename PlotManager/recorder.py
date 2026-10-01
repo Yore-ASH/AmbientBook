@@ -19,7 +19,8 @@ from tscp_player.audio import MusicPlayer
 from tscp_player.lyrics import Lyrics, format_time, parse_time, timed_from_marks
 
 try:  # pragma: no cover - depends on the optional GUI package
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+    from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QDialog,
@@ -28,6 +29,8 @@ try:  # pragma: no cover - depends on the optional GUI package
         QLabel,
         QMessageBox,
         QPushButton,
+        QStyle,
+        QStyledItemDelegate,
         QTableWidget,
         QTableWidgetItem,
         QVBoxLayout,
@@ -39,6 +42,24 @@ except ImportError:  # pragma: no cover
 
 
 if QT_AVAILABLE:
+
+    class RecordedTimeDelegate(QStyledItemDelegate):
+        """Tint the time cell of a recorded line.
+
+        The tint cannot be an item background role: Qt paints that over the
+        selection highlight, which leaves a selected row looking half painted.
+        Painting it here, and skipping it while the row is selected, keeps the
+        whole-row highlight intact.
+        """
+
+        DONE = QColor("#1d4d24")
+
+        def paint(self, painter, option, index) -> None:
+            if index.data(Qt.ItemDataRole.UserRole) and not (
+                option.state & QStyle.StateFlag.State_Selected
+            ):
+                painter.fillRect(option.rect, self.DONE)
+            super().paint(painter, option, index)
 
     class LyricsRecorderDialog(QDialog):
         """Press a key per line while the track plays; edit the times afterwards."""
@@ -90,6 +111,7 @@ if QT_AVAILABLE:
             self.table = QTableWidget(len(self.lines), 3)
             self.table.setHorizontalHeaderLabels(["#", "时间", "歌词"])
             self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(
                 QAbstractItemView.EditTrigger.DoubleClicked
                 | QAbstractItemView.EditTrigger.EditKeyPressed
@@ -97,6 +119,12 @@ if QT_AVAILABLE:
             self.table.horizontalHeader().setStretchLastSection(True)
             self.table.setColumnWidth(0, 44)
             self.table.setColumnWidth(1, 110)
+            self.table.setItemDelegateForColumn(1, RecordedTimeDelegate(self.table))
+            # A QTableWidget eats Space (it toggles the selection) and Return
+            # (it starts editing), so the dialog's keyPressEvent never sees the
+            # very keys this screen is built around. Intercept them first.
+            self.table.installEventFilter(self)
+            self.table.viewport().installEventFilter(self)
             for row, text in enumerate(self.lines):
                 number = QTableWidgetItem(str(row + 1))
                 number.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -182,6 +210,28 @@ if QT_AVAILABLE:
                 "当前时间 %.2fs" % (time.monotonic() - self._started_at)
             )
 
+        def eventFilter(self, watched, event) -> bool:
+            """Catch Space/Enter before the table can swallow them.
+
+            Editing a time by hand has to keep working, so the keys are only
+            intercepted when no editor is open.
+            """
+
+            if event.type() == QEvent.Type.KeyPress:
+                if self.table.state() != QAbstractItemView.State.EditingState:
+                    key = event.key()
+                    if key in (
+                        Qt.Key.Key_Return,
+                        Qt.Key.Key_Enter,
+                        Qt.Key.Key_Space,
+                    ):
+                        if self._started_at is None:
+                            self.start()
+                        else:
+                            self._mark()
+                        return True
+            return super().eventFilter(watched, event)
+
         def keyPressEvent(self, event) -> None:
             key = event.key()
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
@@ -200,13 +250,17 @@ if QT_AVAILABLE:
             for row, mark in enumerate(self._marks):
                 item = self.table.item(row, 1)
                 item.setText("" if mark is None else "%.2f" % mark)
-                item.setBackground(
-                    Qt.GlobalColor.transparent if mark is None else Qt.GlobalColor.darkGreen
-                )
+                # The delegate reads this; it is deliberately not a background
+                # role, which would hide the row highlight.
+                item.setData(Qt.ItemDataRole.UserRole, mark is not None)
             done = sum(1 for mark in self._marks if mark is not None)
             self.progress_label.setText("已录 %d/%d 行" % (done, len(self.lines)))
             if self._cursor < len(self.lines):
                 self.table.selectRow(self._cursor)
+                self.table.scrollToItem(
+                    self.table.item(self._cursor, 0),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
 
         def _read_times(self) -> Optional[List[float]]:
             """Read the (possibly hand-edited) time column back out."""

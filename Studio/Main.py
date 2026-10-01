@@ -14,6 +14,7 @@ import re
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -56,7 +57,18 @@ from tscp_player.format import (
     note_parts,
     visible_text_length,
 )
-from tscp_player.lyrics import lyric_source_lines, parse_lrc, serialize_lrc, timed_from_marks
+from tscp_player.lyricview import LyricsWindow
+from tscp_player.lyrics import (
+    Lyrics,
+    format_time,
+    has_line_styles as has_style,
+    lyric_source_lines,
+    parse_lyrics,
+    parse_lrc,
+    serialize_lrc,
+    serialize_lyric_document,
+    timed_from_marks,
+)
 from tscp_player.music import STOP_WORDS
 from tscp_player import musicpack
 
@@ -65,6 +77,7 @@ try:  # pragma: no cover - depends on the optional GUI package
     from PySide6.QtGui import (
         QAction,
         QColor,
+        QFont,
         QFontMetrics,
         QIcon,
         QKeySequence,
@@ -82,6 +95,7 @@ try:  # pragma: no cover - depends on the optional GUI package
         QDialog,
         QDialogButtonBox,
         QDoubleSpinBox,
+        QFontDialog,
         QFileDialog,
         QFormLayout,
         QHBoxLayout,
@@ -1155,6 +1169,152 @@ if QT_AVAILABLE:
     # ----------------------------------------------------------------------
     # steps
     # ----------------------------------------------------------------------
+
+    class LineStyleDialog(QDialog):
+        """Give individual lyric lines their own font and colour.
+
+        LRC has no room for either, so the result is stored as the JSON lyric
+        document beside the ``.lrc``.  Only lines that differ from the track's
+        own settings are recorded.
+        """
+
+        def __init__(self, parent, lines, styles: Dict[float, Dict[str, str]]) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("逐句字体 / 颜色")
+            self.resize(720, 460)
+            self._lines = list(lines.lines)
+            self._styles: Dict[float, Dict[str, str]] = {
+                round(time_, 2): dict(entry) for time_, entry in styles.items()
+            }
+
+            self.table = QTableWidget(len(self._lines), 4)
+            self.table.setHorizontalHeaderLabels(["时间", "歌词", "字体", "颜色"])
+            compact_table(self.table)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.setColumnWidth(0, 70)
+            self.table.setColumnWidth(2, 150)
+            self.table.setColumnWidth(3, 90)
+
+            font_button = QPushButton("设置字体…")
+            font_button.clicked.connect(self.pick_font)
+            colour_button = QPushButton("设置颜色…")
+            colour_button.clicked.connect(self.pick_colour)
+            clear_button = QPushButton("清除本句")
+            clear_button.clicked.connect(self.clear_row)
+            clear_all = QPushButton("全部清除")
+            clear_all.clicked.connect(self.clear_all)
+
+            tools = QHBoxLayout()
+            tools.addWidget(font_button)
+            tools.addWidget(colour_button)
+            tools.addWidget(clear_button)
+            tools.addWidget(clear_all)
+            tools.addStretch(1)
+
+            hint = QLabel(
+                "只给需要变化的句子设置即可；没设置的句子沿用曲目自己的颜色和自动字体。"
+            )
+            hint.setWordWrap(True)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(hint)
+            layout.addWidget(self.table, 1)
+            layout.addLayout(tools)
+            layout.addWidget(buttons)
+
+            self._fill()
+
+        def _fill(self) -> None:
+            for row, line in enumerate(self._lines):
+                entry = self._styles.get(round(line.time, 2), {})
+                when = QTableWidgetItem(format_time(line.time))
+                when.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.table.setItem(row, 0, when)
+
+                text = QTableWidgetItem(line.lrc_text)
+                text.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.table.setItem(row, 1, text)
+
+                family = QTableWidgetItem(entry.get("font", "") or "（自动）")
+                family.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.table.setItem(row, 2, family)
+
+                swatch = QTableWidgetItem(entry.get("color", "") or "（曲目颜色）")
+                swatch.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                colour = entry.get("color", "")
+                if colour:
+                    swatch.setForeground(QColor(colour))
+                self.table.setItem(row, 3, swatch)
+
+        def _selected_row(self) -> Optional[int]:
+            rows = [index.row() for index in self.table.selectedIndexes()]
+            if rows:
+                return rows[0]
+            # The selection can be empty right after the table is refilled;
+            # fall back to the focused row so the buttons keep working.
+            current = self.table.currentRow()
+            return current if current >= 0 else None
+
+        def _entry(self, row: int) -> Dict[str, str]:
+            time_ = round(self._lines[row].time, 2)
+            return self._styles.setdefault(time_, {})
+
+        def pick_font(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                return
+            entry = self._entry(row)
+            current = QFont(entry.get("font", "") or self.font().family())
+            chosen, accepted = QFontDialog.getFont(current, self, "这句歌词的字体")
+            if not accepted:
+                return
+            entry["font"] = chosen.family()
+            self._fill()
+            self.table.selectRow(row)
+
+        def pick_colour(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                return
+            entry = self._entry(row)
+            chosen = QColorDialog.getColor(
+                QColor(entry.get("color", "") or "#ffd166"), self, "这句歌词的颜色"
+            )
+            if not chosen.isValid():
+                return
+            entry["color"] = chosen.name()
+            self._fill()
+            self.table.selectRow(row)
+
+        def clear_row(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                return
+            self._styles.pop(round(self._lines[row].time, 2), None)
+            self._fill()
+            self.table.selectRow(row)
+
+        def clear_all(self) -> None:
+            self._styles.clear()
+            self._fill()
+
+        def styles(self) -> Dict[float, Dict[str, str]]:
+            """Only the lines that actually carry an override."""
+
+            return {
+                time_: dict(entry)
+                for time_, entry in self._styles.items()
+                if entry.get("font") or entry.get("color")
+            }
 
     class Step(QWidget):
         """Base class: a page that refreshes from the open project."""
@@ -2392,9 +2552,23 @@ if QT_AVAILABLE:
             remove_button = QPushButton("删除曲目")
             remove_button.clicked.connect(self.remove_music)
 
+            self.play_button = QPushButton("▶ 预播放")
+            self.play_button.setToolTip(
+                "播放选中的这首歌，同时按时间弹出歌词窗，用来检查时间、颜色和字体"
+            )
+            self.play_button.clicked.connect(self.toggle_preview)
+            self.preview_window = None
+            self.preview_player = None
+            self.preview_broken = False
+            self.preview_started = 0.0
+            self.preview_timer = QTimer(self)
+            self.preview_timer.setInterval(60)
+            self.preview_timer.timeout.connect(self._sync_preview)
+
             left_buttons = QHBoxLayout()
             left_buttons.addWidget(add_button)
             left_buttons.addWidget(remove_button)
+            left_buttons.addWidget(self.play_button)
             left_buttons.addStretch(1)
 
             left = QWidget()
@@ -2425,9 +2599,15 @@ if QT_AVAILABLE:
             self.colour_swatch.setFixedWidth(28)
             self.colour_swatch.setStyleSheet("border:1px solid #555;")
 
+            self.styles_button = QPushButton("逐句字体/颜色…")
+            self.styles_button.setToolTip("给单独的某几句指定字体和颜色")
+            self.styles_button.clicked.connect(self.edit_styles)
+            self._styles: Dict[float, Dict[str, str]] = {}
+
             tools = QHBoxLayout()
             tools.addWidget(import_button)
             tools.addWidget(record_button)
+            tools.addWidget(self.styles_button)
             tools.addWidget(QLabel("颜色"))
             tools.addWidget(self.colour_swatch)
             tools.addWidget(colour_button)
@@ -2454,7 +2634,6 @@ if QT_AVAILABLE:
             pack_row.addWidget(self.pack_button)
             pack_row.addStretch(1)
             right_layout.addLayout(pack_row)
-
             splitter = QSplitter(Qt.Orientation.Horizontal)
             splitter.addWidget(left)
             splitter.addWidget(right)
@@ -2511,6 +2690,19 @@ if QT_AVAILABLE:
             self.lyrics_edit.setPlainText(self.project.lyrics_text(key))
             self._colour = track.color or LYRIC_COLOR_DEFAULT
             self._paint_swatch()
+            # Per-line font/colour overrides, keyed by the line's time so they
+            # survive edits to the text.
+            self._styles = self.project.track_styles(key)
+            self._styles_label()
+
+        def _style_entries(self) -> Dict[float, Dict[str, str]]:
+            return self._styles
+
+        def _styles_label(self) -> None:
+            count = sum(1 for entry in self._styles.values() if entry)
+            self.styles_button.setText(
+                "逐句字体/颜色…（已设 %d 句）" % count if count else "逐句字体/颜色…"
+            )
 
         def _paint_swatch(self) -> None:
             self.colour_swatch.setStyleSheet(
@@ -2594,6 +2786,115 @@ if QT_AVAILABLE:
                 self._colour = colour.name()
                 self._paint_swatch()
 
+        # -- preview playback ----------------------------------------------
+        def _music_player(self) -> Optional[MusicPlayer]:
+            if self.preview_player is None and not self.preview_broken:
+                try:
+                    self.preview_player = MusicPlayer()
+                except RuntimeError as exc:
+                    self.preview_broken = True
+                    QMessageBox.warning(self, "歌词", "音乐不可用：%s" % exc)
+            return self.preview_player
+
+        def stop_preview(self) -> None:
+            """Stop the preview and take the lyric window down with it."""
+
+            self.preview_timer.stop()
+            self.preview_started = 0.0
+            if self.preview_player is not None:
+                self.preview_player.stop()
+            if self.preview_window is not None:
+                self.preview_window.clear()
+                self.preview_window.hide()
+            self.play_button.setText("▶ 预播放")
+
+        def start_preview(self) -> None:
+            """Play the selected track and follow it with the lyric window."""
+
+            key = self._selected_abbreviation()
+            if self.project is None or key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            player = self._music_player()
+            if player is None:
+                return
+            try:
+                audio = self.project.audio_path(key)
+            except StudioError as exc:
+                QMessageBox.critical(self, "歌词", str(exc))
+                return
+            try:
+                player.play(str(audio))
+            except (OSError, RuntimeError) as exc:
+                QMessageBox.critical(self, "歌词", "无法播放 %s：%s" % (key, exc))
+                return
+
+            # Show exactly what the lyrics editor currently holds, so a time or a
+            # colour can be checked before it is written back.
+            lyrics = self._edited_lyrics()
+            if self.preview_window is None:
+                self.preview_window = LyricsWindow()
+            self.preview_window.show_track(lyrics, self.current_colour(), 0.0)
+            self.preview_started = time.monotonic()
+            self.preview_timer.start()
+            self.play_button.setText("■ 停止")
+            self.studio.status.setText("预播放 %s" % key)
+
+        def toggle_preview(self) -> None:
+            if self.preview_timer.isActive():
+                self.stop_preview()
+            else:
+                self.start_preview()
+
+        def _sync_preview(self) -> None:
+            if self.preview_window is None:
+                return
+            self.preview_window.update_line(time.monotonic() - self.preview_started)
+
+        def _edited_lyrics(self):
+            """The lyrics as currently typed, styled with the loaded colours."""
+
+            text = self.lyrics_edit.toPlainText()
+            lines = parse_lyrics(text)
+            entries = self._style_entries()
+            if not entries:
+                return lines
+            styled = []
+            for line in lines.lines:
+                entry = entries.get(round(line.time, 2))
+                if entry is None:
+                    styled.append(line)
+                    continue
+                styled.append(
+                    replace(
+                        line,
+                        font=entry.get("font", "") or line.font,
+                        color=entry.get("color", "") or line.color,
+                    )
+                )
+            return Lyrics(styled)
+
+        def edit_styles(self) -> None:
+            """Assign a font and a colour to individual lines."""
+
+            key = self._selected_abbreviation()
+            if self.project is None or key is None:
+                QMessageBox.information(self, "歌词", "请先选择一首音乐")
+                return
+            lines = parse_lyrics(self.lyrics_edit.toPlainText())
+            if not lines.lines:
+                QMessageBox.information(self, "歌词", "还没有歌词")
+                return
+            dialog = LineStyleDialog(self, lines, self._styles)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._styles = dialog.styles()
+            self._styles_label()
+            self.apply_lyrics()
+
+        def current_colour(self) -> str:
+            return self._colour or ""
+
         def export_pack(self) -> None:
             """Write the selected track out as a standalone ``.tscpmc``.
 
@@ -2664,6 +2965,10 @@ if QT_AVAILABLE:
             if kind == "lyrics" and not text:
                 QMessageBox.warning(self, "歌词", "选择「带歌词」时要填歌词内容")
                 return
+            # The per-line font/colour overrides go into the JSON document, which
+            # is written beside the .lrc in the same rewrite.
+            # "" clears the document; None would mean "leave it alone".
+            document = self._document_for(text) if kind == "lyrics" else ""
             self.studio.run(
                 lambda: self.project.update_music(
                     key,
@@ -2671,10 +2976,38 @@ if QT_AVAILABLE:
                     lyrics_text=text if kind == "lyrics" else None,
                     lyrics_name="%s.lrc" % key,
                     color=self._colour,
+                    lyric_document=document,
                 ),
                 "已更新 %s" % key,
             )
             self.refresh()
+
+        def _document_for(self, text: str) -> str:
+            """The JSON lyric document for the current text, or ``""`` for none.
+
+            ``""`` clears any document the track used to have, rather than
+            leaving a stale one behind.
+            """
+
+            if not self._styles:
+                return ""
+            lines = parse_lyrics(text)
+            styled = []
+            for line in lines.lines:
+                entry = self._styles.get(round(line.time, 2))
+                if not entry:
+                    styled.append(line)
+                    continue
+                styled.append(
+                    replace(
+                        line,
+                        font=entry.get("font", "") or "",
+                        color=entry.get("color", "") or "",
+                    )
+                )
+            if not has_style(Lyrics(styled)):
+                return ""
+            return serialize_lyric_document(Lyrics(styled))
 
     class ExportStep(Step):
         title = "⑤ 导出"

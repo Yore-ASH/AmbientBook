@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from CharacterCreator import model as characters
 from PlotManager import model
 from PlotManager.model import MusicDraft, PackError
-from tscp_player import archive
+from tscp_player import archive, lyrics
 from tscp_player.format import (
     Dialogue,
     Directive,
@@ -1174,6 +1174,7 @@ class StudioProject:
         lyrics_text: Optional[str] = None,
         lyrics_name: Optional[str] = None,
         color: Optional[str] = None,
+        lyric_document: Optional[str] = None,
     ) -> None:
         try:
             model.update_track(
@@ -1183,10 +1184,39 @@ class StudioProject:
                 lyrics_text=lyrics_text,
                 lyrics_name=lyrics_name,
                 color=color,
+                lyric_document=lyric_document,
             )
         except (PackError, archive.PackageError, OSError, ValueError) as exc:
             raise StudioError(str(exc)) from exc
         self._reload_tracks()
+
+    def track_document(self, abbreviation: str) -> str:
+        """The JSON lyric document for one track, or ``""``."""
+
+        try:
+            return model.track_document(self.path, abbreviation)
+        except (PackError, archive.PackageError, OSError, ValueError):
+            return ""
+
+    def track_styles(self, abbreviation: str) -> Dict[float, Dict[str, str]]:
+        """Per-line font and colour overrides, keyed by rounded time.
+
+        Keyed by time rather than row number so the styling survives a lyric
+        text edit that only touches the words.
+        """
+
+        document = self.track_document(abbreviation)
+        if not document:
+            return {}
+        try:
+            lines = lyrics.parse_lyric_document(document).lines
+        except (lyrics.LyricError, ValueError):
+            return {}
+        return {
+            round(line.time, 2): {"font": line.font, "color": line.color}
+            for line in lines
+            if line.has_style
+        }
 
     def remove_music(self, abbreviation: str) -> None:
         try:

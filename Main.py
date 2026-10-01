@@ -16,7 +16,6 @@ from tscp_player.format import (
     is_note,
     note_parts,
 )
-from tscp_player.lyrics import to_html
 from tscp_player.music import STOP_WORDS
 from tscp_player.plot import (
     PlotPackageError,
@@ -31,10 +30,9 @@ def _plain(text: str) -> str:
 
 try:  # pragma: no cover - depends on the optional GUI dependency
     from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QPoint, QTimer, Qt
-    from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextCharFormat, QTextCursor
+    from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
-        QGraphicsDropShadowEffect,
         QGraphicsOpacityEffect,
         QLabel,
         QListWidget,
@@ -73,98 +71,7 @@ def _plot_labels(playlists, source: Path):
 
 if QT_AVAILABLE:
 
-    #: Point size of the on-screen lyric text.
-    LYRIC_POINT_SIZE = 26
-
-    class LyricsWindow(QWidget):
-        """A backgroundless window that follows the current lyric line.
-
-        No frame, no fill: only the text is drawn, so it floats over whatever is
-        behind it.  Chinese uses 宋体, Latin uses Times New Roman in italic, and
-        every other script picks the best installed family for it.  Drag it
-        anywhere to place it.
-        """
-
-        def __init__(self, parent=None) -> None:
-            super().__init__(
-                parent,
-                Qt.WindowType.FramelessWindowHint
-                | Qt.WindowType.WindowStaysOnTopHint
-                | Qt.WindowType.Tool,
-            )
-            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-            self.setWindowTitle("歌词")
-
-            self.label = QLabel(self)
-            self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.label.setTextFormat(Qt.TextFormat.RichText)
-            self.label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self.label.setFont(QFont("", LYRIC_POINT_SIZE))
-            # A drop shadow keeps the text readable over any wallpaper without
-            # painting a background box behind it.
-            shadow = QGraphicsDropShadowEffect(self)
-            shadow.setBlurRadius(14)
-            shadow.setColor(QColor(0, 0, 0, 210))
-            shadow.setOffset(0, 2)
-            self.label.setGraphicsEffect(shadow)
-
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(28, 14, 28, 14)
-            layout.addWidget(self.label)
-
-            self._families = QFontDatabase.families()
-            self._lyrics = None
-            self._color = "#ffffff"
-            self._dragging = None
-            self.resize(960, 130)
-
-        # -- content -------------------------------------------------------
-        def show_track(self, lyrics, color: str = "", seconds: float = 0.0) -> None:
-            """Start showing *lyrics* in *color*, positioned once per track."""
-
-            self._lyrics = lyrics
-            self._color = color or "#ffffff"
-            if not self.isVisible():
-                self._place()
-                self.show()
-            self.raise_()
-            self.update_line(seconds)
-
-        def update_line(self, seconds: float) -> None:
-            if self._lyrics is None:
-                return
-            text = self._lyrics.at(seconds)
-            self.label.setText("" if not text else to_html(text, self._color, self._families))
-
-        def clear(self) -> None:
-            self._lyrics = None
-            self.label.clear()
-
-        # -- placement -----------------------------------------------------
-        def _place(self) -> None:
-            screen = QApplication.primaryScreen()
-            if screen is None:
-                return
-            area = screen.availableGeometry()
-            self.move(
-                area.x() + (area.width() - self.width()) // 2,
-                area.y() + int(area.height() * 0.72),
-            )
-
-        def mousePressEvent(self, event) -> None:
-            if event.button() == Qt.MouseButton.LeftButton:
-                self._dragging = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                event.accept()
-
-        def mouseMoveEvent(self, event) -> None:
-            if self._dragging is not None:
-                self.move(event.globalPosition().toPoint() - self._dragging)
-                event.accept()
-
-        def mouseReleaseEvent(self, event) -> None:
-            self._dragging = None
-            event.accept()
+    from tscp_player.lyricview import LYRIC_POINT_SIZE, LyricsWindow
 
     class PlayerWindow(QMainWindow):
         """Introduction/selection page followed by an incremental player."""
